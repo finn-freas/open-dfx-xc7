@@ -17,6 +17,7 @@ CONFIG = {
     "vivado_ref": Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build/xdc"),
     "designs": ["x_iodly", "x_iodly_minmax", "x_iodly_fall", "x_mcp_from", "x_mcp_thru", "x_maxdly_cells", "x_maxdly_dp"],
     "variant": "xdc3",
+    "extra": {"rv_soc": ("build/xdc_noop/rv_soc", "designs/rv_soc/arty_a7_35t.xdc")},
     "dry_run": True,
     "npr_line": re.compile(r"Max (?:frequency|delay) for (.+?): .*?slack (-?[\d.]+) ns"),
     "rpt_slack": re.compile(r"^Slack \([A-Z]+\)\s*:\s*(-?[\d.]+)ns", re.M),
@@ -56,7 +57,8 @@ def renamed_json(syn_json, out):
 
 
 def prep(design, variant, dry):
-    run = CONFIG["builds"] / design / variant
+    extra = CONFIG["extra"].get(design)
+    run = (ROOT / extra[0] / variant) if extra else CONFIG["builds"] / design / variant
     d = CONFIG["out"] / "src" / name_of(design, variant)
     print(f"[{'dry' if dry else 'run'}] {d.relative_to(ROOT)} from {run.relative_to(ROOT)}")
     if dry:
@@ -66,7 +68,8 @@ def prep(design, variant, dry):
     qor_xtime.write_netlist(d / "renamed.json", d / "netlist.edf", dry)
     (d / "top.txt").write_text(design + "\n")
     (d / "mode.txt").write_text("placed\n")
-    (d / "constraints.xdc").write_text(next((CONFIG["designs_dir"] / design).glob("*.xdc")).read_text())
+    xdc = (ROOT / extra[1]) if extra else next((CONFIG["designs_dir"] / design).glob("*.xdc"))
+    (d / "constraints.xdc").write_text(xdc.read_text())
     rows, skipped = qor_xtime.placement(run / f"{design}_routed.json")
     rows = [(names.get(n, n), b) for n, b in rows]
     (d / "place.txt").write_text("".join(f"{qor_xtime.tcl_quote(n)} {b}\n" for n, b in rows))

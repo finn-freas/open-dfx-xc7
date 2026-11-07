@@ -1,0 +1,120 @@
+{
+ "classes": [
+  [
+   "clock_leaf",
+   "^HCLK_LEAF_CLK_B_(TOP|BOT)\\d+$"
+  ],
+  [
+   "single",
+   "^(NN|SS|EE|WW|NE|NW|SE|SW|NL|NR|SL|SR|EL|ER|WL|WR)1BEG"
+  ],
+  [
+   "double",
+   "^(NN|SS|EE|WW|NE|NW|SE|SW)2BEG"
+  ],
+  [
+   "quad",
+   "^(NN|SS|EE|WW|NE|NW|SE|SW)4BEG"
+  ],
+  [
+   "hex",
+   "^(NN|SS|EE|WW|NE|NW|SE|SW)6BEG"
+  ],
+  [
+   "long",
+   "^(LH|LV|LVB)(_L)?\\d+$"
+  ],
+  [
+   "bounce",
+   "^(BYP_ALT|FAN_ALT|BYP_BOUNCE|FAN_BOUNCE|GFAN)"
+  ],
+  [
+   "imux",
+   "^IMUX(_L)?\\d+$"
+  ],
+  [
+   "byp",
+   "^BYP(_L)?\\d+$"
+  ],
+  [
+   "ctrl",
+   "^(FAN(_L)?\\d+|CTRL(_L)?\\d+)$"
+  ],
+  [
+   "hard_out",
+   "^(BRAM|DSP|INT_INTERFACE|IO_INT_INTERFACE|BRAM_INT_INTERFACE)_.*LOGIC_OUTS"
+  ],
+  [
+   "bram_in",
+   "^BRAM_"
+  ],
+  [
+   "clb_site_out",
+   "^CLBL[LM]_(L|LL|M)_([A-D]|[A-D]MUX|[A-D]Q|COUT)"
+  ]
+ ],
+ "pip_add": {
+  "bounce": [
+   0,
+   5
+  ],
+  "bram_in": [
+   0,
+   -44
+  ],
+  "byp": [
+   0,
+   98
+  ],
+  "clb_site_out": [
+   0,
+   -56
+  ],
+  "ctrl": [
+   0,
+   280
+  ],
+  "double": [
+   0,
+   30
+  ],
+  "hard_out": [
+   0,
+   -10
+  ],
+  "hex": [
+   0,
+   26
+  ],
+  "imux": [
+   0,
+   413
+  ],
+  "long": [
+   0,
+   30
+  ],
+  "quad": [
+   0,
+   26
+  ],
+  "single": [
+   0,
+   22
+  ],
+  "clock_leaf": [
+   0,
+   775
+  ]
+ },
+ "source": {
+  "train": [
+   "blinky_p5_cal_static_s1",
+   "rv_soc_p5_cal_static_s1",
+   "bram_p5_cal_static_s1"
+  ],
+  "timer": "perm",
+  "arcs": 9079,
+  "clock_leaf": "mean clock-tree arc error, BUFG -> FF clock pin, nextpnr minus Vivado: blinky -770, rv_soc -779, bram -780 ps (identical routes, xroute perm timer); one HCLK leaf pip per arc"
+ }
+}

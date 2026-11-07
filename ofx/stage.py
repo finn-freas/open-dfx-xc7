@@ -2,6 +2,8 @@ import json
 import re
 from pathlib import Path
 
+from . import debug as debugmod
+from . import ip as ipmod
 from . import vhdl
 from .project import CONFIG as PCONFIG, ProjectError, defines_module
 
@@ -62,8 +64,30 @@ def stage(proj, dry, tool_dry=False):
     if not dry:
         write_if_changed(xdc, xdc_text(proj))
     sources = vhdl_sources(proj, d, tool_dry)
+    inputs = [f for f in proj.sources]
+    if proj.raw.get("ip"):
+        try:
+            ipf, ipin = ipmod.gen_all(proj, proj.build / ipmod.CONFIG["dir"], dry or tool_dry)
+        except ipmod.IpError as e:
+            raise ProjectError(str(e))
+        sources = sources + ipf
+        inputs += ipin + ([] if (dry or tool_dry) else ipf)
+    if proj.raw.get("debug", {}).get("insert"):
+        if proj.dfx:
+            raise ProjectError("[debug] insert works on flat builds only (not with [dfx])")
+        try:
+            sources, xdc = debugmod.insert(proj, sources, proj.constraints, proj.build / debugmod.CONFIG["out"],
+                                           dry or tool_dry)
+        except debugmod.DebugError as e:
+            raise ProjectError(str(e))
+        if not (dry or tool_dry):
+            write_if_changed(d / f"{proj.top}.xdc", Path(xdc).read_text() + xdc_text(proj)[len(
+                "".join(Path(f).read_text() for f in proj.constraints)):])
+        xdc = d / f"{proj.top}.xdc"
+        if not (dry or tool_dry):
+            inputs += [Path(f) for f in sources]
     info = {"dir": d, "xdc": xdc, "sources": sources, "specs": {}, "r2v_rtl": {}, "rms": {},
-            "inputs": [f for f in proj.sources]}
+            "inputs": inputs}
     if proj.dfx:
         if proj.dfx["decoupler"] and PCONFIG["decoupler_rtl"] not in sources:
             sources.append(PCONFIG["decoupler_rtl"])

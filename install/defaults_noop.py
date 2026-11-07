@@ -19,7 +19,8 @@ CONFIG = {
     "designs": {
         "blinky": {"top": "blinky", "recorded": "build/patched/baseline/blinky_stock/blinky.json"},
         "rv_soc": {"top": "rv_soc", "recorded": "build/patched/baseline/rv_soc_stock/rv_soc.json",
-                   "rtl": ["rv_soc.v", "uart.v", "picorv32.v", "pr/rm_stub.v"]},
+                   "rtl": ["rv_soc.v", "uart.v", "picorv32.v", "pr/rm_stub.v"],
+                   "changed_by": ["hardblock_timing"]},
     },
     "part": "xc7a35tcsg324-1",
     "max_nextpnr": int(os.environ.get("OFX_MAX_NEXTPNR", 2)),
@@ -28,6 +29,7 @@ CONFIG = {
     "candidates": {
         "hardblock_timing": {"noop_pnr": ["blinky"]},
         "clkbuf_keep_buffer_inputs": {"noop_synth": ["blinky", "rv_soc"], "fixes": ["bufr", "bufio_iddr", "oserdes"]},
+        "static_all_sizes": {"placer_rule": [100, 3000, 3001, 30000]},
     },
     "gap_dir": "designs/gap",
 }
@@ -119,7 +121,7 @@ def check_candidates(names, p, out, dry):
     base = dict(defaults.CONFIG["defaults"])
     for opt in names:
         spec = CONFIG["candidates"][opt]
-        on = dict(base, **{opt: True})
+        on = dict(base, **{opt: True}) if opt in base else dict(base)
         print(f"== candidate {opt}: on top of the defaults", flush=True)
         for name in spec.get("noop_synth", []):
             d = CONFIG["designs"][name]
@@ -153,6 +155,14 @@ def check_candidates(names, p, out, dry):
             if not dry:
                 result(built(f0) and built(f1) and filecmp.cmp(f0, f1, shallow=False),
                        f"{opt} {name}: .frames with {' '.join(a1)} identical to the defaults' ({' '.join(a0)})")
+        for cells in spec.get("placer_rule", []):
+            old = ["--placer", "static"] if cells <= 3000 else []
+            new, why = defaults.placer_args({"placer": "auto"}, cells)
+            if cells <= 3000:
+                result(new == old, f"{opt} {cells} cells: nextpnr placer arguments {new} = the 3000-cell rule's {old}")
+            else:
+                print(f"INFO {opt} {cells} cells: {new} instead of the 3000-cell rule's {old or 'HeAP'} ({why}); "
+                      f"evidence: Vivado-timer runs in docs/wip/placement-global.md", flush=True)
         for name in spec.get("fixes", []):
             src = ROOT / CONFIG["gap_dir"] / name
             d = {"top": name}
@@ -190,9 +200,9 @@ def main():
             sys.exit(0 if all(results) else 1)
         return
     check_all_off(p)
-    on_args = defaults.nextpnr_args(on)
     for name in a.designs:
         d = CONFIG["designs"][name]
+        on_args = defaults.nextpnr_args(dict(on, **{k: False for k in d.get("changed_by", [])}))
         xdc = next((ROOT / "designs" / name).glob("*.xdc"))
         script, _ = defaults.synth_script(on, xdc, p["plugins"])
         if script:

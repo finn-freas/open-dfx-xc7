@@ -64,7 +64,34 @@ CONFIG = {
         "MMCME2_ADV/CLKOUT4": {"min_period": 1.249, "max_period": 213.360},
         "MMCME2_ADV/CLKOUT5": {"min_period": 1.249, "max_period": 213.360},
         "MMCME2_ADV/CLKOUT6": {"min_period": 1.249, "max_period": 213.360},
+        "PLLE2_ADV/CLKIN1": {"max_period": 52.633, "low": 2.000, "high": 2.000},
+        "PLLE2_ADV/CLKFBIN": {"max_period": 52.633},
+        "PLLE2_ADV/CLKFBOUT": {"min_period": 1.249},
+        **{f"PLLE2_ADV/CLKOUT{k}": {"max_period": 160.000} for k in range(6)},
+        "RAMD32/CLK": {"low": 1.250, "high": 1.250},
+        "RAMS32/CLK": {"low": 1.250, "high": 1.250},
+        "RAMD64E/CLK": {"low": 1.250, "high": 1.250},
+        "SRL16E/CLK": {"low": 0.980, "high": 0.980},
+        "SRLC32E/CLK": {"low": 0.980, "high": 0.980},
+        "ICAPE2/CLK": {"min_period": 10.000},
+        "DNA_PORT/CLK": {"min_period": 10.000},
+        "XADC/DCLK": {"min_period": 4.000},
+        "IDELAYCTRL/REFCLK": {"min_period": 3.225, "max_period": 5.264},
+        "ISERDESE2/CLKDIV": {"min_period": 1.667},
+        "OSERDESE2/CLKDIV": {"min_period": 1.667},
+        "FIFO18E1/RDCLK": {"min_period": 2.576},
+        "FIFO36E1/RDCLK": {"min_period": 2.576},
+        "RAMB18E1/CLKARDCLK": {"min_period": 2.944, "mode_dependent": True},
+        "RAMB18E1/CLKBWRCLK": {"min_period": 2.944, "mode_dependent": True},
+        "RAMB36E1/CLKARDCLK": {"min_period": 3.361, "mode_dependent": True},
+        "RAMB36E1/CLKBWRCLK": {"min_period": 3.361, "mode_dependent": True},
+        "DSP48E1/CLK": {"min_period": 3.884, "mode_dependent": True},
     },
+    "exception_names": ((r"datapath_only", "Max Delay Datapath Only"), (r"^set_max_delay", "Max Delay"),
+                        (r"^set_min_delay", "Min Delay"), (r"^set_multicycle_path", "Multicycle Path"),
+                        (r"^set_false_path", "False Path")),
+    "cdc_exceptions": {"Timed": "None", "Asynchronous Groups": "Asynch Clock Groups",
+                       "Exclusive Groups": "Exclusive Clock Groups", "Not timed (nextpnr: no common primary)": "None"},
     "pulse_checks": (("min_period", "Min Period"), ("max_period", "Max Period"), ("low", "Low Pulse Width"),
                      ("high", "High Pulse Width")),
 }
@@ -514,11 +541,14 @@ def check_timing(d, rep, eps, names):
         rows["no_output_delay"] = (None, "no routed JSON, ports not checked", [])
     else:
         note = "" if xdc else "; no XDC found, so clock ports are counted too"
+        live = live_ports(d)
         for direction, attr in CONFIG["io_delay_attrs"].items():
             miss = sorted(b for b, (dirn, a, base) in ports.items()
-                          if dirn == direction and attr not in a and b not in clk_ports and base not in clk_ports)
+                          if dirn == direction and attr not in a and b not in clk_ports and base not in clk_ports
+                          and (live is None or b in live))
             rows[f"no_{direction}_delay"] = (len(miss), f"{direction} ports without set_{direction}_delay "
-                                             f"(clock ports excluded{note})", miss)
+                                             f"(clock ports, unused inputs and constant outputs excluded{note})",
+                                             miss)
     caps = defaultdict(set)
     for e in eps:
         if e["to"] != "<async>":
@@ -542,13 +572,17 @@ def check_timing(d, rep, eps, names):
     unrel = sorted({(event_clock(e["from"], names), event_clock(e["to"], names)) for e in eps
                     if e.get("untimed") == "unrelated clocks"})
     rows["unrelated_clocks"] = (len(unrel), "clock pairs with paths but no common primary and no exception "
-                                "(Vivado times these; nextpnr does not)", [f"{a} -> {b}" for a, b in unrel])
-    apins = async_pins(d)
-    rows["async_pins_untimed"] = (len(apins), "asynchronous set/reset pins driven by logic; Vivado times them "
-                                  "(recovery/removal, path group **async_default**), nextpnr does not", apins)
+                                "(Vivado times these as 'Timed (unsafe)'; nextpnr only with -o vivado-timing)",
+                                [f"{a} -> {b}" for a, b in unrel])
+    timed_pins = {pin(e) for e in eps if "setup" in e}
+    nl_ = netlist(str(d))
+    apins = [p for p in async_pins(d) if nl_ is None or
+             f"{p.rsplit('/', 1)[0]}/{nl_.bel_port(*p.rsplit('/', 1))}" not in timed_pins]
+    rows["async_pins_untimed"] = (len(apins), "asynchronous set/reset pins driven by logic with no timed "
+                                  "endpoint (Vivado: recovery/removal in **async_default**)", apins)
     silent = untimed_sequential(d, rep, eps)
     rows["sequential_cells_untimed"] = (len(silent), "clocked cells on a constrained clock with no timed endpoint "
-                                        "or path start (nextpnr has no timing arcs for them, e.g. SRL16E/SRLC32E)",
+                                        "or path start (SRL16E/SRLC32E have timing arcs only with -o vivado-timing)",
                                         silent)
     return [(k, *rows[k]) for k in CONFIG["vivado_checks"] + CONFIG["ofx_checks"]]
 
@@ -567,6 +601,11 @@ def async_pins(d):
         if b is not None and drv and nl.cells[drv[0]].get("type") not in ("PSEUDO_VCC", "PSEUDO_GND"):
             out.append(f"{cell}/{p}")
     return sorted(out)
+
+
+def is_async_check(nl, e):
+    """Vivado puts recovery/removal checks (FDCE CLR, FDPE PRE) in the path group **async_default**."""
+    return nl is not None and CONFIG["async_pins"].get(nl.otype(e["cell"])) == nl.oport(e["cell"], e["port"])
 
 
 def untimed_sequential(d, rep, eps):
@@ -588,6 +627,38 @@ def untimed_sequential(d, rep, eps):
     return sorted(out)
 
 
+def vivado_exception(x):
+    """Vivado's name for a nextpnr exception string such as 'set_max_delay -datapath_only (line 13)'."""
+    for rx, name in CONFIG["exception_names"]:
+        if re.search(rx, x or ""):
+            return name
+    return x
+
+
+def live_ports(d):
+    """Top ports Vivado's check_timing looks at: inputs whose buffer drives logic, outputs not driven by a constant."""
+    nl = netlist(str(d))
+    if nl is None:
+        return None
+    out = set()
+    for b, name in nl.port_bits.items():
+        for cell, port in nl.sinks.get(b, []):
+            if nl.otype(cell) in ("IBUF", "IBUFG", "IBUF_INTERMDISABLE", "IBUF_IBUFDISABLE"):
+                ob = nl.bit(cell, nl.bel_port(cell, "O") or "")
+                if ob is not None and nl.sinks.get(ob):
+                    out.add(name)
+        drv = nl.driver.get(b)
+        cells = [drv] if drv else []
+        cells += [x for x in nl.sinks.get(b, [])]
+        for cell, port in cells:
+            if nl.otype(cell) in ("OBUF", "OBUFT"):
+                ib = nl.bit(cell, nl.bel_port(cell, "I") or "")
+                d2 = nl.driver.get(ib)
+                if d2 and nl.cells[d2[0]].get("type") not in ("PSEUDO_VCC", "PSEUDO_GND"):
+                    out.add(name)
+    return out
+
+
 def cdc_class(d, e):
     """Vivado report_cdc-like class of one asynchronous crossing endpoint."""
     nl = netlist(str(d))
@@ -598,11 +669,9 @@ def cdc_class(d, e):
     async_reg = str(attrs.get("ASYNC_REG", "")).upper() in ("TRUE", "1", "00000000000000000000000000000001")
     drv = nl.driver.get(nl.bit(e["cell"], e["port"]))
     direct = drv is not None and nl.otype(drv[0]) in CONFIG["sync_types"]
-    if t not in CONFIG["sync_types"]:
-        return "Unsafe"
-    if not direct:
-        return "Unsafe"
-    return "Safe" if async_reg else "Unknown"
+    if t in CONFIG["sync_types"] and async_reg:
+        return "Safe" if direct else "Unsafe"
+    return "Unknown"
 
 
 def histogram(values):
@@ -700,7 +769,8 @@ def print_path(p, names, idx, pads, nl=None, clocks=None):
     print(f"                      {cell_desc(nl, st['cell'], p['from'], names, clocks)}")
     print(f"   Destination:     {dest}{via}")
     print(f"                      {cell_desc(nl, en['cell'], p['to'], names, clocks)}")
-    print(f"   Path Group:      {event_clock(p['to'], names)}")
+    group = "**async_default**" if is_async_check(nl, p["endpoint"]) else event_clock(p['to'], names)
+    print(f"   Path Group:      {group}")
     print(f"   Path Type:       {'Hold (Min)' if hold else 'Setup (Max)'} (one corner, nextpnr timer)")
     if p.get("exception"):
         print(f"   Timing Exception: {p['exception']}")
@@ -770,6 +840,7 @@ def clock_tree_rows(clocks, masters_used):
 def interaction(d, rep, eps, names):
     """report_clock_interaction-like rows: one per launch/capture clock pair seen at an endpoint."""
     groups = xdc_clock_groups(d)
+    _, clocks = clock_map(d, rep)
     pairs = defaultdict(list)
     for e in eps:
         if e["from"] == "<async>" or e["to"] == "<async>" or on_unconstrained_clock(e, rep, names):
@@ -788,7 +859,7 @@ def interaction(d, rep, eps, names):
         why = sorted({e.get("untimed") for e in untimed})
         exc = sorted({e.get("exception") for e in timed if e.get("exception")})
         if not untimed and not exc:
-            cons = "Timed"
+            cons = "Timed" if clock_root(clocks, a) == clock_root(clocks, b) else "Timed (unsafe)"
         elif not timed and why == ["unrelated clocks"]:
             cons = "Not timed (nextpnr: no common primary)"
         elif not timed:
@@ -796,14 +867,23 @@ def interaction(d, rep, eps, names):
         elif untimed:
             cons = "Partial False Path"
         else:
-            cons = ", ".join(exc)
+            cons = ", ".join(sorted({vivado_exception(x) for x in exc}))
         rows.append({"from": a, "to": b, "edges": ", ".join(edges), "wns": s["wns"], "tns": s["tns"],
                      "failing": s["failing"], "total": len({pin(e) for e in v}), "req": req, "constraints": cons,
                      "endpoints": v})
     return rows
 
 
-def cdc_rows(d, inter):
+def clock_root(clocks, name):
+    seen = set()
+    while name in clocks and clocks[name].get("master") and name not in seen:
+        seen.add(name)
+        name = clocks[name]["master"]
+    return name
+
+
+def cdc_rows(d, inter, clocks=None):
+    clocks = clocks or {}
     out = []
     for r in inter:
         if r["from"] == r["to"]:
@@ -821,12 +901,12 @@ def cdc_rows(d, inter):
             safe += k == "Safe"
             unsafe += k == "Unsafe"
             unknown += k == "Unknown"
-            no_async += k == "Unknown"
-        kind = "Safely Timed" if r["constraints"] == "Timed" else "No Common Primary Clock" \
-            if "nextpnr" in r["constraints"] else "Asynchronous"
-        sev = "Critical" if unsafe else "Warning" if unknown else "Info"
-        out.append([sev, r["from"], r["to"], kind, "None" if r["constraints"] == "Timed" else r["constraints"],
-                    len(seen), safe, unsafe, unknown, no_async])
+        common = clock_root(clocks, r["from"]) == clock_root(clocks, r["to"])
+        kind = ("Safely Timed" if r["constraints"] == "Timed" else "User Ignored" if common
+                else "No Common Primary Clock")
+        exc = CONFIG["cdc_exceptions"].get(r["constraints"], r["constraints"])
+        sev = "Critical" if unsafe or unknown else "Warning" if no_async else "Info"
+        out.append([sev, r["from"], r["to"], kind, exc, len(seen), safe, unsafe, unknown, no_async])
     return out
 
 
@@ -887,7 +967,8 @@ def print_one(d, args):
     table("Clock Summary", ["Clock                   ", "Waveform(ns)      ", "Period(ns)", "Freq(MHz)"], crows)
     order = [r[0].strip() for r in crows]
 
-    keys, by_pair = path_groups(timed, names, order)
+    async_eps = [e for e in timed if is_async_check(nl, e)]
+    keys, by_pair = path_groups([e for e in timed if not is_async_check(nl, e)], names, order)
     pw_by = defaultdict(list)
     for c in pw:
         pw_by[c["clock"]].append(c)
@@ -904,11 +985,13 @@ def print_one(d, args):
     inter = [[f"{a:16s}", f"{b:16s}"] + sum_cols(summary_row(by_pair[(a, b)])) for (a, b) in keys if a != b]
     table("Intra Clock Table", ["Clock                   "] + SUM_HEAD + PW_HEAD, intra)
     table("Inter Clock Table", ["From Clock      ", "To Clock        "] + SUM_HEAD, inter)
-    apins = async_pins(d)
-    print("\nOther Path Groups Table")
-    print("-----------------------")
-    print(f"  (none timed: nextpnr has no recovery/removal checks; {len(apins)} asynchronous set/reset pin(s) "
-          f"driven by logic would be in **async_default**)" if apins else "  (none)")
+    agroups = defaultdict(list)
+    for e in async_eps:
+        agroups[(event_clock(e["from"], names), event_clock(e["to"], names))].append(e)
+    table("Other Path Groups Table (recovery = setup columns, removal = hold columns)",
+          ["Path Group         ", "From Clock      ", "To Clock        "] + SUM_HEAD,
+          [[f"{'**async_default**':19s}", f"{a:16s}", f"{b:16s}"] + sum_cols(summary_row(v))
+           for (a, b), v in sorted(agroups.items())])
 
     exc = defaultdict(list)
     for e in timed:
@@ -940,7 +1023,7 @@ def print_one(d, args):
           ["Severity", "Source Clock    ", "Dest Clock      ", "CDC Type                ", "Exceptions          ",
            "Endpoints", "Safe", "Unsafe", "Unknown", "No ASYNC_REG"],
           [[f"{r[0]:8s}", f"{r[1]:16s}", f"{r[2]:16s}", f"{r[3]:24s}", f"{r[4]:20s}", f"{r[5]:9d}", f"{r[6]:4d}",
-            f"{r[7]:6d}", f"{r[8]:7d}", f"{r[9]:12d}"] for r in cdc_rows(d, inter_rows)])
+            f"{r[7]:6d}", f"{r[8]:7d}", f"{r[9]:12d}"] for r in cdc_rows(d, inter_rows, clocks)])
 
     for key in ("setup", "hold"):
         w = worst_per_pin([e for e in timed if key in e], key)
@@ -963,7 +1046,8 @@ def print_one(d, args):
     if untimed:
         print(f"  {len(untimed)} path(s) on a clock with no create_clock left out (Unconstrained Paths above)")
     pads = pad_cells(d)
-    extra = sorted({(event_clock(p["from"], names), event_clock(p["to"], names)) for p in paths} - set(keys))
+    extra = sorted(({(event_clock(p["from"], names), event_clock(p["to"], names)) for p in paths}
+                    | {(r["from"], r["to"]) for r in inter_rows if r["from"] != r["to"]}) - set(keys))
     gkeys = ([(n, n) for n in order if (n, n) in by_pair or pw_by.get(n)]
              + [k for k in keys if k[0] == k[1] and k[0] not in order]
              + [k for k in keys if k[0] != k[1]] + extra)
@@ -987,7 +1071,7 @@ def print_one(d, args):
         print("-" * 99)
         for check, title in (("setup", "Max Delay Paths"), ("hold", "Min Delay Paths")):
             sel = [p for p in paths if p["check"] == check and event_clock(p["from"], names) == a
-                   and event_clock(p["to"], names) == b][:args.paths]
+                   and event_clock(p["to"], names) == b and not is_async_check(nl, p["endpoint"])][:args.paths]
             if not sel:
                 continue
             print(f"\n{title}\n" + "-" * 86)
@@ -996,6 +1080,23 @@ def print_one(d, args):
                 print_path(p, names, i, pads, nl, clocks)
         if a == b and pw_by.get(a):
             print_pulse(a, clocks, pw_by[a])
+    for (a, b), v in sorted(agroups.items()):
+        sr = summary_row(v)
+        print("\n" + "-" * 99)
+        print(f"Path Group:  **async_default**\nFrom Clock:  {a}\n  To Clock:  {b}\n")
+        for k, lab in (("setup", "Recovery"), ("hold", "Removal ")):
+            x = sr[k]
+            print(f"{lab} : {x['failing']:9d}  Failing Endpoints,  Worst Slack {fmt(x['wns'], 12)}ns,  "
+                  f"Total Violation {fmt(x['tns'], 12)}ns")
+        print("-" * 99)
+        for check, title in (("setup", "Max Delay Paths (recovery)"), ("hold", "Min Delay Paths (removal)")):
+            sel = [p for p in paths if p["check"] == check and event_clock(p["from"], names) == a
+                   and event_clock(p["to"], names) == b and is_async_check(nl, p["endpoint"])][:args.paths]
+            if sel:
+                print(f"\n{title}\n" + "-" * 86)
+            for i, p in enumerate(sel, 1):
+                shown += 1
+                print_path(p, names, i, pads, nl, clocks)
     if not shown:
         print("  (no path matches)")
     return int((s["setup"]["failing"] or 0) > 0 or (s["hold"]["failing"] or 0) > 0)

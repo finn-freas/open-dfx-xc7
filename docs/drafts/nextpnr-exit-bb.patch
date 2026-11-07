@@ -1,0 +1,49 @@
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index c9cd40e5..e89d865a 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -79,6 +79,10 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("delay-matrix", po::value<std::string>(),
+                            "interconnect delay model: on by default (measured per tile offset); 'off' uses the "
+                            "tuned formula; a path caches the table there; 'build' rebuilds it fresh (the default)");
++    specific.add_options()("exit-bb", po::value<std::string>()->implicit_value(""),
++                           "for a pin of a non-logic site (ICAP, BSCAN, BRAM, DSP, IO...), take the routing box "
++                           "anchor from the interconnect tile the pin reaches (INT_L/INT_R), not from the first "
++                           "general wire, which can sit in the site's own tall tile rows away");
+     specific.add_options()("hold-fix", po::value<std::string>()->implicit_value(""),
+                            "after routing, fix hold-time (min-delay) violations: small deficits by a routing "
+                            "detour, larger ones by a feedthrough LUT; optional value sets the max passes (default 8)");
+@@ -1557,6 +1561,15 @@ bool XilinxImpl::is_general_routing(WireId wire) const
+ 
+ void XilinxImpl::find_source_sink_locs()
+ {
++
++
++
++
++    const bool exit_bb = ctx->args.options.count("exit-bb");
++    auto is_int_tile = [&](int tile) {
++        IdString tt = IdString(chip_tile_info(ctx->chip_info, tile).type_name);
++        return tt == ctx->id("INT_L") || tt == ctx->id("INT_R");
++    };
+     for (auto &net : ctx->nets) {
+         NetInfo *ni = net.second.get();
+         for (auto &usr : ni->users) {
+@@ -1577,7 +1590,7 @@ void XilinxImpl::find_source_sink_locs()
+                 ++iter;
+                 WireId cursor = visit.front();
+                 visit.pop();
+-                if (is_general_routing(cursor)) {
++                if (is_general_routing(cursor) && (!exit_bb || is_int_tile(cursor.tile))) {
+                     Loc loc(0, 0, 0);
+                     tile_xy(ctx->chip_info, cursor.tile, loc.x, loc.y);
+                     sink_locs[sink] = loc;
+@@ -1622,7 +1635,7 @@ void XilinxImpl::find_source_sink_locs()
+                 ++iter;
+                 WireId cursor = visit.front();
+                 visit.pop();
+-                if (is_general_routing(cursor)) {
++                if (is_general_routing(cursor) && (!exit_bb || is_int_tile(cursor.tile))) {
+                     Loc loc(0, 0, 0);
+                     tile_xy(ctx->chip_info, cursor.tile, loc.x, loc.y);
+                     source_locs[source] = loc;

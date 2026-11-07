@@ -1,0 +1,11 @@
+[project]
+name = "dbg_ila"
+top = "x_dbg_net"
+board = "arty-a7-35t"
+sources = ["src/x_dbg_net.v"]
+constraints = ["constraints/x_dbg_net.xdc"]
+
+[debug]
+insert = true
+bridge = "jtag"
+depth = 256

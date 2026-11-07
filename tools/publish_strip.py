@@ -1496,26 +1496,30 @@ def norm_rtlil(text):
     return "\n".join(out)
 
 
-def yosys_rtlil(path, incdirs, workdir, tag, defer=False):
+def yosys_rtlil(path, incdirs, workdir, tag, defer=False, tree=None):
     il = workdir / f"{tag}.il"
     inc = " ".join(f"-I{d}" for d in incdirs)
     script = f"read_verilog -sv {'-defer ' if defer else ''}{inc} {path}; write_rtlil {il}"
     r = run([str(CONFIG["yosys"]), "-q", "-p", script], cwd=str(workdir))
     if r.returncode != 0 or not il.exists():
         return None, (r.stderr or r.stdout).strip().splitlines()[-1:] or ["yosys failed"]
-    return norm_rtlil(il.read_text()), None
+    text = il.read_text()
+    if tree is not None:
+        text = text.replace(str(tree), "TREE")
+    return norm_rtlil(text), None
 
 
 def proof_verilog(rel, orig_tree, strip_tree, work):
     work.mkdir(parents=True, exist_ok=True)
     res = {}
     for mode in ("elab", "defer"):
-        a, ea = yosys_rtlil(orig_tree / rel, [(orig_tree / rel).parent, orig_tree], work, "orig_" + mode, mode == "defer")
+        a, ea = yosys_rtlil(orig_tree / rel, [(orig_tree / rel).parent, orig_tree], work, "orig_" + mode, mode == "defer",
+                            tree=orig_tree)
         if a is None:
             res[mode] = f"original fails: {ea[0]}"
             continue
         b, eb = yosys_rtlil(strip_tree / rel, [(strip_tree / rel).parent, strip_tree], work, "strip_" + mode,
-                            mode == "defer")
+                            mode == "defer", tree=strip_tree)
         if b is None:
             return f"FAIL: stripped fails to parse ({eb[0]}) while the original parses", None
         if a != b:

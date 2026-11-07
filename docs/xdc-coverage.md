@@ -308,6 +308,83 @@ In x_iodly_minmax both corners carry the hold-repair detour:
 | Slow | +3.969 | 5.474 | +1.028 |
 | Fast | +4.520 | 2.550 | +1.098 |
 
+## xdc4: latency, jitter, KEEP/DONT_TOUCH/MARK_DEBUG, DIFF_TERM, pad delays (2026-11-06, in progress)
+
+`xdc4` is nextpnr variant `build/nextpnr-build/xdc4`: the xdc3 tree (router stack + xdc-timing + xdc2 +
+ologic-iob-sdr) plus `docs/drafts/nextpnr-diff-term.patch` plus `docs/drafts/nextpnr-xdc4-constraints.patch`
+(draft). In `flow/xdc_audit.py` the variant also runs `flow/xdc_keep.py` in yosys. 14 new designs in
+`flow/xdc_designs.py`: x_lat_src, x_lat_net, x_lat_early, x_lat_xsrc, x_jit_in, x_jit_sys, x_jit_both, x_jit_two,
+x_keep_none, x_keep_dt, x_keep_k, x_dbg_rtl, x_pad_a, x_pad_b. Vivado script `vivado/build_xdc4.tcl`
+(build_xdc.tcl plus `pad_arcs.txt`, the Slow/Fast min/max rise/fall delay of every pad buffer's timing arc, and
+per-port path reports), run in batches of at most ~20 min through `vivado/run_polite.sh`.
+
+**Status of the Vivado references:** queued, not run yet (the Vivado slot was taken by higher-priority agents
+for the whole session). Every "vs Vivado" cell below that says *pending* is unmeasured.
+
+### KEEP / DONT_TOUCH / MARK_DEBUG
+Vivado reads the XDC before synthesis; nextpnr reads it after. `flow/xdc_keep.py` turns
+`set_property KEEP|DONT_TOUCH|MARK_DEBUG true [get_cells|get_nets ...]` (Vivado names: `a/b/q_reg[3]` is the
+flattened yosys wire `a.b.q`) and RTL `(* mark_debug = "true" *)` / `(* dont_touch = "true" *)` into yosys
+`setattr -set keep 1` on the wire and the cells driving it, run on the flattened design before synth_xilinx's
+optimisation (`synth_xilinx -run :prepare; proc; flatten; <keep>; synth_xilinx -run prepare:`). Only when the
+XDC or RTL asks for one of them; otherwise the yosys script is unchanged. nextpnr's warning now says the flow
+applied it.
+
+| Design | xdc3 (no pass) | xdc4 | Vivado |
+|---|---|---|---|
+| x_keep_cell (DONT_TOUCH + KEEP on dq_reg[*], only dq[15:12] used) | 20 FDRE | **32 FDRE** | 32 FDRE (`build\xdc\x_keep_cell\synth_cells.txt`) |
+| x_keep_dt (DONT_TOUCH on dq_reg[*]; dd_reg is a duplicate of dq_reg) | 0 FDRE (LEDs constant, all optimised away) | 32 FDRE | pending |
+| x_keep_k (KEEP on dd_reg[*]) | 0 FDRE | 32 FDRE | pending |
+| x_dbg_rtl (`(* mark_debug *)` on dq) | 0 FDRE | 32 FDRE | pending |
+
+(`build/xdc/<d>/xdc4/yosys_stat.txt`.) x_keep_none's LEDs are a constant (dq ^ dd of two equal registers), so
+it has no flip-flop left in either flow; it is the control. MARK_DEBUG here only keeps the net, which is what
+Vivado's synthesis does with it; inserting a debug core is `flow/mark_debug.py` (LiteScope), not yet called by
+`ofx build`.
+
+### DIFF_TERM
+With `nextpnr-diff-term.patch` in the stack, the XDC reader now counts DIFF_TERM as applied (no "NOT applied"
+warning). gap design dt_xdc (`build/xdc4_dt/dt_xdc/`): the IOB FASM lines are identical to the `ofx-prim`
+build's (diff empty), including `LVDS_25.IN_ONLY_DIFF_TERM` on both terminated receivers, and ofx-prim's
+dt_xdc was 0 / 0 against Vivado's decoded bitstream (gap-vivado.md G2). Frames need the db segbits of
+`docs/drafts/prjxray-db-diff-term.segbits` (as for ofx-prim).
+
+### set_clock_latency
+The draft implements Vivado's documented rules; whether Vivado's numbers agree is pending (x_lat_*):
+- network latency (no `-source`): no effect, with an info line, since every clock is propagated after placement
+  and Vivado ignores network latency on a propagated clock;
+- `-source` with one value: on the clock's own paths (registers and the ports timed against it) it is on both the
+  launch and the capture side and cancels, so slack does not change;
+- `-source -early/-late` (or `-min/-max`): the spread late - early is charged to setup (late launch, early
+  capture) and to hold (early launch, late capture), like an uncertainty;
+- between two clocks of one primary (MMCM outputs, generated clocks), the clock's edges move by the latency (its
+  waveform offset), and clocks generated from it move with it.
+A first build had the latency lines parsed but never applied (the post-pack function returned early when no
+other clock setting existed); fixed, re-run pending.
+
+### Jitter (set_input_jitter, set_system_jitter)
+nextpnr (xdc3 = xdc4 here, nextpnr's timer, same placement as x_mcp_none at 68.85 MHz): the period lost is
+1000/Fmax - 1000/68.85:
+
+| Design | nextpnr Fmax | uncertainty taken | sqrt(TSJ^2 + TIJ^2)/2, TSJ = sqrt(2) x system jitter, TIJ = rss of both clocks' input jitter | Vivado |
+|---|---|---|---|---|
+| x_jit_in (input jitter 0.3) | 67.84 | 0.216 | 0.215 (system jitter 0.05, Vivado's default) | pending |
+| x_jit_sys (system jitter 0.2) | 68.18 | 0.143 | 0.141 | pending |
+| x_jit_both | 67.66 | 0.256 | 0.255 | pending |
+
+Vivado's own report of x_mcp_none shows the default term: `Clock Uncertainty: 0.035ns ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2
++ PE`, which is the formula above with system jitter 0.05; nextpnr adds no jitter at all unless the XDC sets one,
+so on every other design it is 0.035 ns optimistic against Vivado. MMCM discrete jitter (DJ) and phase error (PE)
+are not modelled.
+
+### Pad buffer delays for other I/O standards
+x_pad_a / x_pad_b put registered inputs and outputs on LVCMOS33 (4/8/12/16 mA x SLOW/FAST), LVTTL, LVCMOS25,
+LVCMOS18 (4-24 mA), LVCMOS15, LVCMOS12, SSTL15, SSTL135, SSTL18_I, HSTL_I, HSTL_I_18, HSUL_12, LVDS_25 and
+DIFF_SSTL15/DIFF_SSTL135 (in and out), each bank at its own VCCO, INTERNAL_VREF for the referenced standards.
+Both build with xdc3 (`build/xdc/x_pad_{a,b}/xdc3/`); nextpnr warns "no ... buffer delay is known" for every
+standard but LVCMOS33 input and LVCMOS33/12/SLOW output, as before. `flow/xdc_pads.py` turns Vivado's
+`pad_arcs.txt` into the table for the draft (keys as nextpnr builds them); pending the Vivado run.
+
 ## Remaining gaps, in order of importance
 1. **Vivado references for the 22 new designs: done 2026-11-06** (`build/xdc2_scratch/postviv.out`). They agree on every exception (requirement and which paths are cut), every clock DRC case and the IOB packing. The differences found, and where each stands (re-verified after WIP checkpoint 791d27d):
    - **OLOGIC SDR bug:** fixed by docs/drafts/nextpnr-ologic-iob-sdr (variant xdc3).
@@ -327,6 +404,7 @@ In x_iodly_minmax both corners carry the hold-repair detour:
        - a Fast-corner check for port paths, using prjxray's fast pip delays in the chipdb;
        - the clock leaf calibration (route-timing calibration).
      - **Output slack:** on one placement it is 1.03 ns optimistic, not within 0.06 ns as first reported.
+     - **Fast corner:** docs/drafts/nextpnr-timing-corners (`-o timing-corners`) reports both corners. On one placement its worst input setup is 3.306 vs Vivado's 3.354 ns (x_iodly) and 3.420 vs 3.310 (x_iodly_fall).
    - **Exception slacks:** compared on one placement ("Exceptions on one placement" above).
      - Same requirements and same cut paths in both timers.
      - nextpnr is 1.1 to 2.9 ns more optimistic on the same cells. That is the general delay calibration, not the exceptions.

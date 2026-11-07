@@ -28,6 +28,9 @@ def sets():
     for d in sorted((ROOT / "designs" / "drc").iterdir()):
         n = d.name
         out.append(("test", n, ROOT / "build" / "drc" / n, [d / f"{n}.xdc"]))
+    pw = ROOT / "designs" / "power"
+    for d in sorted(pw.iterdir()) if pw.exists() else ():
+        out.append(("power", d.name, ROOT / "build" / "power" / "open" / d.name, [d / f"{d.name}.xdc"]))
     for d in sorted((ROOT / "designs" / "gap").iterdir()):
         n = d.name
         out.append(("gap", n, ROOT / "build" / "gap" / n / "ofx", sorted(d.glob("*.xdc"))))

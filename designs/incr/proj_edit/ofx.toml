@@ -1,0 +1,7 @@
+[project]
+name = "rv_soc_edit"
+top = "rv_soc"
+board = "arty-a7-35t"
+sources = ["../rv_soc_edit/rv_soc.v", "../../rv_soc/uart.v", "../../rv_soc/picorv32.v", "../../rv_soc/sim/rm_add.v"]
+constraints = ["../../rv_soc/arty_a7_35t.xdc"]
+seed = 1

@@ -1,0 +1,461 @@
+diff --git a/himbaechel/uarch/xilinx/CMakeLists.txt b/himbaechel/uarch/xilinx/CMakeLists.txt
+index a10d35db..fa71310d 100644
+--- a/himbaechel/uarch/xilinx/CMakeLists.txt
++++ b/himbaechel/uarch/xilinx/CMakeLists.txt
+@@ -4,6 +4,7 @@ set(SOURCES
+     clock_tree.cc
+     constids.inc
+     delay_matrix.cc
++    detail_place.cc
+     extra_data.h
+     fasm.cc
+     hardblock_timing.cc
+diff --git a/himbaechel/uarch/xilinx/detail_place.cc b/himbaechel/uarch/xilinx/detail_place.cc
+new file mode 100644
+index 00000000..d0e42b15
+--- /dev/null
++++ b/himbaechel/uarch/xilinx/detail_place.cc
+@@ -0,0 +1,284 @@
++/*
++ *  nextpnr -- Next Generation Place and Route
++ *
++ *  Permission to use, copy, modify, and/or distribute this software for any
++ *  purpose with or without fee is hereby granted, provided that the above
++ *  copyright notice and this permission notice appear in all copies.
++ *
++ *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++
++
++
++
++
++
++
++
++
++
++
++
++#include <algorithm>
++#include <cmath>
++#include "log.h"
++#include "nextpnr.h"
++#include "timing.h"
++#include "util.h"
++#include "xilinx.h"
++
++#define HIMBAECHEL_CONSTIDS "uarch/xilinx/constids.inc"
++#include "himbaechel_constids.h"
++
++NEXTPNR_NAMESPACE_BEGIN
++
++namespace {
++struct DetailPlacer
++{
++    Context *ctx;
++    XilinxImpl *impl;
++    TimingAnalyser tmg;
++    int radius = 2;
++    int passes = 3;
++    float crit_min = 0.8f;
++    float crit_exp = 4.0f;
++    int max_fanout = 32;
++
++    DetailPlacer(Context *ctx, XilinxImpl *impl) : ctx(ctx), impl(impl), tmg(ctx) {}
++
++    bool movable(const CellInfo *ci) const
++    {
++        if (ci == nullptr || ci->bel == BelId())
++            return false;
++        if (!ci->type.in(id_SLICE_LUTX, id_SLICE_FFX))
++            return false;
++        if (ci->cluster != ClusterId() || ci->belStrength > STRENGTH_STRONG || ci->region != nullptr)
++            return false;
++        if (ci->attrs.count(id_X_LUT_AS_DRAM) || ci->attrs.count(id_X_LUT_AS_SRL))
++            return false;
++        return true;
++    }
++
++    delay_t arc_delay(BelId sb, IdString sp, BelId db, IdString dp) const
++    {
++        if (sb == BelId() || db == BelId())
++            return 0;
++        if (dp == id_CIN && sp == id_CO3)
++            return 0;
++        if (sb.tile == db.tile) {
++            Loc sl = ctx->getBelLocation(sb), dl = ctx->getBelLocation(db);
++            const bool same_position = (sl.z >> 4) == (dl.z >> 4);
++            const int st = sl.z & 0xF, dt = dl.z & 0xF;
++            const bool lut_src = st == BEL_6LUT || st == BEL_5LUT;
++            const bool ff_dst = dt == BEL_FF || dt == BEL_FF2;
++            if (same_position && lut_src && ff_dst && dp == id_D)
++                return 0;
++            if ((sl.z >> 6) == (dl.z >> 6))
++                return 665;
++            return 682;
++        }
++        return 313 + delay_t(1.235 * impl->predictDelay(sb, sp, db, dp));
++    }
++
++    float weight(float crit) const { return 0.02f + std::pow(std::max(0.0f, crit), crit_exp); }
++
++    double cost(const CellInfo *ci) const
++    {
++        double c = 0;
++        for (auto &port : ci->ports) {
++            if (port.first.in(id_CK, id_CLK))
++                continue;
++            NetInfo *ni = port.second.net;
++            if (ni == nullptr || ni->driver.cell == nullptr)
++                continue;
++            if (int(ni->users.entries()) > max_fanout)
++                continue;
++            if (port.second.type == PORT_IN) {
++                float cr = tmg.get_criticality(CellPortKey(ci->name, port.first));
++                c += weight(cr) * arc_delay(ni->driver.cell->bel, ni->driver.port, ci->bel, port.first);
++            } else if (port.second.type == PORT_OUT) {
++                for (auto &usr : ni->users) {
++                    if (usr.cell == nullptr || usr.cell->bel == BelId())
++                        continue;
++                    float cr = tmg.get_criticality(CellPortKey(usr));
++                    c += weight(cr) * arc_delay(ci->bel, port.first, usr.cell->bel, usr.port);
++                }
++            }
++        }
++        return c;
++    }
++
++    float cell_crit(const CellInfo *ci) const
++    {
++        float m = 0;
++        for (auto &port : ci->ports) {
++            if (port.first.in(id_CK, id_CLK))
++                continue;
++            NetInfo *ni = port.second.net;
++            if (ni == nullptr || ni->driver.cell == nullptr)
++                continue;
++            if (port.second.type == PORT_IN)
++                m = std::max(m, tmg.get_criticality(CellPortKey(ci->name, port.first)));
++            else if (port.second.type == PORT_OUT && int(ni->users.entries()) <= max_fanout)
++                for (auto &usr : ni->users)
++                    m = std::max(m, tmg.get_criticality(CellPortKey(usr)));
++        }
++        return m;
++    }
++
++    bool centre(const CellInfo *ci, int &cx, int &cy) const
++    {
++        double sx = 0, sy = 0, sw = 0;
++        auto add = [&](BelId b, float cr) {
++            if (b == BelId())
++                return;
++            Loc l = ctx->getBelLocation(b);
++            double w = weight(cr);
++            sx += w * l.x;
++            sy += w * l.y;
++            sw += w;
++        };
++        for (auto &port : ci->ports) {
++            if (port.first.in(id_CK, id_CLK))
++                continue;
++            NetInfo *ni = port.second.net;
++            if (ni == nullptr || ni->driver.cell == nullptr || int(ni->users.entries()) > max_fanout)
++                continue;
++            if (port.second.type == PORT_IN)
++                add(ni->driver.cell->bel, tmg.get_criticality(CellPortKey(ci->name, port.first)));
++            else if (port.second.type == PORT_OUT)
++                for (auto &usr : ni->users)
++                    if (usr.cell)
++                        add(usr.cell->bel, tmg.get_criticality(CellPortKey(usr)));
++        }
++        if (sw <= 0)
++            return false;
++        cx = int(std::lround(sx / sw));
++        cy = int(std::lround(sy / sw));
++        return true;
++    }
++
++    bool try_bel(CellInfo *ci, BelId nb)
++    {
++        BelId ob = ci->bel;
++        if (nb == ob || !ctx->isValidBelForCellType(ci->type, nb))
++            return false;
++        CellInfo *other = ctx->getBoundBelCell(nb);
++        if (other != nullptr && (!movable(other) || other->type != ci->type))
++            return false;
++        if (other == nullptr && !ctx->checkBelAvail(nb))
++            return false;
++        double before = cost(ci) + (other ? cost(other) : 0);
++        ctx->unbindBel(ob);
++        if (other)
++            ctx->unbindBel(nb);
++        ctx->bindBel(nb, ci, STRENGTH_WEAK);
++        if (other)
++            ctx->bindBel(ob, other, STRENGTH_WEAK);
++        bool ok = ctx->isBelLocationValid(nb) && ctx->isBelLocationValid(ob);
++        double after = ok ? cost(ci) + (other ? cost(other) : 0) : 0;
++        if (ok && after < before - 1.0)
++            return true;
++        ctx->unbindBel(nb);
++        if (other)
++            ctx->unbindBel(ob);
++        ctx->bindBel(ob, ci, STRENGTH_WEAK);
++        if (other)
++            ctx->bindBel(nb, other, STRENGTH_WEAK);
++        return false;
++    }
++
++    int improve(CellInfo *ci)
++    {
++        int cx, cy;
++        if (!centre(ci, cx, cy))
++            return 0;
++        Loc cur = ctx->getBelLocation(ci->bel);
++        std::vector<std::pair<int, BelId>> targets;
++        for (int dy = -radius; dy <= radius; dy++)
++            for (int dx = -radius; dx <= radius; dx++) {
++                int x = cx + dx, y = cy + dy;
++                if (x < 0 || y < 0 || x >= ctx->getGridDimX() || y >= ctx->getGridDimY())
++                    continue;
++                for (BelId b : ctx->getBelsByTile(x, y))
++                    if (ctx->isValidBelForCellType(ci->type, b))
++                        targets.emplace_back(std::abs(dx) + std::abs(dy), b);
++            }
++        std::stable_sort(targets.begin(), targets.end(),
++                         [](const std::pair<int, BelId> &a, const std::pair<int, BelId> &b) { return a.first < b.first; });
++        int moved = 0;
++        for (auto &t : targets) {
++            if (t.second == ci->bel)
++                continue;
++            Loc tl = ctx->getBelLocation(t.second);
++            if (tl.x == cur.x && tl.y == cur.y && (tl.z >> 6) == (cur.z >> 6) && ci->type == id_SLICE_FFX)
++                continue;
++            if (try_bel(ci, t.second)) {
++                moved++;
++                cur = ctx->getBelLocation(ci->bel);
++            }
++        }
++        return moved;
++    }
++
++    void run()
++    {
++        const std::string v = ctx->args.options.at("dpl").as<std::string>();
++        if (!v.empty()) {
++            float r = radius, p = passes, c = crit_min, e = crit_exp;
++            int n = sscanf(v.c_str(), "%f,%f,%f,%f", &r, &p, &c, &e);
++            if (n >= 1)
++                radius = std::max(1, int(r));
++            if (n >= 2)
++                passes = std::max(1, int(p));
++            if (n >= 3)
++                crit_min = c;
++            if (n >= 4)
++                crit_exp = e;
++        }
++        log_info("Detailed placement (dpl): radius %d, %d passes, criticality >= %.2f, exponent %.1f\n", radius,
++                 passes, crit_min, crit_exp);
++        tmg.setup();
++        for (int pass = 0; pass < passes; pass++) {
++            tmg.run();
++            std::vector<std::pair<float, CellInfo *>> cand;
++            for (auto &cell : ctx->cells) {
++                CellInfo *ci = cell.second.get();
++                if (!movable(ci))
++                    continue;
++                float cr = cell_crit(ci);
++                if (cr >= crit_min)
++                    cand.emplace_back(cr, ci);
++            }
++            std::stable_sort(cand.begin(), cand.end(),
++                             [](const std::pair<float, CellInfo *> &a, const std::pair<float, CellInfo *> &b) {
++                                 return a.first > b.first;
++                             });
++            int moved = 0;
++            for (auto &c : cand)
++                moved += improve(c.second);
++            log_info("    pass %d: %d candidate cells, %d moves/swaps kept\n", pass + 1, int(cand.size()), moved);
++            if (moved == 0)
++                break;
++        }
++    }
++};
++}
++
++void XilinxImpl::detail_place()
++{
++    const bool asked = ctx->args.options.count("dpl");
++    const bool replay = ctx->args.options.count("preplaced") || ctx->args.options.count("prerouted");
++    if (!asked || replay)
++        return;
++    DetailPlacer(ctx, this).run();
++}
++
++NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/pack_carry.cc b/himbaechel/uarch/xilinx/pack_carry.cc
+index e2a5e09d..85a471f1 100644
+--- a/himbaechel/uarch/xilinx/pack_carry.cc
++++ b/himbaechel/uarch/xilinx/pack_carry.cc
+@@ -225,6 +225,16 @@ void XC7Packer::pack_carries()
+ 
+     // N.B. LUT6 is not a valid type here, as CARRY requires dual outputs
+     pool<IdString> lut_types{id_LUT1, id_LUT2, id_LUT3, id_LUT4, id_LUT5};
++
++
++
++
++
++    const bool di_bypass_asked = ctx->args.options.count("carry-di-bypass");
++    pool<IdString> s_lut_types = lut_types;
++    if (di_bypass_asked)
++        s_lut_types.insert(id_LUT6);
++    int di_bypassed = 0;
+ 
+     pool<IdString> folded_nets;
+     int moved = 0, duplicated = 0;
+@@ -297,12 +307,20 @@ void XC7Packer::pack_carries()
+             // is free, or duplicated there when it is already clustered (see below)
+             CellInfo *s_dup_source = nullptr;
+             pool<IdString> s_dup_inputs;
++            const bool di_is_constant = c4_di != nullptr && (c4_di->driver.cell == nullptr ||
++                                                             c4_di->driver.cell->type.in(id_GND, id_VCC) ||
++                                                             c4_di->name == ctx->id("$PACKER_GND_NET") ||
++                                                             c4_di->name == ctx->id("$PACKER_VCC_NET"));
++            const bool x_taken_by_cyinit = z == 0 && c4->getPort(id_CYINIT) != nullptr;
++            const bool di_bypass_ok = di_bypass_asked && c4_di != nullptr && !di_is_constant && !x_taken_by_cyinit;
++            const pool<IdString> &s_types = di_bypass_ok ? s_lut_types : lut_types;
++            const int s_max_inputs = di_bypass_ok ? 6 : 5;
+             if (c4_s) {
+-                const bool s_driven_by_lut = c4_s->driver.cell != nullptr && lut_types.count(c4_s->driver.cell->type);
++                const bool s_driven_by_lut = c4_s->driver.cell != nullptr && s_types.count(c4_s->driver.cell->type);
+                 const bool s_is_only_load = c4_s->users.entries() == 1;
+                 if (s_driven_by_lut && s_is_only_load) {
+                     s_lut = c4_s->driver.cell;
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < s_max_inputs; j++) {
+                         NetInfo *ix = s_lut->getPort(ctx->idf("I%d", j));
+                         if (ix) {
+                             unique_lut_inputs.insert(ix->name);
+@@ -311,7 +329,7 @@ void XC7Packer::pack_carries()
+                     }
+                 } else if (s_driven_by_lut) {
+                     s_dup_source = c4_s->driver.cell;
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < s_max_inputs; j++) {
+                         NetInfo *ix = s_dup_source->getPort(ctx->idf("I%d", j));
+                         if (ix)
+                             s_dup_inputs.insert(ix->name);
+@@ -345,8 +363,8 @@ void XC7Packer::pack_carries()
+                 pool<IdString> shared_inputs = unique_lut_inputs;
+                 for (IdString ix : s_dup_inputs)
+                     shared_inputs.insert(ix);
+-                const int shared_input_count = int(shared_inputs.size()) + (di_lut ? 0 : 1);
+-                const bool duplicate_fits = shared_input_count <= 5;
++                const int shared_input_count = int(shared_inputs.size()) + ((di_lut || di_bypass_ok) ? 0 : 1);
++                const bool duplicate_fits = di_bypass_ok ? int(s_dup_inputs.size()) <= 6 : shared_input_count <= 5;
+                 const bool source_is_free = s_dup_source->cluster == ClusterId();
+                 if (duplicate_fits && source_is_free) {
+                     s_lut = s_dup_source;
+@@ -358,7 +376,7 @@ void XC7Packer::pack_carries()
+                     CellInfo *dup = ctx->createCell(ctx->idf("%s$S_DUP%d", s_dup_source->name.c_str(ctx), k),
+                                                     s_dup_source->type);
+                     NetInfo *dup_out = ctx->createNet(ctx->idf("%s$S_DUP%d", c4_s->name.c_str(ctx), k));
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < s_max_inputs; j++) {
+                         IdString ip = ctx->idf("I%d", j);
+                         const bool source_has_input = s_dup_source->ports.count(ip);
+                         if (!source_has_input)
+@@ -380,9 +398,13 @@ void XC7Packer::pack_carries()
+             int lut_inp_count = int(unique_lut_inputs.size());
+             if (!s_lut)
+                 ++lut_inp_count; // for feedthrough
+-            if (!di_lut)
++            if (!di_lut && !di_bypass_ok)
+                 ++lut_inp_count; // for feedthrough
+-            if (lut_inp_count > 5) {
++            const bool s_needs_whole_lut = s_lut != nullptr && s_inputs > 5;
++            if (di_bypass_ok && di_lut && (lut_inp_count > 5 || s_needs_whole_lut)) {
++
++                di_lut = nullptr;
++            } else if (lut_inp_count > 5) {
+                 // Must use feedthrough for at least one LUT
+                 di_lut = nullptr;
+                 if (s_inputs > 4)
+@@ -396,7 +418,11 @@ void XC7Packer::pack_carries()
+                 auto s_feed = feed_through_lut(c4_s, {pr});
+                 s_lut = s_feed;
+             }
+-            if (!di_lut && c4_di) {
++            if (!di_lut && c4_di && di_bypass_ok) {
++                c4->attrs[ctx->id("X_DI_BYPASS")] =
++                        Property(int_or_default(c4->attrs, ctx->id("X_DI_BYPASS"), 0) | (1 << z), 4);
++                ++di_bypassed;
++            } else if (!di_lut && c4_di) {
+                 PortRef pr;
+                 pr.cell = c4;
+                 pr.port = ctx->idf("DI[%d]", z);
+@@ -427,6 +453,8 @@ void XC7Packer::pack_carries()
+         log_info("   Moved %d shared LUTs driving carry S inputs into the carry site.\n", moved);
+     if (duplicated > 0)
+         log_info("   Duplicated %d shared LUTs driving carry S inputs.\n", duplicated);
++    if (di_bypassed > 0)
++        log_info("   %d carry DI inputs come in through the slice X pin (carry-di-bypass).\n", di_bypassed);
+ 
+     for (auto net : folded_nets)
+         ctx->nets.erase(net);
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 5fcd510e..9f179712 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -82,6 +82,12 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("hold-fix", po::value<std::string>()->implicit_value(""),
+                            "after routing, fix hold-time (min-delay) violations: small deficits by a routing "
+                            "detour, larger ones by a feedthrough LUT; optional value sets the max passes (default 8)");
++    specific.add_options()("carry-di-bypass", po::value<std::string>()->implicit_value(""),
++                           "feed a carry DI that no LUT of its own position drives through the slice X pin "
++                           "(AX..DX), as Vivado does, instead of a feed-through LUT; the S LUT may then be a LUT6");
++    specific.add_options()("dpl", po::value<std::string>()->implicit_value(""),
++                           "timing-driven detailed placement after legalisation: RADIUS,PASSES,CRIT,EXP "
++                           "(default 2,3,0.8,4); moves and swaps critical unclustered LUTs and flip-flops");
+     specific.add_options()("preplaced", po::value<std::string>(),
+                            "before placing, pin the cells named in this file to the bels they had in a reference "
+                            "build (scripts/routing_dump.py from that build's --write JSON), packer-made cells included");
+@@ -1146,6 +1152,7 @@ void XilinxImpl::postPlace()
+     // 30), with the measured delay matrix giving its estimates.  Off unless asked for, until it is measured on xc7
+     // (docs/physopt-pass-proposal.md in the tools repository).
+     replace_around_brams();
++    detail_place();
+     const bool timing_opt_asked = ctx->args.options.count("timing-opt");
+     if (timing_opt_asked) {
+         std::string v = ctx->args.options.at("timing-opt").as<std::string>();
+@@ -2089,6 +2096,10 @@ void XilinxImpl::assign_cell_tags()
+                 ct.carry.x_sigs[i] = nullptr;
+             }
+             ct.carry.x_sigs[0] = ci->getPort(id_CYINIT);
++            const int di_bypass = int_or_default(ci->attrs, ctx->id("X_DI_BYPASS"), 0);
++            for (int i = 0; i < 4; i++)
++                if (di_bypass & (1 << i))
++                    ct.carry.x_sigs[i] = ci->getPort(ctx->idf("DI%d", i));
+         } else if (ci->type == id_RAMB18E1_RAMB18E1 || ci->type == id_RAMB36E1_RAMB36E1) {
+             bool read_sdp = ((ci->type == id_RAMB18E1_RAMB18E1 &&
+                               int_or_default(ci->params, ctx->id("READ_WIDTH_B"), 0) == 36) ||
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index cc8c3442..8082e9f9 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -388,6 +388,7 @@ struct XilinxImpl : HimbaechelAPI
+     bool is_movable_bram(const CellInfo *ci) const;
+     bool place_brams_by_group();
+     void replace_around_brams();
++    void detail_place();
+ 
+     delay_t predictDelay(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const override;
+     delay_t estimateDelay(WireId src, WireId dst) const override;

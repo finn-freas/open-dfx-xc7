@@ -1,0 +1,81 @@
+diff --git a/passes/opt/dff/opt_dff.cc b/passes/opt/dff/opt_dff.cc
+index 3d684c5f7..3fdbeff04 100644
+--- a/passes/opt/dff/opt_dff.cc
++++ b/passes/opt/dff/opt_dff.cc
+@@ -88,6 +88,10 @@ struct OptDffPass : public Pass {
+ 		log("        default 1000000000, 0 = unlimited) deterministically bounds the total\n");
+ 		log("        sat effort spent per module, remaining proofs are skipped once exceeded.\n");
+ 		log("\n");
++		log("The scratchpad option 'opt_dff.keep_memrd_regs' (default off) keeps a register fed by a\n");
++		log("$memrd data port whole when a sync reset would be inferred on only part of its bits, so that\n");
++		log("memory_dff can still merge it into the read port.\n");
++		log("\n");
+ 		log("    -keepdc\n");
+ 		log("        some optimizations change the behavior of the circuit with respect to\n");
+ 		log("        don't-care bits. for example in 'a+0' a single x-bit in 'a' will cause\n");
+diff --git a/passes/opt/dff/simple.cc b/passes/opt/dff/simple.cc
+index eb2954da3..fae5c7515 100644
+--- a/passes/opt/dff/simple.cc
++++ b/passes/opt/dff/simple.cc
+@@ -36,11 +36,17 @@ struct SimpleContext
+ 	dict<SigBit, int> bitusers;        // Signal sink count
+ 	dict<SigBit, cell_int_t> bit2mux;  // Signal bit to driving MUX
+ 	dict<SigBit, cell_int_t> bit2gate; // Signal bit to driving AND/OR
++	pool<SigBit> memrd_bits;
++	bool keep_memrd_regs = false;
+ 
+ 	std::vector<Cell *> dff_cells;
+ 
+ 	SimpleContext(OptDffWorker &worker) : worker(worker)
+ 	{
++
++
++		keep_memrd_regs = worker.module->design->scratchpad_get_bool("opt_dff.keep_memrd_regs", false);
++
+ 		// Gathering three kinds of information here for every sigmapped SigBit:
+ 		// - bitusers: how many users it has (muxes will only be merged into FFs if the FF is the only user)
+ 		// - bit2mux: the mux cell and bit index that drives it, if any
+@@ -52,6 +58,10 @@ struct SimpleContext
+ 					bitusers[bit]++;
+ 
+ 		for (auto cell : worker.module->cells()) {
++			if (keep_memrd_regs && cell->type.in(ID($memrd), ID($memrd_v2)) && cell->hasPort(ID::DATA))
++				for (auto bit : worker.sigmap(cell->getPort(ID::DATA)))
++					memrd_bits.insert(bit);
++
+ 			if (cell->type.in(ID($mux), ID($pmux), ID($_MUX_))) {
+ 				RTLIL::SigSpec sig_y = worker.sigmap(cell->getPort(ID::Y));
+ 				for (int i = 0; i < GetSize(sig_y); i++)
+@@ -525,6 +535,8 @@ struct SimpleContext
+ 		std::map<ctrls_t, std::vector<int>> groups;
+ 		std::vector<int> remaining_indices;
+ 		Const::Builder val_srst_builder(ff.width);
++		SigSpec orig_d = ff.sig_d;
++		bool reset_on_memrd = false;
+ 
+ 		for (int i = 0; i < ff.width; i++) {
+ 			ctrls_t resets;
+@@ -558,6 +570,9 @@ struct SimpleContext
+ 				}
+ 			}
+ 
++			if (!resets.empty() && keep_memrd_regs && memrd_bits.count(worker.sigmap(ff.sig_d[i])))
++				reset_on_memrd = true;
++
+ 			if (!resets.empty()) {
+ 				if (ff.has_srst)
+ 					resets.insert(ctrl_t(ff.sig_srst, ff.pol_srst));
+@@ -572,6 +587,13 @@ struct SimpleContext
+ 
+ 		Const val_srst = val_srst_builder.build();
+ 
++		if (reset_on_memrd && !remaining_indices.empty()) {
++			ff.sig_d = orig_d;
++			log("Keeping %s (%s) from module %s whole: a sync reset on part of a memory read register (Q = %s).\n",
++					cell, cell->type.unescape(), worker.module, log_signal(ff.sig_q));
++			return false;
++		}
++
+ 		for (auto &it : groups) {
+ 			FfData new_ff = ff.slice(it.second);
+ 			Const::Builder new_val_srst_builder(new_ff.width);

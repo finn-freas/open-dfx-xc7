@@ -1,0 +1,27 @@
+# ofx ip clk vs Vivado clk_wiz: name part primitive in_mhz {freq_mhz phase_deg duty_pct} ...
+c01 xc7a35tcsg324-1 MMCM 100 {200 0 50}
+c02 xc7a35tcsg324-1 MMCM 100 {25 0 50} {50 0 50} {75 0 50}
+c03 xc7a35tcsg324-1 MMCM 100 {148.5 0 50}
+c04 xc7a35tcsg324-1 MMCM 100 {74.25 0 50}
+c05 xc7a35tcsg324-1 MMCM 100 {65 0 50}
+c06 xc7a35tcsg324-1 MMCM 12 {100 0 50}
+c07 xc7a35tcsg324-1 MMCM 125 {156.25 0 50}
+c08 xc7a35tcsg324-1 MMCM 100 {166.667 0 50} {200 0 50}
+c09 xc7a35tcsg324-1 MMCM 50 {40 0 50} {100 90 50}
+c10 xc7a35tcsg324-1 MMCM 100 {100 0 50} {100 90 50} {100 180 50} {100 270 50}
+c11 xc7a35tcsg324-1 MMCM 100 {25.175 0 50}
+c12 xc7a35tcsg324-1 MMCM 100 {33.333 0 40} {50 45 25}
+c13 xc7a35tcsg324-1 PLL 100 {200 0 50} {50 0 50}
+c14 xc7a35tcsg324-1 PLL 100 {125 0 50} {25 0 50}
+c15 xc7a35tcsg324-1 MMCM 27 {74.25 0 50}
+c16 xc7a35tcsg324-1 MMCM 100 {10 0 50}
+c17 xc7a35tcsg324-1 MMCM 100 {120 0 50} {48 0 50}
+c18 xc7a35tcsg324-1 MMCM 100 {325 0 50}
+c19 xc7a35tcsg324-1 PLL 125 {250 0 50} {125 0 50} {62.5 0 50}
+c20 xc7a35tcsg324-1 MMCM 100 {40 0 50} {200 0 50} {200 180 50} {100 0 50} {50 0 50} {25 0 50} {12.5 0 50}
+c21 xc7a35tcsg324-1 PLL 100 {83.333 0 50}
+c22 xc7a35tcsg324-1 MMCM 66.666 {100 0 50}
+c23 xc7a35tcsg324-2 MMCM 100 {200 0 50}
+c24 xc7a35tcsg324-2 MMCM 100 {148.5 0 50}
+c25 xc7a35tcsg324-3 MMCM 100 {74.25 0 50} {371.25 0 50}
+c26 xc7a35tcsg324-3 PLL 100 {200 0 50}

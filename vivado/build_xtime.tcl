@@ -20,13 +20,14 @@ foreach name $CONFIG_NAMES {
     puts "XTIME_BEGIN $name"
     set top [string trim [read [open $src/top.txt]]]
     set mode [string trim [read [open $src/mode.txt]]]
+    set part [expr {[file exists $src/part.txt] ? [string trim [read [open $src/part.txt]]] : $CONFIG_PART}]
     set tf [open $out/times.txt w]
     set ::cur_step read
     set rc [catch {
-        create_project -in_memory -part $CONFIG_PART
+        create_project -in_memory -part $part
         file copy -force $src/netlist.edf $out/$top.edf
         read_edif $out/$top.edf
-        link_design -top $top -part $CONFIG_PART
+        link_design -top $top -part $part
         read_xdc $src/constraints.xdc
         if {$mode eq "free"} {
             step $tf opt { opt_design }

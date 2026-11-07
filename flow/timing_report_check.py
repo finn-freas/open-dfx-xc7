@@ -25,6 +25,7 @@ CONFIG = {
     "binaries": {
         "xdc2": ROOT / "build/nextpnr-build/xdc2/nextpnr-himbaechel",
         "timrep": ROOT / "build/nextpnr-build/timrep/nextpnr-himbaechel",
+        "tmrfix": ROOT / "build/nextpnr-build/tmrfix/nextpnr-himbaechel",
     },
     "release_binaries": {
         "xdc2": ROOT / "build/nextpnr-build/rel01/nextpnr-himbaechel",
@@ -35,6 +36,10 @@ CONFIG = {
         "xdc2": ("xdc2", False),
         "timrep": ("timrep", False),
         "timrep_paths": ("timrep", True),
+    },
+    "fix_variants": {
+        "tmrfix_paths": ("tmrfix", True, []),
+        "vivado_paths": ("tmrfix", True, ["-o", "vivado-timing"]),
     },
     "new_keys": ("clocks", "endpoints", "paths"),
     "fasm_version": "# nextpnr-himbaechel ",
@@ -69,12 +74,15 @@ CONFIG = {
         "x_iodly_partial": {"json": "build/xdc/x_iodly_minmax/xdc2/x_iodly_minmax.json",
                             "xdc": "designs/timing/x_iodly_partial.xdc", "top": "x_iodly_minmax", "freq": 100,
                             "vivado": True},
+        **{n: {"json": f"build/timing_rv/synth/{n}/{n}.json", "xdc": f"designs/timing/{n}.xdc", "top": n,
+               "freq": 100, "vivado": True} for n in ("x_arst", "x_srl")},
     },
 }
 
 
 def pnr(name, d, variant, dry):
-    binary, with_paths = CONFIG["variants"][variant]
+    v = CONFIG["variants"].get(variant)
+    binary, with_paths, extra = (v[0], v[1], ()) if v else CONFIG["fix_variants"][variant]
     out = CONFIG["out"] / name / variant
     top = d["top"]
     fasm = out / f"{top}.fasm"
@@ -84,6 +92,7 @@ def pnr(name, d, variant, dry):
            "--report", str(out / "report.json")] + CONFIG["npr_args"]
     if with_paths:
         cmd += ["--report-paths", str(CONFIG["report_paths"])]
+    cmd += list(extra)
     binaries = CONFIG["release_binaries" if d.get("release") else "binaries"]
     cmd += CONFIG["release_args"] if d.get("release") else []
     if fasm.exists():
@@ -125,9 +134,22 @@ def noop(name, d):
             "paths": len(rep["timrep_paths"].get("paths", []))}
 
 
-def xtime_prep(name, d, dry):
-    run = ROOT / d["run"] if d.get("run") else CONFIG["out"] / name / "timrep_paths"
-    src = CONFIG["xtime_src"] / f"{name}_tr_placed"
+def noop_fix(name, d):
+    """tmrfix without -o vivado-timing against timrep: the same FASM and the same report."""
+    top = d["top"]
+    a, b = CONFIG["out"] / name / "timrep_paths", CONFIG["out"] / name / "tmrfix_paths"
+    if not ((a / f"{top}.fasm").exists() and (b / f"{top}.fasm").exists()):
+        return {"design": name, "done": False}
+    return {"design": name, "done": True,
+            "fasm_tmrfix_eq_timrep": strip_version((a / f"{top}.fasm").read_text()) ==
+            strip_version((b / f"{top}.fasm").read_text()),
+            "report_tmrfix_eq_timrep": json.loads((a / "report.json").read_text()) ==
+            json.loads((b / "report.json").read_text())}
+
+
+def xtime_prep(name, d, dry, variant="timrep_paths", suffix="tr"):
+    run = ROOT / d["run"] if d.get("run") else CONFIG["out"] / name / variant
+    src = CONFIG["xtime_src"] / f"{name}_{suffix}_placed"
     if dry:
         print(f"[dry] xtime source {src}")
         return src.name
@@ -154,12 +176,29 @@ def main():
     ap.add_argument("--designs", nargs="+", default=list(CONFIG["designs"]))
     ap.add_argument("--out", type=Path, help="output root (default build/timing); a fresh one re-runs every build")
     ap.add_argument("--run", action="store_true")
+    ap.add_argument("--fix", action="store_true", help="build the vivado-checks draft variants instead "
+                                                       "(no-op against timrep, Vivado sources from vivado_paths)")
     a = ap.parse_args()
     if a.out:
         CONFIG["out"] = a.out.resolve()
         CONFIG["xtime_src"] = CONFIG["out"] / "xtime" / "src"
     dry = CONFIG["dry_run"] and not a.run
     results, names = [], []
+    if a.fix:
+        for name in a.designs:
+            d = CONFIG["designs"][name]
+            for v in ("timrep_paths",) + tuple(CONFIG["fix_variants"]):
+                pnr(name, d, v, dry)
+            if not dry:
+                results.append(noop_fix(name, d))
+                if d["vivado"]:
+                    names.append(xtime_prep(name, d, dry, "vivado_paths", "vt"))
+        for r in results:
+            print(json.dumps(r))
+        if not dry and results:
+            (CONFIG["out"] / "noop_fix.json").write_text(json.dumps(results, indent=1) + "\n")
+        print(f"vivado names: {','.join(names)}")
+        return
     for name in a.designs:
         d = CONFIG["designs"][name]
         for v in CONFIG["variants"] if not d.get("run") else ():

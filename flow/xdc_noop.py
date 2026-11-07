@@ -19,6 +19,7 @@ CONFIG = {
         "xdc": "build/nextpnr-build/xdc/nextpnr-himbaechel",
         "xdc2": "build/nextpnr-build/xdc2/nextpnr-himbaechel",
         "xdc3": "build/nextpnr-build/xdc3/nextpnr-himbaechel",
+        "corners": "build/nextpnr-build/corners/nextpnr-himbaechel",
     },
     "reference": "router",
     "new": "xdc2",

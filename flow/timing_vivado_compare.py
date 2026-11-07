@@ -13,6 +13,8 @@ XT2 = ("x_gen_none", "x_mmcm_none", "x_iodly", "rv_soc", "rv_mul", "rv_soc_hb", 
 XT3 = ("x_cdc_none", "x_cdc_groups", "x_cdc_fpclk", "x_cdc_maxdly", "x_async_rtl", "x_async_none", "x_iodly_minmax",
        "x_mmcm_groups", "x_gen_div", "x_iodly_partial")
 
+XT5 = ("x_cdc_none", "x_iodly_partial", "x_iodly_minmax", "x_arst", "x_srl", "x_mmcm_none")
+
 CONFIG = {
     "vivado": Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build"),
     "out": ROOT / "build" / "timing_rv" / "compare.json",
@@ -21,6 +23,8 @@ CONFIG = {
         "dfx_rv_pr_xor_n": ("build/timing/dfx_rv_pr/rel01tr_p10/rel01tr/xor_n",
                             "timing_xtime2/dfx_rv_pr_xor_n_tr_placed"),
         **{n: (f"build/timing_rv/{n}/timrep_paths", f"timing_xtime3/{n}_tr_placed") for n in XT3},
+        **{f"{n}_vt": (f"build/timing_rv/{n}/vivado_paths", f"timing_xtime5/{n}_vt_placed") for n in XT5},
+        **{n: (f"build/timing_rv/{n}/timrep_paths", f"timing_xtime5/{n}_tr_placed") for n in ("x_arst", "x_srl")},
         "x_gen_none_own": ("build/timing/x_gen_none/timrep_paths", "xdc/x_gen_none"),
         "x_mmcm_none_own": ("build/timing/x_mmcm_none/timrep_paths", "xdc/x_mmcm_none"),
         "x_iodly_own": ("build/timing/x_iodly/timrep_paths", "xdc/x_iodly"),
@@ -113,12 +117,13 @@ def vivado(d):
     text = (d / "timing.rpt").read_text(errors="replace")
     out = {"check_timing": {k: int(n) for k, n in re.findall(r"^\d+\. checking (\w+) \((\d+)\)", text, re.M)}}
     body = section(text, "Design Timing Summary").splitlines()
-    nums = next((ln.split() for ln in body if re.match(r"^\s*-?\d", ln)), [])
+    nums = next((ln.split() for ln in body if re.match(r"^\s*(-?\d|NA\s)", ln)), [])
+    cnt = lambda x: None if x == "NA" else int(x)
     if len(nums) >= 8:
-        out["summary"] = {"setup": [num(nums[0]), num(nums[1]), int(nums[2]), int(nums[3])],
-                          "hold": [num(nums[4]), num(nums[5]), int(nums[6]), int(nums[7])]}
+        out["summary"] = {"setup": [num(nums[0]), num(nums[1]), cnt(nums[2]), cnt(nums[3])],
+                          "hold": [num(nums[4]), num(nums[5]), cnt(nums[6]), cnt(nums[7])]}
         if len(nums) >= 12:
-            out["summary"]["pw"] = [num(nums[8]), num(nums[9]), int(nums[10]), int(nums[11])]
+            out["summary"]["pw"] = [num(nums[8]), num(nums[9]), cnt(nums[10]), cnt(nums[11])]
     for title, key, nclk in (("Intra Clock Table", "intra", 1), ("Inter Clock Table", "inter", 2)):
         rows = {}
         for ln in section(text, title).splitlines():
@@ -137,6 +142,15 @@ def vivado(d):
             elif len(vals) == 4 and key == "intra":
                 rows[name] = {"pw": vals}
         out[key] = rows
+    out["other_groups"] = {}
+    for ln in section(text, "Other Path Groups Table").splitlines():
+        parts = ln.split()
+        if len(parts) >= 11 and parts[0].startswith("**"):
+            try:
+                vals = [float(x) for x in parts[3:11]]
+            except ValueError:
+                continue
+            out["other_groups"][f"{parts[0]} {parts[1]} -> {parts[2]}"] = {"setup": vals[0:4], "hold": vals[4:8]}
     out["clocks"] = sorted(re.findall(r"^\s*(\S+)\s+\{[\d. ]+\}\s+[\d.]+\s+[\d.]+\s*$",
                                       section(text, "Clock Summary"), re.M))
     out["endpoints"] = {k: vivado_endpoints(d, k) for k in ("setup", "hold")}
@@ -164,13 +178,18 @@ def vivado(d):
     ci = d / "clock_interaction.rpt"
     out["interaction"] = {}
     if ci.exists():
+        body = False
         for ln in ci.read_text(errors="replace").splitlines():
-            m = re.match(r"^(\S+)\s+(\S+)\s+((?:rise|fall) - (?:rise|fall))\s+(.*)$", ln)
-            if not m:
+            if re.match(r"^-{6,}\s+-{6,}", ln):
+                body = True
                 continue
-            cols = split_cols(m.group(4))
-            out["interaction"][f"{m.group(1)} -> {m.group(2)}"] = {"edges": m.group(3), "cols": cols,
-                                                                    "constraints": cols[-1] if cols else None}
+            cols = split_cols(ln)
+            if not body or len(cols) < 5:
+                body = body and bool(cols)
+                continue
+            edges = next((c for c in cols if re.fullmatch(r"(rise|fall) - (rise|fall)", c)), "")
+            out["interaction"][f"{cols[0]} -> {cols[1]}"] = {"edges": edges, "cols": cols, "class": cols[-2],
+                                                              "constraints": cols[-1]}
     cdc = d / "cdc.rpt"
     out["cdc"] = {}
     if cdc.exists():
@@ -209,7 +228,8 @@ def ours(d):
     pwpack = lambda r: [r["wns"], r["tns"], r["failing"], r["total"]]
     by_pair = defaultdict(list)
     for e in timed:
-        by_pair[(timing.event_clock(e["from"], names), timing.event_clock(e["to"], names))].append(e)
+        if not timing.is_async_check(timing.netlist(str(dd)), e):
+            by_pair[(timing.event_clock(e["from"], names), timing.event_clock(e["to"], names))].append(e)
     pw_by = defaultdict(list)
     for c in pw:
         pw_by[c["clock"]].append(c)
@@ -242,10 +262,17 @@ def ours(d):
         if row:
             intra[a] = row
     inter_rows = timing.interaction(dd, rep, eps, names)
+    other = defaultdict(list)
+    for e in timed:
+        if timing.is_async_check(nl, e):
+            other[f"**async_default** {timing.event_clock(e['from'], names)} -> "
+                  f"{timing.event_clock(e['to'], names)}"].append(e)
     order = [r[0].strip() for r in timing.clock_tree_rows(clocks, set())]
     keys = timing.path_groups(timed, names, order)[0]
     groups = ([f"{c} -> {c}" for c in order if (c, c) in by_pair or pw_by.get(c)]
-              + [f"{a} -> {b}" for a, b in keys if a != b])
+              + [f"{a} -> {b}" for a, b in keys if a != b]
+              + sorted({f"{r['from']} -> {r['to']}" for r in inter_rows if r["from"] != r["to"]}
+                       - {f"{a} -> {b}" for a, b in keys}))
     pulse = {}
     for c in pw:
         k = pulse.setdefault(c["clock"], {})
@@ -258,7 +285,8 @@ def ours(d):
                                                           "total": r["total"], "wns": r["wns"]} for r in inter_rows},
             "cdc": {f"{r[1]} -> {r[2]}": {"severity": r[0], "type": r[3], "exceptions": r[4], "endpoints": r[5],
                                           "safe": r[6], "unsafe": r[7], "unknown": r[8]}
-                    for r in timing.cdc_rows(dd, inter_rows)},
+                    for r in timing.cdc_rows(dd, inter_rows, clocks)},
+            "other_groups": {k: pack(timing.summary_row(v)) for k, v in other.items()},
             "pulse": pulse, "worst_path": wpath, "worst_endpoints": [[norm(k), v] for k, v in worst],
             "details_groups": groups}
 
@@ -360,6 +388,8 @@ def structure(n, v):
         pw[c] = {chk: {"ofx": a.get(chk), "vivado": b.get(chk)} for chk in sorted(set(a) | set(b))}
     out["pulse"] = pw
     out["details_groups"] = {"ofx": n["details_groups"], "vivado": v["details_groups"]}
+    out["other_groups"] = {g: {"ofx": n["other_groups"].get(g), "vivado": v.get("other_groups", {}).get(g)}
+                           for g in sorted(set(n["other_groups"]) | set(v.get("other_groups", {})))}
     return out
 
 
@@ -421,6 +451,8 @@ def main():
         print(f"  interaction {json.dumps(st['interaction'])}")
         print(f"  cdc {json.dumps(st['cdc'])}")
         print(f"  groups {json.dumps(st['details_groups'])}")
+        if st["other_groups"]:
+            print(f"  other groups {json.dumps(st['other_groups'])}")
         print(f"  selection: {json.dumps(res[name]['selection'])}")
         for kind, dd in res[name]["endpoint_diff"].items():
             short = {k: dd[k] for k in ("nextpnr_total", "vivado_total", "common", "slack_delta_mean",

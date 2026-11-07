@@ -1,0 +1,10 @@
+[project]
+name = "pcie_bare"
+top = "pcie_bare"
+part = "xc7a35tcpg236-1"
+sources = ["src/pcie_bare.v"]
+constraints = ["constraints/pcie_bare.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

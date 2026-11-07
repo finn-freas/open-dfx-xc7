@@ -1,0 +1,489 @@
+diff --git a/common/kernel/command.cc b/common/kernel/command.cc
+index 6759ae12..5beb2d40 100644
+--- a/common/kernel/command.cc
++++ b/common/kernel/command.cc
+@@ -457,6 +457,9 @@ po::options_description CommandHandler::getGeneralOptions()
+                           "under --router2-region-keep-out, let the arcs whose criticality is at least this value when "
+                           "routing starts cross the regions (default: none)");
+ 
++    general.add_options()("router2-opt", po::value<std::vector<std::string>>(),
++                          "set a router2 setting, KEY=VALUE (stored as router2/KEY; repeatable)");
++
+     general.add_options()("report", po::value<std::string>(),
+                           "write timing and utilization report in JSON format to file");
+     general.add_options()("detailed-timing-report", "Append detailed net timing data to the JSON report");
+@@ -629,6 +632,15 @@ void CommandHandler::setupContext(Context *ctx)
+         ctx->settings[ctx->id("router2/regionKeepOutCrit")] =
+                 std::to_string(vm["router2-region-keep-out-crit"].as<float>());
+ 
++    if (vm.count("router2-opt")) {
++        for (auto &kv : vm["router2-opt"].as<std::vector<std::string>>()) {
++            auto eq = kv.find('=');
++            if (eq == std::string::npos)
++                log_error("--router2-opt expects KEY=VALUE, got '%s'\n", kv.c_str());
++            ctx->settings[ctx->id("router2/" + kv.substr(0, eq))] = kv.substr(eq + 1);
++        }
++    }
++
+     if (vm.count("static-dump-density"))
+         ctx->settings[ctx->id("static/dump_density")] = true;
+     if (vm.count("placer-static-timingweight"))
+diff --git a/common/route/router2.cc b/common/route/router2.cc
+index 235874fb..6d75fffa 100644
+--- a/common/route/router2.cc
++++ b/common/route/router2.cc
+@@ -76,6 +76,8 @@ struct Router2
+         // Exempt from region_keep_out: critical at the start of routing; see
+         // exempt_critical_arcs()
+         bool keep_out_exempt = false;
++
++        bool force_reroute = false;
+     };
+ 
+     // As we allow overlap at first; the nextpnr bind functions can't be used
+@@ -1226,7 +1228,9 @@ struct Router2
+         const int bwd_root_idx = wire_to_idx.at(bwd_root);
+         // Calculate a timing weight based on criticality
+         float crit = get_arc_crit(net, i);
+-        float crit_weight = std::max<float>(0.05f, (1.0f - std::pow(crit, 2)));
++        float crit_weight = std::max<float>(cfg.crit_floor, (1.0f - std::pow(crit, cfg.crit_exp)));
++        const float est_w = (cfg.crit_est_weight >= 0 && crit >= cfg.crit_est_thresh) ? cfg.crit_est_weight
++                                                                                       : cfg.estimate_weight;
+         ROUTE_LOG_DBG("     crit=%.3f crit_weight=%.3f\n", crit, crit_weight);
+         // Check if arc was already done _in this iteration_
+         if (t.processed_sinks.count(dst_wire))
+@@ -1264,10 +1268,16 @@ struct Router2
+                 WireScore base_score;
+                 base_score.delay = 0;
+                 base_score.cost = 0;
++
++
++                if (cfg.crit_seed_delay > 0 && wire != fwd_root) {
++                    base_score.delay = ctx->getDelayNS(delay_from_source(nd, wire));
++                    base_score.cost = cfg.crit_seed_delay * crit * base_score.delay;
++                }
+                 int wire_idx = wire_to_idx.at(wire);
+                 base_score.togo_cost = get_togo_cost(net, i, wire_idx, bwd_root, false, crit_weight);
+                 t.fwd_queue.push(QueuedWire(wire_idx, base_score));
+-                set_visited_fwd(t, wire_idx, PipId(), 0.0);
++                set_visited_fwd(t, wire_idx, PipId(), base_score.cost);
+             };
+             auto &dst_data = flat_wires.at(bwd_root_idx);
+             // Look for nearby existing routing
+@@ -1349,7 +1359,7 @@ struct Router2
+                         next_score.delay = curr.score.delay + cfg.get_base_cost(ctx, next, dh, crit_weight);
+                         next_score.cost = curr.score.cost + score_wire_for_arc(net, i, phys_pin, next, dh, crit_weight);
+                         next_score.togo_cost =
+-                                cfg.estimate_weight * get_togo_cost(net, i, next_idx, bwd_root, false, crit_weight);
++                                est_w * get_togo_cost(net, i, next_idx, bwd_root, false, crit_weight);
+                         if (was_visited_fwd(next_idx, next_score.delay)) {
+                             // Don't expand the same node twice.
+                             continue;
+@@ -1429,7 +1439,7 @@ struct Router2
+                         next_score.cost = curr.score.cost + score_wire_for_arc(net, i, phys_pin, next, uh, crit_weight);
+                         next_score.togo_cost = const_mode
+                                                        ? 0
+-                                                       : cfg.estimate_weight * get_togo_cost(net, i, next_idx, fwd_root,
++                                                       : est_w * get_togo_cost(net, i, next_idx, fwd_root,
+                                                                                              true, crit_weight);
+                         if (was_visited_bwd(next_idx, next_score.delay)) {
+                             // Don't expand the same node twice.
+@@ -1600,6 +1610,15 @@ struct Router2
+         bool failed_slack = false;
+         for (auto usr : net->users.enumerate())
+             failed_slack |= arc_failed_slack(net, usr.index);
++
++
++
++        for (auto &arcs : nd.arcs)
++            for (auto &a : arcs)
++                if (a.force_reroute) {
++                    failed_slack = true;
++                    a.force_reroute = false;
++                }
+         for (auto usr : net->users.enumerate()) {
+             auto &ad = nd.arcs.at(usr.index.idx());
+             for (size_t j = 0; j < ad.size(); j++) {
+@@ -1689,6 +1708,138 @@ struct Router2
+     int total_resource_overuse = 0;
+     std::vector<int> route_queue;
+     std::set<int> failed_nets;
++    int crit_rounds = 0;
++
++
++
++    struct ArcSnap
++    {
++        bool routed = false;
++        std::vector<std::pair<int, PipId>> path;
++    };
++    std::vector<std::vector<std::vector<ArcSnap>>> best_snap;
++    delay_t best_ws = std::numeric_limits<delay_t>::lowest();
++
++    bool arc_is_snapshotted(NetInfo *ni, PerArcData &ad, store_index<PortRef> u, size_t j)
++    {
++        return ni->constant_value == IdString() && ni->driver.cell != nullptr && !ad.pre_routed &&
++               !arc_route_is_locked(ni, u, j) && nets.at(ni->udata).src_wire != WireId();
++    }
++
++    void take_snapshot()
++    {
++        best_snap.assign(nets_by_udata.size(), {});
++        for (size_t i = 0; i < nets_by_udata.size(); i++) {
++            NetInfo *ni = nets_by_udata.at(i);
++            auto &nd = nets.at(i);
++            best_snap.at(i).resize(nd.arcs.size());
++            for (auto usr : ni->users.enumerate()) {
++                auto &arcs = nd.arcs.at(usr.index.idx());
++                auto &sa = best_snap.at(i).at(usr.index.idx());
++                sa.resize(arcs.size());
++                for (size_t j = 0; j < arcs.size(); j++) {
++                    if (!arc_is_snapshotted(ni, arcs.at(j), usr.index, j))
++                        continue;
++                    sa.at(j).routed = arcs.at(j).routed;
++                    if (!arcs.at(j).routed)
++                        continue;
++                    WireId cursor = arcs.at(j).sink_wire;
++                    while (cursor != nd.src_wire) {
++                        PipId pip = nd.wires.at(cursor).first;
++                        sa.at(j).path.emplace_back(wire_to_idx.at(cursor), pip);
++                        cursor = ctx->getPipSrcWire(pip);
++                    }
++                }
++            }
++        }
++    }
++
++    void restore_snapshot()
++    {
++        for (size_t i = 0; i < nets_by_udata.size(); i++) {
++            NetInfo *ni = nets_by_udata.at(i);
++            auto &nd = nets.at(i);
++            for (auto usr : ni->users.enumerate())
++                for (size_t j = 0; j < nd.arcs.at(usr.index.idx()).size(); j++)
++                    if (arc_is_snapshotted(ni, nd.arcs.at(usr.index.idx()).at(j), usr.index, j))
++                        ripup_arc(ni, usr.index, j);
++        }
++        for (size_t i = 0; i < nets_by_udata.size(); i++) {
++            NetInfo *ni = nets_by_udata.at(i);
++            auto &nd = nets.at(i);
++            for (auto usr : ni->users.enumerate()) {
++                auto &arcs = nd.arcs.at(usr.index.idx());
++                for (size_t j = 0; j < arcs.size(); j++) {
++                    auto &s = best_snap.at(i).at(usr.index.idx()).at(j);
++                    if (!s.routed || arcs.at(j).routed)
++                        continue;
++                    for (auto it = s.path.rbegin(); it != s.path.rend(); ++it)
++                        bind_pip_internal(nd, usr.index, it->first, it->second);
++                    arcs.at(j).routed = true;
++                }
++            }
++        }
++        for (size_t i = 0; i < nets_by_udata.size(); i++)
++            route_queue.push_back(int(i));
++        update_route_delays();
++        route_queue.clear();
++        tmg.run(false);
++    }
++
++
++
++    delay_t delay_from_source(const PerNetData &nd, WireId wire)
++    {
++        delay_t d = 0;
++        WireId cursor = wire;
++        for (int guard = 0; guard < 100000; guard++) {
++            d += ctx->getWireDelay(cursor).maxDelay();
++            auto fnd = nd.wires.find(cursor);
++            if (fnd == nd.wires.end() || fnd->second.first == PipId())
++                break;
++            d += ctx->getPipDelay(fnd->second.first).maxDelay();
++            cursor = ctx->getPipSrcWire(fnd->second.first);
++        }
++        return d;
++    }
++
++    delay_t worst_setup_slack()
++    {
++        delay_t worst = std::numeric_limits<delay_t>::max();
++        for (auto ni : nets_by_udata)
++            for (auto &usr : ni->users) {
++                delay_t s = delay_t(tmg.get_setup_slack(CellPortKey(usr)));
++                if (s > std::numeric_limits<delay_t>::lowest() / 2)
++                    worst = std::min(worst, s);
++            }
++        return worst;
++    }
++
++
++
++    int mark_critical_arcs()
++    {
++        int n = 0;
++        for (size_t i = 0; i < nets_by_udata.size(); i++) {
++            NetInfo *ni = nets_by_udata.at(i);
++            if (ni->constant_value != IdString() || ni->driver.cell == nullptr)
++                continue;
++            auto &nd = nets.at(i);
++            for (auto usr : ni->users.enumerate()) {
++                if (tmg.get_criticality(CellPortKey(usr.value)) < cfg.crit_ripup_thresh)
++                    continue;
++                auto &ad = nd.arcs.at(usr.index.idx());
++                for (size_t j = 0; j < ad.size(); j++) {
++                    if (ad.at(j).pre_routed || arc_route_is_locked(ni, usr.index, j))
++                        continue;
++                    ad.at(j).force_reroute = true;
++                    failed_nets.insert(int(i));
++                    n++;
++                }
++            }
++        }
++        return n;
++    }
+ 
+     // Size a net's bounding box from its timing criticality, not from how many
+     // times it has failed to route.  This is the inverse of grow-on-congestion:
+@@ -2796,6 +2947,37 @@ struct Router2
+                     }
+                 }
+             }
++            const bool legal_now =
++                    overused_wires == 0 && overused_resources == 0 && tmgfail == 0 && failed_nets.empty();
++            if (timing_driven && cfg.crit_ripup_iters > 0 && legal_now) {
++                int n_arcs = 0;
++                const bool another_round = crit_rounds < cfg.crit_ripup_iters;
++                const delay_t ws = worst_setup_slack();
++                const bool best_so_far = best_snap.empty() || ws > best_ws;
++                if (best_so_far && cfg.crit_ripup_keep_best) {
++                    best_ws = ws;
++                    take_snapshot();
++                }
++                if (another_round)
++                    n_arcs = mark_critical_arcs();
++                log_info("    critical rip-up: legal routing, worst setup slack %.3f ns%s\n", ctx->getDelayNS(ws),
++                         another_round ? stringf(", round %d rips up %d arc(s)", crit_rounds + 1, n_arcs).c_str()
++                                       : "");
++                if (!another_round && cfg.crit_ripup_keep_best && !best_so_far) {
++                    restore_snapshot();
++                    log_info("    critical rip-up: restored the best legal routing, worst setup slack %.3f ns (now "
++                             "%.3f ns)\n",
++                             ctx->getDelayNS(best_ws), ctx->getDelayNS(worst_setup_slack()));
++                }
++                if (another_round) {
++                    crit_rounds++;
++                    if (n_arcs > 0) {
++                        tmgfail = n_arcs;
++                        if (cfg.crit_ripup_reset_cong)
++                            curr_cong_weight = cfg.init_curr_cong_weight;
++                    }
++                }
++            }
+             if (overused_wires == 0 && overused_resources == 0 && tmgfail == 0) {
+                 // Try and actually bind nextpnr Arch API wires
+                 bind_and_check_all();
+@@ -2878,6 +3060,15 @@ Router2Cfg::Router2Cfg(Context *ctx)
+     region_contain_constants = ctx->setting<bool>("router2/regionContainConstants", true);
+     region_keep_out = ctx->setting<bool>("router2/regionKeepOut", false);
+     region_keep_out_crit = ctx->setting<float>("router2/regionKeepOutCrit", 1.1f);
++    crit_exp = ctx->setting<float>("router2/critExp", 2.0f);
++    crit_floor = ctx->setting<float>("router2/critFloor", 0.05f);
++    crit_est_weight = ctx->setting<float>("router2/critEstWeight", -1.0f);
++    crit_est_thresh = ctx->setting<float>("router2/critEstThresh", 0.9f);
++    crit_ripup_iters = ctx->setting<int>("router2/critRipupIters", 0);
++    crit_ripup_thresh = ctx->setting<float>("router2/critRipupThresh", 0.9f);
++    crit_ripup_reset_cong = ctx->setting<bool>("router2/critRipupResetCong", true);
++    crit_ripup_keep_best = ctx->setting<bool>("router2/critRipupKeepBest", true);
++    crit_seed_delay = ctx->setting<float>("router2/critSeedDelay", 0.0f);
+     ipin_cost_adder = ctx->setting<float>("router2/ipinCostAdder", 0.0f);
+     bias_cost_factor = ctx->setting<float>("router2/biasCostFactor", 0.25f);
+     if (ctx->settings.count(ctx->id("router2/alt-weights"))) {
+diff --git a/common/route/router2.h b/common/route/router2.h
+index c5bbeac3..6bfdc0b3 100644
+--- a/common/route/router2.h
++++ b/common/route/router2.h
+@@ -54,6 +54,23 @@ struct Router2Cfg
+     // of choosing a less congestion/delay-optimal route
+     float estimate_weight;
+ 
++
++
++
++
++
++
++
++    float crit_exp = 2.0f, crit_floor = 0.05f;
++    float crit_est_weight = -1.0f, crit_est_thresh = 0.9f;
++    int crit_ripup_iters = 0;
++    float crit_ripup_thresh = 0.9f;
++    bool crit_ripup_reset_cong = true;
++    bool crit_ripup_keep_best = true;
++
++
++    float crit_seed_delay = 0.0f;
++
+     // Congestion smoothing: a post-legality rip-up and re-route that makes
+     // tile DENSITY a cost.  router2's own congestion cost is driven by
+     // overuse -- nets illegally sharing a wire -- so once routing is legal
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 5fcd510e..4b8deb60 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -82,6 +82,10 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("hold-fix", po::value<std::string>()->implicit_value(""),
+                            "after routing, fix hold-time (min-delay) violations: small deficits by a routing "
+                            "detour, larger ones by a feedthrough LUT; optional value sets the max passes (default 8)");
++    specific.add_options()("place-import", po::value<std::string>(),
++                           "before placing, bind the cells named in this file (\"<cell>\\t<bel>\" per line) to those "
++                           "bels, locked, where the bel is free and the tile stays legal (a placement made by another "
++                           "tool); the placer places the rest");
+     specific.add_options()("preplaced", po::value<std::string>(),
+                            "before placing, pin the cells named in this file to the bels they had in a reference "
+                            "build (scripts/routing_dump.py from that build's --write JSON), packer-made cells included");
+@@ -944,6 +948,126 @@ void XilinxImpl::close_routed_tiles()
+         log_info("Pre-routed: %d more tile(s) closed to new cells, a reference route passes through them.\n", closed);
+ }
+ 
++
++
++
++
++void XilinxImpl::apply_place_import()
++{
++    const ArchArgs &args = ctx->args;
++    if (!args.options.count("place-import"))
++        return;
++    std::string path = args.options.at("place-import").as<std::string>();
++    std::ifstream in(path);
++    if (!in)
++        log_error("cannot read place-import file '%s'\n", path.c_str());
++    int bound = 0, no_cell = 0, no_bel = 0, busy = 0, illegal = 0, child = 0, cl_fail = 0, cl_moved = 0;
++    dict<IdString, BelId> want;
++    std::vector<IdString> order;
++    std::string line;
++    while (std::getline(in, line)) {
++        auto tab = line.find('\t');
++        if (tab == std::string::npos)
++            continue;
++        IdString cn = ctx->id(line.substr(0, tab));
++        if (!ctx->cells.count(cn)) {
++            no_cell++;
++            continue;
++        }
++        BelId bel = ctx->getBelByNameStr(line.substr(tab + 1));
++        if (bel == BelId()) {
++            if (no_bel < 10)
++                log_info("place-import: no bel '%s'\n", line.substr(tab + 1).c_str());
++            no_bel++;
++            continue;
++        }
++        want[cn] = bel;
++        order.push_back(cn);
++    }
++    auto tile_ok = [&](BelId b) { return isBelLocationValid(b); };
++    for (int pass = 0; pass < 2; pass++) {
++        for (IdString cn : order) {
++            CellInfo *ci = ctx->cells.at(cn).get();
++            if (ci->bel != BelId())
++                continue;
++            BelId bel = want.at(cn);
++            bool is_root = ci->cluster != ClusterId() && ci->cluster == ci->name;
++            bool is_child = ci->cluster != ClusterId() && ci->cluster != ci->name;
++            if ((pass == 0) != is_root)
++                continue;
++            if (is_child) {
++                child++;
++                continue;
++            }
++            if (is_root) {
++                std::vector<std::pair<CellInfo *, BelId>> placement;
++                bool ok = ctx->getClusterPlacement(ci->cluster, bel, placement);
++                std::string why = ok ? "" : "no cluster placement at the root bel";
++                for (auto &p : placement) {
++                    if (!ok)
++                        break;
++                    if (p.second == BelId()) {
++                        ok = false;
++                        why = stringf("no bel for %s", ctx->nameOf(p.first));
++                    } else if (!ctx->checkBelAvail(p.second)) {
++                        ok = false;
++                        CellInfo *holder = ctx->getBoundBelCell(p.second);
++                        why = stringf("%s wants %s, held by %s", ctx->nameOf(p.first), ctx->nameOfBel(p.second),
++                                      holder ? ctx->nameOf(holder) : "?");
++                    } else if (!ctx->isValidBelForCellType(p.first->type, p.second)) {
++                        ok = false;
++                        why = stringf("%s cannot go on %s", ctx->nameOf(p.first), ctx->nameOfBel(p.second));
++                    }
++                }
++                if (!ok) {
++                    if (cl_fail < 10)
++                        log_info("place-import: cluster %s not placed: %s\n", ctx->nameOf(ci), why.c_str());
++                    cl_fail++;
++                    continue;
++                }
++                for (auto &p : placement)
++                    ctx->bindBel(p.second, p.first, STRENGTH_LOCKED);
++                bool legal = true;
++                for (auto &p : placement)
++                    legal = legal && tile_ok(p.second);
++                if (!legal) {
++                    if (cl_fail < 10)
++                        log_info("place-import: cluster %s not placed: tile not legal with it\n", ctx->nameOf(ci));
++                    for (auto &p : placement)
++                        ctx->unbindBel(p.second);
++                    cl_fail++;
++                    continue;
++                }
++                for (auto &p : placement) {
++                    bound++;
++                    if (p.first != ci && want.count(p.first->name) && want.at(p.first->name) != p.second)
++                        cl_moved++;
++                }
++                continue;
++            }
++            if (!ctx->checkBelAvail(bel) || !ctx->isValidBelForCellType(ci->type, bel)) {
++                busy++;
++                continue;
++            }
++            ctx->bindBel(bel, ci, STRENGTH_LOCKED);
++            if (!tile_ok(bel)) {
++                ctx->unbindBel(bel);
++                illegal++;
++                continue;
++            }
++            bound++;
++        }
++    }
++    int left = 0;
++    for (auto &cell : ctx->cells)
++        if (cell.second->bel == BelId())
++            left++;
++    log_info("place-import: %d cell(s) bound; not in design %d, unknown bel %d, bel taken %d, tile illegal %d, "
++             "cluster not placeable %d, cluster member off its imported bel %d; %d cell(s) left to the placer\n",
++             bound, no_cell, no_bel, busy, illegal, cl_fail, cl_moved, left);
++    (void)child;
++}
++
+ void XilinxImpl::prePlace()
+ {
+     apply_holdbufs();
+@@ -977,6 +1101,7 @@ void XilinxImpl::prePlace()
+         if (ci->bel != BelId())
+             notifyBelChange(ci->bel, ci);
+     }
++    apply_place_import();
+ }
+ 
+ // Vivado's rule_gclkio_bufg (Place 30-574): an input pad that drives a BUFGCTRL straight through its
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index cc8c3442..09e6e86e 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -266,6 +266,7 @@ struct XilinxImpl : HimbaechelAPI
+     bool route_outside_pblocks(NetInfo *ni, WireId target, const pool<Loc> &closed, const pool<WireId> &reserved,
+                                std::vector<PipId> &path, int &visits);
+     void apply_preplaced(bool verbose = true);
++    void apply_place_import();
+     void apply_holdbufs();
+     void close_routed_tiles();
+     pool<int> frozen_tiles; // tiles holding -o preplaced cells: no other cell may go there

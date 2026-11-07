@@ -381,6 +381,136 @@ for nm, props in CFG_SETTINGS.items():
     design(nm, blinky_rtl(nm), "\n".join([clk_xdc(), LED_XDC] +
                                          [f"set_property {p} [current_design]" for p in props]))
 
+IODLY7 = ("set_input_delay -clock [get_clocks clk] 7.000 [get_ports {sw[*]}]\n"
+          "set_output_delay -clock [get_clocks clk] 7.000 [get_ports {ja[*]}]")
+for nm, extra in [
+    ("x_lat_src", "set_clock_latency -source 1.000 [get_clocks clk]"),
+    ("x_lat_net", "set_clock_latency 1.000 [get_clocks clk]"),
+    ("x_lat_early", "set_clock_latency -source -early 0.400 [get_clocks clk]\n"
+                    "set_clock_latency -source -late 1.000 [get_clocks clk]"),
+]:
+    design(nm, io_rtl(nm), "\n".join([IODLY_XDC, IODLY7, extra]))
+design("x_lat_xsrc", cdc_rtl("x_lat_xsrc"), CDC_XDC + "\nset_clock_latency -source 0.500 [get_clocks clk_b]")
+for nm, extra in [
+    ("x_jit_in", "set_input_jitter [get_clocks clk] 0.300"),
+    ("x_jit_sys", "set_system_jitter 0.200"),
+    ("x_jit_both", "set_input_jitter [get_clocks clk] 0.300\nset_system_jitter 0.200"),
+]:
+    design(nm, mcp_rtl(nm), MCP_XDC + "\n" + extra)
+design("x_jit_two", cdc_rtl("x_jit_two"), CDC_XDC + "\nset_input_jitter [get_clocks clk_a] 0.200\n"
+       "set_input_jitter [get_clocks clk_b] 0.100")
+
+
+def keep_rtl(name, attr=""):
+    return f"""
+module {name} (input wire clk, input wire [3:0] sw, output wire [3:0] led);
+    reg [15:0] s = 16'd0;
+    always @(posedge clk) s <= s + {{12'd0, sw}} + 16'd1;
+    wire [15:0] t0 = (s ^ {{s[0:0], s[15:1]}}) + s;
+    {attr}reg [15:0] dq = 16'd0;
+    always @(posedge clk) dq <= t0;
+    reg [15:0] dd = 16'd0;
+    always @(posedge clk) dd <= t0;
+    assign led = dq[15:12] ^ dd[15:12];
+endmodule
+"""
+
+
+KEEP_XDC = "\n".join([clk_xdc(), SW_XDC, LED_XDC])
+design("x_keep_none", keep_rtl("x_keep_none"), KEEP_XDC)
+design("x_keep_dt", keep_rtl("x_keep_dt"), KEEP_XDC + "\nset_property DONT_TOUCH true [get_cells {dq_reg[*]}]")
+design("x_keep_k", keep_rtl("x_keep_k"), KEEP_XDC + "\nset_property KEEP true [get_cells {dd_reg[*]}]")
+design("x_dbg_rtl", keep_rtl("x_dbg_rtl", '(* mark_debug = "true" *) '), KEEP_XDC)
+
+PAD_PAIRS = {
+    "35": ["C6 C5", "B7 B6", "A6 A5", "D8 C7", "E6 E5", "C4 B4", "A4 A3", "B1 A1", "B3 B2", "D5 D4", "F4 F3"],
+    "14": ["K17 K18", "L14 M14", "L15 L16", "L18 M18", "R12 R13", "R18 T18", "N14 P14", "N17 P18", "M16 M17",
+           "N15 N16", "P17 R17", "P15 R15"],
+    "15": ["D14 C14", "B13 B14", "C12 B12", "B11 A11", "F13 F14", "B16 B17", "A15 A16", "A13 A14", "B18 A18",
+           "E15 E16", "D15 C15", "H16 G16"],
+    "34": ["L1 M1", "K3 L3", "N2 N1", "M3 M2", "K5 L4", "U1 V1", "U4 U3", "U2 V2", "V5 V4", "R3 T3", "T5 T4",
+           "N5 P5", "P4 P3"],
+    "16": ["C9 B9", "B8 A8", "C11 C10", "A10 A9"],
+}
+
+
+def pad_design(name, specs, vrefs):
+    pairs = {b: [p.split() for p in v] for b, v in PAD_PAIRS.items()}
+    singles = {}
+    ports = {"i": [], "o": [], "di": [], "do": []}
+    for kind, std, drive, slew, bank in sorted(specs, key=lambda s: s[0] not in ("di", "do")):
+        if kind in ("di", "do"):
+            ports[kind].append((std, None, slew, pairs[bank].pop(0)))
+        else:
+            if not singles.get(bank):
+                singles[bank] = pairs[bank].pop(0)
+            ports[kind].append((std, drive, slew, [singles[bank].pop(0)]))
+    ni, no, ndi, ndo = (len(ports[k]) for k in ("i", "o", "di", "do"))
+    hdr = ["input wire clk", f"input wire [{ni - 1}:0] i", f"output wire [{no - 1}:0] o"]
+    if ndi:
+        hdr += [f"input wire [{ndi - 1}:0] dip", f"input wire [{ndi - 1}:0] din"]
+    if ndo:
+        hdr += [f"output wire [{ndo - 1}:0] dop", f"output wire [{ndo - 1}:0] don"]
+    body = [f"    wire [{max(ndi, 1) - 1}:0] di;"]
+    body += [f"    IBUFDS u_ibd{k} (.I(dip[{k}]), .IB(din[{k}]), .O(di[{k}]));" for k in range(ndi)]
+    if not ndi:
+        body.append("    assign di = 1'b0;")
+    body += [f"    reg [{ni + max(ndi, 1) - 1}:0] r = 0;", "    always @(posedge clk) r <= {di, i};",
+             f"    reg [{no + ndo - 1}:0] q = 0;", "    always @(posedge clk) q <= q + {{" + str(no + ndo - 1)
+             + "{1'b0}}, ^r} + 1'b1;", f"    assign o = q[{no - 1}:0];"]
+    body += [f"    OBUFDS u_obd{k} (.I(q[{no + k}]), .O(dop[{k}]), .OB(don[{k}]));" for k in range(ndo)]
+    rtl = f"module {name} ({', '.join(hdr)});\n" + "\n".join(body) + "\nendmodule\n"
+    x = [clk_xdc()]
+    for kind, plist in ports.items():
+        for k, (std, drive, slew, pins_) in enumerate(plist):
+            if kind in ("i", "o"):
+                props = f"PACKAGE_PIN {pins_[0]} IOSTANDARD {std}"
+                if drive:
+                    props += f" DRIVE {drive}"
+                if slew and kind == "o":
+                    props += f" SLEW {slew}"
+                x.append(f"set_property -dict {{ {props} }} [get_ports {{{kind}[{k}]}}]")
+            else:
+                p = "dip" if kind == "di" else "dop"
+                n = "din" if kind == "di" else "don"
+                sl = f" SLEW {slew}" if slew and kind == "do" else ""
+                x.append(f"set_property -dict {{ PACKAGE_PIN {pins_[0]} IOSTANDARD {std}{sl} }} [get_ports {{{p}[{k}]}}]")
+                x.append(f"set_property -dict {{ PACKAGE_PIN {pins_[1]} IOSTANDARD {std}{sl} }} [get_ports {{{n}[{k}]}}]")
+    for bank, v in vrefs.items():
+        x.append(f"set_property INTERNAL_VREF {v} [get_iobanks {bank}]")
+    ins = "i[*]" + (" dip[*]" if ndi else "")
+    outs = "o[*]" + (" dop[*]" if ndo else "")
+    x.append(f"set_input_delay -clock [get_clocks clk] 1.000 [get_ports {{{ins}}}]")
+    x.append(f"set_output_delay -clock [get_clocks clk] 1.000 [get_ports {{{outs}}}]")
+    design(name, rtl, "\n".join(x))
+
+
+def lvcmos(std, drives, bank, slews=("SLOW", "FAST")):
+    return [("o", std, d, s, bank) for d in drives for s in slews] + [("i", std, None, None, bank)]
+
+
+pad_design("x_pad_a",
+           lvcmos("LVCMOS33", (4, 8, 12, 16), "35") + [("o", "LVTTL", 12, "SLOW", "35"), ("o", "LVTTL", 24, "FAST", "35"),
+                                                      ("i", "LVTTL", None, None, "35")]
+           + lvcmos("LVCMOS18", (4, 8, 12, 16, 24), "14")
+           + [("o", "HSTL_I_18", None, "SLOW", "14"), ("i", "HSTL_I_18", None, None, "14"),
+              ("o", "SSTL18_I", None, "SLOW", "14"), ("i", "SSTL18_I", None, None, "14")]
+           + lvcmos("LVCMOS25", (4, 8, 12, 16), "15") + [("di", "LVDS_25", None, None, "15"),
+                                                        ("do", "LVDS_25", None, None, "15")]
+           + lvcmos("LVCMOS15", (4, 8, 12, 16), "34")
+           + [("o", "SSTL15", None, "SLOW", "34"), ("o", "SSTL15", None, "FAST", "34"), ("i", "SSTL15", None, None, "34"),
+              ("o", "HSTL_I", None, "SLOW", "34"), ("i", "HSTL_I", None, None, "34"),
+              ("di", "DIFF_SSTL15", None, None, "34"), ("do", "DIFF_SSTL15", None, "SLOW", "34")]
+           + lvcmos("LVCMOS12", (4, 8, 12), "16"),
+           {"14": 0.9, "34": 0.75})
+pad_design("x_pad_b",
+           [("o", "LVCMOS33", 12, "SLOW", "35"), ("i", "LVCMOS33", None, None, "35"),
+            ("o", "SSTL135", None, "SLOW", "34"), ("o", "SSTL135", None, "FAST", "34"), ("i", "SSTL135", None, None, "34"),
+            ("di", "DIFF_SSTL135", None, None, "34"), ("do", "DIFF_SSTL135", None, "SLOW", "34"),
+            ("o", "HSUL_12", None, "SLOW", "14"), ("i", "HSUL_12", None, None, "14"),
+            ("o", "LVCMOS25", 12, "SLOW", "15"), ("i", "LVCMOS25", None, None, "15")],
+           {"34": 0.675, "14": 0.6})
+
 
 def main():
     ap = argparse.ArgumentParser(description="write the XDC coverage test designs into designs/xdc/<name>/")

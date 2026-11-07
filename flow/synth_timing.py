@@ -39,6 +39,26 @@ DEFAULTS = {
     "fsm": None,
     "retime": False,
     "dspq": False,
+    "prep": None,
+    "scratch": None,
+}
+
+YOSYS_SYNX = "build/yosys-build/yosys-synx/yosys"
+
+PREP = {
+    "manual": "proc; check; flatten; tribuf -logic; deminout; opt_expr; check; opt_clean; opt -nodffe -nosdff; "
+              "fsm; opt; wreduce; peepopt; opt_clean; pmux2shiftx; clean; sort",
+    "memdff": "proc; check; flatten; tribuf -logic; deminout; opt_expr; check; opt_clean; opt -nodffe -nosdff; "
+              "memory_dff; fsm; opt; wreduce; peepopt; opt_clean; pmux2shiftx; clean; sort",
+    "nosdff": "proc; check; flatten; tribuf -logic; deminout; opt_expr; check; opt_clean; opt -nodffe -nosdff; "
+              "fsm; opt -nosdff; wreduce; peepopt; opt_clean; pmux2shiftx; clean; sort",
+}
+PREP["keepmul"] = ("proc; check; flatten; tribuf -logic; deminout; opt_expr; check; opt_clean; setattr -set keep 1 t:$mul; "
+                   "opt -nodffe -nosdff; fsm; opt; wreduce; peepopt; opt_clean; pmux2shiftx; clean; sort; "
+                   "setattr -unset keep t:$mul")
+
+COARSE = {
+    "nosdff": "techmap -map +/cmp2lut.v -map +/cmp2lcu.v -D LUT_WIDTH=6; alumacc; share; opt -nosdff; memory -nomap; opt_clean",
 }
 
 RETIME_EXCLUDE_WIRE_ATTRS = ["keep", "ASYNC_REG", "async_reg", "DONT_TOUCH", "dont_touch"]
@@ -58,6 +78,10 @@ SCRIPTS = {
 
 VARIANTS = {
     "viv": {"vivado_synth": True},
+    "viv_retime": {"vivado_synth": True, "synth_opts": "-retiming"},
+    "viv_nofsm": {"vivado_synth": True, "synth_opts": "-fsm_extraction off"},
+    "viv_noshare": {"vivado_synth": True, "synth_opts": "-resource_sharing off"},
+    "viv_share": {"vivado_synth": True, "synth_opts": "-resource_sharing on"},
     "ys": {"qor_variant": "fix_static"},
     "ys_dspq": {"qor_variant": "dspq", "skip": ("rv_soc", "bram", "arty_ddr3")},
     "t_split": {"split_map_luts": True},
@@ -90,12 +114,28 @@ VARIANTS = {
     "t_cal_retime": {"lutlib": "flat200", "W": 450, "retime": True},
     "t_retime_full": {"retime": "full"},
     "t_cal_retime_full": {"lutlib": "flat200", "W": 450, "retime": "full"},
+    "t_prep": {"prep": "manual"},
+    "m_memdff": {"prep": "memdff"},
+    "m_memdff_dspq": {"prep": "memdff", "dspq": True},
+    "m_nosdff": {"prep": "nosdff"},
+    "m_synxref": {"yosys": YOSYS_SYNX},
+    "m_keepmem": {"yosys": YOSYS_SYNX, "scratch": "opt_dff.keep_memrd_regs 1"},
+    "m_keepmem_dspq": {"yosys": YOSYS_SYNX, "scratch": "opt_dff.keep_memrd_regs 1", "dspq": True},
+    "x1": {"scratch": "abc9.xaiger 1"},
+    "k_mul": {"prep": "keepmul"},
+    "k_mul_dspq": {"prep": "keepmul", "dspq": True},
+    "x1_cal": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450},
+    "x1_cal_dff": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "dff": True},
+    "dx1": {"scratch": "abc9.xaiger 1", "dspq": True},
+    "dx1_cal": {"scratch": "abc9.xaiger 1", "dspq": True, "lutlib": "flat200", "W": 450},
+    "dx1_cal_dff": {"scratch": "abc9.xaiger 1", "dspq": True, "lutlib": "flat200", "W": 450, "dff": True},
 }
 
 
 def opts_of(vname):
     o = dict(DEFAULTS)
     o.update({k: v for k, v in VARIANTS[vname].items() if k in DEFAULTS})
+    assert not (o["dspq"] and o["prep"] in COARSE), "dspq with a manual coarse step is not wired up"
     return o
 
 
@@ -167,12 +207,23 @@ def retime_cmds(mode):
 def script(top, o, period_ps, clkbuf_pass=None):
     sx = f"synth_xilinx -flatten -abc9 -arch xc7 -top {top}" + (f" {o['flags']}" if o["flags"] else "") + (" -dff" if o["dff"] else "")
     pre = 'setattr -set fsm_encoding "none" w:*; ' if o["fsm"] == "none" else ""
+    for s in ([o["scratch"]] if isinstance(o["scratch"], str) else (o["scratch"] or [])):
+        pre += f"scratchpad -set {s}; "
     custom = o["split_map_luts"] or o["lutlib"] or o["W"] or o["D_frac"] or o["abc9_script"] or o["pre_abc"] or o["retime"]
     tail = f"{clkbuf_pass} -buf BUFG O:I; clean; {sx} -run check:" if clkbuf_pass else None
 
+    first = "map_dsp" if o["prep"] else "begin"
+    head0 = f"{sx} -run :prepare; {PREP[o['prep']]}; " if o["prep"] else ""
+
     def upto(label):
         if o["dspq"]:
-            return f"{sx} -run begin:map_dsp; {qor_bench.MAP_DSP_XC7.replace('{opt}', ' -pipeline')}; {sx} -run coarse:{label}"
+            return (f"{head0}{sx} -run {first}:map_dsp; {qor_bench.MAP_DSP_XC7.replace('{opt}', ' -pipeline')}; "
+                    f"{sx} -run coarse:{label}")
+        if o["prep"] in COARSE:
+            return (f"{head0}{sx} -run {first}:coarse; {COARSE[o['prep']]}; "
+                    + (f"{sx} -run map_memory:{label}" if label else f"{sx} -run map_memory:"))
+        if o["prep"]:
+            return f"{head0}{sx} -run {first}:{label}" if label else f"{head0}{sx} -run {first}:"
         return f"{sx} -run :{label}" if label else sx
 
     if not custom:

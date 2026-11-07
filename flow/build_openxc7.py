@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import device
+import dm_cache
 
 CONFIG = {
     "root": Path(__file__).resolve().parent.parent,
@@ -84,6 +85,11 @@ def main():
     ap.add_argument("--synth", help="yosys synthesis commands instead of 'synth_xilinx -flatten -abc9 -arch xc7 -top TOP' "
                                      "({top} is replaced)")
     ap.add_argument("--db-root", help="prjxray-db root (with the family directories) for fasm2frames and xc7frames2bit")
+    ap.add_argument("--frontend", choices=["builtin", "slang"], default="builtin",
+                    help="SystemVerilog front end: yosys read_verilog -sv (builtin) or the yosys-slang plugin shipped "
+                         "with oss-cad-suite (slang: plugin -i slang; read_slang); docs/sv-frontend.md")
+    ap.add_argument("--slang-arg", action="append", default=[],
+                    help="extra read_slang option, e.g. --slang-arg=--ignore-initial")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
     dry = CONFIG["dry_run"] and not a.run
@@ -103,19 +109,39 @@ def main():
         extra += ["--chipdb", str(Path(a.chipdb).resolve())]
     js, rjs, fasm, frames, bit = (out / f"{top}{e}" for e in (".json", "_routed.json", ".fasm", ".frames", ".bit"))
     synth = a.synth.replace("{top}", top) if a.synth else f"synth_xilinx -flatten -abc9 -arch xc7 -top {top}"
-    ys = f"read_verilog -sv {' '.join(rtl)}; {synth}; write_json {js}"
+    if a.frontend == "slang":
+        sargs = " ".join(["-DSYNTHESIS", "--top", top] + a.slang_arg)
+        ys = f"plugin -i slang; read_slang {sargs} {' '.join(rtl)}; {synth}; write_json {js}"
+    else:
+        ys = f"read_verilog -sv {' '.join(rtl)}; {synth}; write_json {js}"
     db = Path(a.db_root).resolve() if a.db_root else DB
     if a.json:
         stage("copy-json", js, ["cp", a.json, str(js)], out / "copy.log", dry)
     else:
         stage("yosys", js, [tool("yosys"), "-p", ys], out / "yosys.log", dry)
+    if not dry and js.exists() and not fasm.exists() and os.environ.get("OFX_GT_DEFAULTS") != "0":
+        subprocess.run([sys.executable, str(ROOT / "flow" / "gt_json_defaults.py"), str(js)], check=True)
     if a.stop_after == "yosys":
         return
+    dm_key = None
+    if not dry and not fasm.exists():
+        try:
+            dm_key = dm_cache.key(npnr, a.part, device.resolve(a.part)["fabric"], extra, a.chipdb)
+        except (ValueError, OSError):
+            dm_key = None
+        dm_file = dm_cache.prepare(dm_key, out)
+        if dm_file:
+            extra = extra + ["-o", f"delay-matrix={dm_file}"]
     stage("nextpnr", fasm, [npnr, "--device", a.part, "--json", str(js), "-o", f"xdc={xdc}",
                             "--seed", str(a.seed), "--freq", str(a.freq),
                             "--write", str(rjs), "-o", f"fasm={fasm}", "--report", str(out / "report.json")] + extra,
           out / "nextpnr.log", dry)
-    stage("fasm2frames", frames, ["bash", "-c", f"{tool('fasm2frames')} --part {a.part} --db-root {db / family} {fasm} > {frames}"],
+    dm_cache.publish(dm_key, out)
+    f2f = tool("fasm2frames")
+    py, script = OXC7 / "libexec" / "tabbypy3", OXC7 / "libexec" / "fasm2frames"
+    if os.environ.get("OFX_FAST_F2F") != "0" and Path(f2f) == OXC7 / "bin" / "fasm2frames" and py.exists() and script.exists():
+        f2f = (f"PATH={OXC7 / 'bin'}:$PATH PYTHONEXECUTABLE={py} {py} {ROOT / 'flow' / 'fasm2frames_fast.py'} {script}")
+    stage("fasm2frames", frames, ["bash", "-c", f"{f2f} --part {a.part} --db-root {db / family} {fasm} > {frames}"],
           out / "fasm2frames.log", dry)
     stage("xc7frames2bit", bit, [tool("xc7frames2bit"), f"--part_file={db / family / a.part / 'part.yaml'}",
                                  f"--part_name={a.part}", f"--frm_file={frames}", f"--output_file={bit}"],
@@ -131,6 +157,9 @@ def main():
             v["synth"] = synth
         if a.db_root:
             v["prjxray_db_root"] = str(db)
+        if a.frontend != "builtin":
+            v["frontend"] = a.frontend
+            v["slang_args"] = a.slang_arg
         (out / "versions.json").write_text(json.dumps(v, indent=2) + "\n")
         print(f"bitstream: {bit}")
 

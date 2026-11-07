@@ -1,0 +1,10 @@
+[project]
+name = "dbg_rtl"
+top = "dbg_rtl"
+board = "arty-a7-35t"
+sources = ["src/dbg_rtl.v"]
+constraints = ["constraints/dbg_rtl.xdc"]
+
+[debug]
+insert = true
+depth = 128

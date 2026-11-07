@@ -18,10 +18,13 @@ CONFIG = {
         "xdc": "build/nextpnr-build/xdc/nextpnr-himbaechel",
         "xdc2": "build/nextpnr-build/xdc2/nextpnr-himbaechel",
         "xdc3": "build/nextpnr-build/xdc3/nextpnr-himbaechel",
+        "xdc4": "build/nextpnr-build/xdc4/nextpnr-himbaechel",
     },
     "own_synthesis": {
         "xdc2": {"yosys_plugin": "build/yosys-plugin/asyncreg/xilinx_asyncreg.so", "asyncreg_pass": "xilinx_asyncreg"},
         "xdc3": {"yosys_plugin": "build/yosys-plugin/asyncreg/xilinx_asyncreg.so", "asyncreg_pass": "xilinx_asyncreg"},
+        "xdc4": {"yosys_plugin": "build/yosys-plugin/asyncreg/xilinx_asyncreg.so", "asyncreg_pass": "xilinx_asyncreg",
+                 "xdc_keep": True},
     },
     "chipdb": "toolchain/openxc7/share/nextpnr/himbaechel/xilinx/chipdb-xc7a50t.bin",
     "npwait": "ofx/npwait.sh",
@@ -83,6 +86,8 @@ def build_one(name, variant, binary, dry):
     tools = {"nextpnr": str(ROOT / CONFIG["npwait"]), "chipdb": str(ROOT / CONFIG["chipdb"])}
     if own:
         tools.update({"yosys_plugin": str(ROOT / own["yosys_plugin"]), "asyncreg_pass": own["asyncreg_pass"]})
+        if own.get("xdc_keep"):
+            tools["xdc_keep"] = True
     rtl = sorted(src.glob("*.v"))
     gap_build.build(name, src, name, rtl, next(src.glob("*.xdc")), out, CONFIG["freq_mhz"], dry,
                     CONFIG["npr_args"], tools)

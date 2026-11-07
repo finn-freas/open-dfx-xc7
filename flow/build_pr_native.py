@@ -60,6 +60,14 @@ CONFIG = {
                    "default_rms": ["xor", "andn", "add", "rot"],
                    "place_union": ["xor", "andn", "add", "rot"], "grey_clock_leaf": True, "fix_endpoints": True,
                    "pin_module_ends": True, "pin_w_module": 0.5, "pin_exclude_wrap_exits": True},
+        "rv_ppx": {"shell_spec": "ports.json", "out": "build/patched/rv_ppx_native", "variant": "partpin3",
+                   "partpins": "auto", "pp_register": ["ready"],
+                   "rms": {"xor": "rm_core_xor.v", "andn": "rm_core_andn.v", "add": "rm_core_add.v",
+                           "rot": "rm_core_rot.v"},
+                   "default_rms": ["xor", "andn", "add", "rot"],
+                   "place_union": ["xor", "andn", "add", "rot"], "grey_clock_leaf": True, "fix_endpoints": True,
+                   "pin_module_ends": True, "pin_w_module": 0.5, "pin_exclude_wrap_exits": True,
+                   "partpin_xdc": "designs/dfx_rv/partpin_example.xdc"},
     },
     "shared_pblock": "pblock_shared_dyn",
     "pblock": "pblock_rm",
@@ -153,6 +161,7 @@ def shared_slicem_sites(spec):
 
 
 def pblock_xdc(base, contain):
+    base = "".join(l for l in base.splitlines(True) if "HD.PARTPIN_" not in l)
     p = CONFIG["pblock"]
     lines = [f"create_pblock {p}",
              f"add_cells_to_pblock [get_pblocks {p}] [get_cells {CONFIG['rm_inst']}]",
@@ -419,7 +428,8 @@ def main_auto(a, dry, var):
          "--region", CONFIG["region"], "--spec", str(spec)] + (["--endpoint-cells", str(epc)] if fix_ep else [])
         + (["--module-ends", "--keep-per-net", "5000"] if CONFIG.get("pin_module_ends") else [])
         + (["--w-module", str(CONFIG["pin_w_module"])] if "pin_w_module" in CONFIG else [])
-        + (["--exclude-wrap-exits"] if CONFIG.get("pin_exclude_wrap_exits") else []), dry)
+        + (["--exclude-wrap-exits"] if CONFIG.get("pin_exclude_wrap_exits") else [])
+        + (["--xdc", str(ROOT / CONFIG["partpin_xdc"])] if CONFIG.get("partpin_xdc") else []), dry)
     gp = out / "grey_place"
     run("dump greybox placement", Path(str(gp) + ".preplaced"),
         [py, str(FLOW / "replay_dump.py"), str(dp / f"{top}_routed.json"), str(gp), "--exclude", inst + "."], dry)

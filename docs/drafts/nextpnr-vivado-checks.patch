@@ -1,0 +1,268 @@
+--- a/common/kernel/timing.h
++++ b/common/kernel/timing.h
+@@ -156,6 +156,7 @@
+         DelayPair delay;
+         DelayPair buffer;
+         IdString port;
++        bool has_min = true, has_max = true;
+     };
+     dict<CellPortKey, IoDelay> io_starts, io_ends;
+     dict<domain_id_t, DelayPair> io_clock_latency;
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -42,6 +42,16 @@
+     return ctx->nets.at(clock)->clkconstr.get();
+ }
+ 
++
++
++
++static bool vivado_checks(const Context *ctx)
++{
++    return bool_or_default(ctx->settings, ctx->id("timing/vivadoChecks"), false);
++}
++
++static constexpr delay_t untimed_io = 500000000;
++
+ // set_false_path -from [get_clocks a] -to [get_clocks b], or a's and b's clock groups apart:
+ // no path from a to b is timed
+ static bool is_false_clock_pair(const Context *ctx, IdString launch, IdString capture)
+@@ -69,7 +79,7 @@
+         return false;
+     IdString lroot = lc->master != IdString() ? lc->master : lc->name;
+     IdString croot = cc->master != IdString() ? cc->master : cc->name;
+-    if (lroot == IdString() || lroot != croot)
++    if (lroot == IdString() || (lroot != croot && !vivado_checks(ctx)))
+         return false;
+     // Edges of both waveforms over their common period (at most 1000 launch edges, as Vivado
+     // expands them), in ps; the requirement is the shortest launch-to-next-capture time.
+@@ -106,7 +116,7 @@
+         return false;
+     IdString lroot = lc->master != IdString() ? lc->master : lc->name;
+     IdString croot = cc->master != IdString() ? cc->master : cc->name;
+-    if (lroot == IdString() || lroot != croot)
++    if (lroot == IdString() || (lroot != croot && !vivado_checks(ctx)))
+         return false;
+     int64_t lp = std::llround(ctx->getDelayNS(lc->period.minDelay()) * 1000.0);
+     int64_t cp = std::llround(ctx->getDelayNS(cc->period.minDelay()) * 1000.0);
+@@ -723,6 +733,10 @@
+                 DelayPair latency = io_clock_latency.at(io->second.domain);
+                 init_arrival = DelayPair(io->second.delay.min_delay + io->second.buffer.min_delay - latency.max_delay,
+                                          io->second.delay.max_delay + io->second.buffer.max_delay - latency.min_delay);
++                if (vivado_checks(ctx) && !io->second.has_min)
++                    init_arrival.min_delay = untimed_io;
++                if (vivado_checks(ctx) && !io->second.has_max)
++                    init_arrival.max_delay = -untimed_io;
+             }
+             if (sp.second != IdString()) {
+                 // clocked startpoints have a clock-to-out time
+@@ -842,6 +856,10 @@
+                 init_required = DelayPair(
+                         -(io->second.delay.max_delay + io->second.buffer.max_delay + latency.max_delay),
+                         -(io->second.delay.min_delay + io->second.buffer.min_delay + latency.min_delay));
++                if (vivado_checks(ctx) && !io->second.has_max)
++                    init_required.min_delay = untimed_io;
++                if (vivado_checks(ctx) && !io->second.has_min)
++                    init_required.max_delay = -untimed_io;
+             }
+             // set_multicycle_path -setup N: N-1 more periods to reach the capture edge.
+             // Hold is not moved (Vivado's -setup N -hold N-1).
+@@ -1964,8 +1982,11 @@
+                     if (mcp > 1)
+                         check.setup_requirement += ctx->nets.at(capture.clock)->clkconstr->period.minDelay() * (mcp - 1);
+                     check.setup_slack = dp.period.minDelay() + pdp->second.setup_slack;
+-                    setup_candidates[check.clock_pair].push_back(
+-                            Candidate{check.setup_slack, check.setup_requirement, pair_id, ep.first, check.exception});
++                    if (check.setup_slack >= untimed_io / 2)
++                        check.has_setup = false;
++                    else
++                        setup_candidates[check.clock_pair].push_back(Candidate{
++                                check.setup_slack, check.setup_requirement, pair_id, ep.first, check.exception});
+                 }
+ 
+                 auto clocks = std::make_pair(launch.clock, capture.clock);
+@@ -1991,8 +2012,11 @@
+                     check.hold_requirement = hold_requirement;
+                     check.hold_slack = arr.second.value.minDelay() - req->second.value.maxDelay() + clock_to_clock -
+                                        hold_requirement;
+-                    hold_candidates[check.clock_pair].push_back(
+-                            Candidate{check.hold_slack, check.hold_requirement, pair_id, ep.first, hold_exception});
++                    if (check.hold_slack >= untimed_io / 2)
++                        check.has_hold = false;
++                    else
++                        hold_candidates[check.clock_pair].push_back(
++                                Candidate{check.hold_slack, check.hold_requirement, pair_id, ep.first, hold_exception});
+                 }
+                 checks.push_back(check);
+             }
+@@ -2068,6 +2092,7 @@
+             std::string clock_name;
+             int falling = 0;
+             double min_ns = 0, max_ns = 0;
++            std::string only_side;
+             if (!(fields >> clock_name >> falling >> min_ns >> max_ns)) {
+                 log_warning("port '%s': malformed %s '%s', the port is not timed\n", ctx->nameOf(ci),
+                             (is_output ? id_out : id_in).c_str(ctx), attr->second.as_string().c_str());
+@@ -2080,6 +2105,7 @@
+                             ctx->nameOf(ci), clock_name.c_str(), is_output ? "output" : "input");
+                 continue;
+             }
++            fields >> only_side;
+             domain_id_t dom = domain_id(clk, falling ? FALLING_EDGE : RISING_EDGE);
+             DelayPair delay(ctx->getDelayFromNS(min_ns), ctx->getDelayFromNS(max_ns));
+             for (auto &port : ci->ports) {
+@@ -2106,7 +2132,8 @@
+                             continue;
+                         for (auto &pin : buffer_pins(usr.cell, usr.port)) {
+                             CellPortKey key(usr.cell->name, pin.first);
+-                            io_starts[key] = IoDelay{dom, delay, pin.second, ci->name};
++                            io_starts[key] = IoDelay{dom, delay, pin.second, ci->name, only_side != "max",
++                                                     only_side != "min"};
+                             ports.at(key).arrival[dom];
+                             domains.at(dom).startpoints.emplace_back(key, IdString());
+                         }
+@@ -2115,7 +2142,8 @@
+                     CellInfo *buf = pad_net->driver.cell;
+                     for (auto &pin : buffer_pins(buf, pad_net->driver.port)) {
+                         CellPortKey key(buf->name, pin.first);
+-                        io_ends[key] = IoDelay{dom, delay, pin.second, ci->name};
++                        io_ends[key] = IoDelay{dom, delay, pin.second, ci->name, only_side != "max",
++                                               only_side != "min"};
+                         ports.at(key).required[dom];
+                         domains.at(dom).endpoints.emplace_back(key, IdString());
+                     }
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -1267,6 +1267,7 @@
+                         continue;
+                     CellInfo *ci = ctx->cells.at(port).get();
+                     double min_ns = value, max_ns = value;
++                    bool has_min = !only_max, has_max = !only_min;
+                     auto found = ci->attrs.find(id_delay);
+                     if (found != ci->attrs.end() && (only_max || only_min)) {
+                         std::istringstream old(found->second.as_string());
+@@ -1275,15 +1276,20 @@
+                         double old_min = 0, old_max = 0;
+                         const bool same_reference = (old >> old_clock >> old_fall >> old_min >> old_max) &&
+                                                     old_clock == clock && bool(old_fall) == fall;
++                        std::string old_side;
++                        old >> old_side;
+                         if (same_reference) {
+                             min_ns = only_max ? old_min : value;
+                             max_ns = only_min ? old_max : value;
++                            has_min = has_min || old_side != "max";
++                            has_max = has_max || old_side != "min";
+                         }
+                     }
+                     if (found != ci->attrs.end() && !only_max && !only_min)
+                         log_warning("%s: '%s' replaces the earlier delay of port '%s' (on line %d)\n", cmd.c_str(),
+                                     target.c_str(), port.c_str(ctx), lineno);
+-                    ci->attrs[id_delay] = stringf("%s %d %.6f %.6f", clock.c_str(), fall ? 1 : 0, min_ns, max_ns);
++                    ci->attrs[id_delay] = stringf("%s %d %.6f %.6f%s", clock.c_str(), fall ? 1 : 0, min_ns, max_ns,
++                                                  has_min && has_max ? "" : (has_max ? " max" : " min"));
+                     applied_ports++;
+                 }
+             }
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -237,6 +237,10 @@
+     void check_clock_placement();
+     // The pad buffers have no timing in the chipdb; port paths take these (see xilinx.cc)
+     bool getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const override;
++
++    bool vivado_timing = false;
++    TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const override;
++    TimingClockingInfo getPortClockingInfo(const CellInfo *cell, IdString port, int index) const override;
+     mutable pool<std::string> warned_pad_buffers;
+     void add_pblock_routing_tiles(Region *pb_region);
+     void pack() override;
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -101,6 +101,9 @@
+     specific.add_options()("timing-opt", po::value<std::string>(),
+                            "after placing, the timing-driven placement optimisation on the critical paths: R[,N] moves a "
+                            "cell up to R tiles, N rounds (default 30); off unless given");
++    specific.add_options()("vivado-timing", po::value<std::string>()->implicit_value(""),
++                           "time like Vivado: clocks of different primaries, -max/-min-only port delays, SRL "
++                           "data and clock-to-out arcs, FDCE/FDPE recovery/removal; off unless given");
+     specific.add_options()("hold-detour-max", po::value<double>(),
+                            "hold deficit (ns) up to which a routing detour is used instead of a feedthrough LUT "
+                            "(default 0.5)");
+@@ -187,6 +190,9 @@
+ {
+     h.init(ctx);
+     HimbaechelAPI::init(ctx);
++    vivado_timing = ctx->args.options.count("vivado-timing");
++    if (vivado_timing)
++        ctx->settings[ctx->id("timing/vivadoChecks")] = Property(int64_t(1));
+ 
+     // Resolve the repeated-name bel types once (the placer looks buckets up per
+     // cell); everything else buckets as its own type.
+@@ -1088,6 +1094,67 @@
+     return true;
+ }
+ 
++
++
++
++
++
++
++TimingPortClass XilinxImpl::getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const
++{
++    if (vivado_timing && cell->type == id_SLICE_LUTX && cell->attrs.count(id_X_LUT_AS_SRL)) {
++        if (port == id_CLK)
++            return TMG_CLOCK_INPUT;
++        if (port.in(id_DI1, id_DI2, id_WE)) {
++            clockInfoCount = 1;
++            return TMG_REGISTER_INPUT;
++        }
++        if (port.in(id_O6, id_O5, id_MC31)) {
++            clockInfoCount = 1;
++            return TMG_REGISTER_OUTPUT;
++        }
++    }
++    return HimbaechelAPI::getPortTimingClass(cell, port, clockInfoCount);
++}
++
++TimingClockingInfo XilinxImpl::getPortClockingInfo(const CellInfo *cell, IdString port, int index) const
++{
++    auto ns = [&](double v) { return ctx->getDelayFromNS(v); };
++    if (vivado_timing && cell->type == id_SLICE_LUTX && cell->attrs.count(id_X_LUT_AS_SRL)) {
++        TimingClockingInfo info;
++        info.clock_port = id_CLK;
++        info.edge = int_or_default(cell->params, id_IS_WCLK_INVERTED, 0) ? FALLING_EDGE : RISING_EDGE;
++        info.setup = info.hold = DelayPair(0);
++        if (port == id_DI1) {
++            info.setup = DelayPair(ns(0.170));
++            info.hold = DelayPair(ns(0.093));
++        } else if (port == id_DI2) {
++            info.setup = DelayPair(ns(0.173));
++            info.hold = DelayPair(ns(0.094));
++        } else if (port == id_WE) {
++            info.setup = DelayPair(ns(0.638));
++            info.hold = DelayPair(ns(0.014));
++        } else if (port == id_O6) {
++            info.clockToQ = DelayQuad(ns(1.186), ns(1.472));
++        } else if (port == id_O5) {
++            info.clockToQ = DelayQuad(ns(1.177), ns(1.461));
++        } else if (port == id_MC31) {
++            info.clockToQ = DelayQuad(ns(0.898), ns(1.114));
++        }
++        return info;
++    }
++    TimingClockingInfo info = HimbaechelAPI::getPortClockingInfo(cell, port, index);
++    if (vivado_timing && cell->type == id_SLICE_FFX && port == id_SR) {
++        const std::string orig = str_or_default(cell->attrs, id_X_ORIG_TYPE, "");
++        const bool clr = orig == "FDCE" || orig == "FDCE_1", pre = orig == "FDPE" || orig == "FDPE_1";
++        if (clr || pre) {
++            info.setup = DelayPair(ns(clr ? 0.404 : 0.358));
++            info.hold = DelayPair(ns(-0.248));
++        }
++    }
++    return info;
++}
++
+ void XilinxImpl::postPlace()
+ {
+     check_clock_placement();

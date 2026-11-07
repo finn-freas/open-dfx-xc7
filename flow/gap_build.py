@@ -70,7 +70,7 @@ def tool_versions(tools):
             v[f"{k}_version"] = (r.stdout + r.stderr).strip()
     if tools.get("chipdb"):
         v["chipdb"] = tools["chipdb"]
-    for k in ("json_from", "yosys_plugin", "clkbuf_pass", "asyncreg_pass", "db", "synth_opts"):
+    for k in ("json_from", "yosys_plugin", "clkbuf_pass", "asyncreg_pass", "db", "synth_opts", "xdc_keep"):
         if tools.get(k):
             v[k] = tools[k]
     return v
@@ -89,6 +89,11 @@ def build(name, src, top, rtl, xdc, out, freq, dry, npr_extra=(), tools=None):
     js, rjs, fasm, frames, bit = (out / f"{top}{e}" for e in (".json", "_routed.json", ".fasm", ".frames", ".bit"))
     base = f"synth_xilinx -flatten -abc9 -arch xc7 -top {top}" + (f" {tools['synth_opts']}" if tools.get("synth_opts") else "")
     hooks = []
+    if tools.get("xdc_keep"):
+        import xdc_keep
+        kc = xdc_keep.commands([str(r) for r in rtl], xdc)
+        if kc:
+            hooks.append(("prepare", "; ".join(kc), "prepare"))
     if tools.get("asyncreg_pass") and uses_async_reg(list(rtl) + [xdc]):
         hooks.append(("coarse", f"{tools['asyncreg_pass']} -xdc {xdc}", "coarse"))
     if tools.get("clkbuf_pass"):
@@ -98,7 +103,8 @@ def build(name, src, top, rtl, xdc, out, freq, dry, npr_extra=(), tools=None):
         parts += [f"{base} -run {start}:{stop}", cmd]
         start = resume
     sx = "; ".join(parts + [f"{base} -run {start}:"]) if hooks else base
-    ys = f"read_verilog -sv {' '.join(str(p) for p in rtl)}; {sx}; tee -o {out / 'yosys_stat.txt'} stat; write_json {js}"
+    ys = (f"{tools.get('yosys_pre', '')}read_verilog -sv {' '.join(str(p) for p in rtl)}; {sx}; "
+          f"tee -o {out / 'yosys_stat.txt'} stat; write_json {js}")
     if tools.get("json_from"):
         synth = ["cp", str(ROOT / "build" / "gap" / name / tools["json_from"] / f"{top}.json"), str(js)]
     else:

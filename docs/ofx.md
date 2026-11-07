@@ -41,6 +41,11 @@ Built offline so far: xc7a35t, xc7a100t, xc7s50, xc7z020 (PL) and xc7a200t (see 
 | `ofx timing [--dfx] [--build DIR] [--paths N] [--hold] [--from G] [--to G]` | Vivado-style timing summary: check_timing, WNS/TNS/WHS/THS with endpoint counts, clock summary, intra- and inter-clock tables, exceptions, ignored and unconstrained paths, slack histograms, the N worst paths with every cell and net delay (see "Timing reports") | nextpnr `--report` JSON (`--report-paths`, docs/drafts/nextpnr-timing-report.patch) |
 | `ofx program [--flash] [--board B] [--run]` | load the bitstream | openFPGALoader (oss-cad-suite) |
 | `ofx boot [--qemu] [--sim] [--run]` | Zynq: U-Boot SPL `boot.bin` (ps7_init), FIT with the PL bitstream and the `[zynq]` app, SD image, OpenOCD JTAG script; `--qemu` boots it in QEMU, `--sim` replays the app's M_AXI_GP0 accesses on the PL (RTL and bitstream netlist) (see "Zynq-7000") | `flow/zynq_boot.py`, `flow/ps7init.py`, `flow/zynq_pl_sim.py`, `flow/zynq_app_trace.py` |
+| `ofx ip clk --in MHz --out F[@phase][/duty%] ... [--primitive MMCM\|PLL\|auto] [--run]` | Clocking Wizard: MMCME2/PLLE2 parameters for the part's speed grade, Verilog with clk_wiz ports, XDC (see docs/ip.md) | `ofx/ip_clk.py` |
+| `ofx ip fifo --width W --depth D [--impl ...] [--fwft] [flags] [--run]` | FIFO Generator: fabric or built-in FIFO with fifo_generator ports | `ofx/ip_fifo.py` |
+| `ofx ip bram --type T --width W --depth D [--init f.coe] [--reg-a] [--run]` | Block Memory Generator: RAMB36E1/RAMB18E1 with INIT | `ofx/ip_bram.py` |
+| `ofx ip gen [--run]` | generate every `[[ip.clk]]`, `[[ip.fifo]]`, `[[ip.bram]]` of ofx.toml into `build/ip/` (`ofx build` does it too) | `ofx/ip.py` |
+| `ofx debug insert [--run]`, `ofx debug capture [--via sim\|jtag\|uart] [--trigger p=v] [--offset N] [--run]` | ILA: analyzer on MARK_DEBUG nets of the synthesized design over BSCANE2 JTAG; capture to VCD (`--via sim` simulates the whole design with Vivado's JTAG TAP model) | `ofx/debug.py`, `flow/dbg_capture.py`, LiteScope |
 | `ofx dfx build [--rms ...] [--run]` | region DRC, the native DFX flow for every RM, pr_check, then one partial per ordered RM pair with `--simulate` and a `.check.json` | `flow/region.py --drc`, `flow/build_pr_native.py`, `flow/partial.py` |
 | `ofx dfx partials [--force] [--run]` | only the partials step | `flow/partial.py` |
 | `ofx dfx verify [--formal] [--no-region2v] [--run]` | region DRC, pr_check results, every safety record (sha256, region gate, clean simulated load), byteman applied to each base and compared with the original target, region2v on each full build and byteman result, optional decoupler proof | `flow/region.py`, byteman, `flow/region2v.py`, `flow/decoupler_prove.sh` |
@@ -161,13 +166,13 @@ Vivado's timer (`flow/release_bench.py`, variants `rel_new` and `rel_qor*`) has 
 
 | key | default | what it does | evidence for the default |
 |---|---|---|---|
-| `hardblock_timing` | `false` | nextpnr `-o hardblock-timing`: DSP48E1, ICAPE2 and RAMB36E1 pins are timed (otherwise those paths are untimed) | off = no-op (noop_check). On, it changes placement of every design with a DSP, BRAM36 or ICAP by design (the timer sees new paths); not yet regression-checked as a default (roadmap) |
+| `hardblock_timing` | `true` (0.1) | nextpnr `-o hardblock-timing`: DSP48E1, ICAPE2 and RAMB36E1 pins are timed (otherwise those paths are untimed) | off = no-op (noop_check); on: blinky `.frames` identical; on the qor designs every blind placement replayed under the honest timer is equal or slower than the hardblock-timing placement (rv_soc +12.9 %, rv_mul +1.7 %, rv_big +3.6 %, bram +10.0 %, fir -1.5 %, 3 seeds, nextpnr timer; `install/hardblock_regress.py`, docs/release-0.1.md) |
 | `dsp_cascade` | `true` | nextpnr `-o dsp-cascade-place`: DSP48E1 PCOUT->PCIN chains placed along the chipdb cascade wires | on = `.frames` identical to off on designs without a long chain (Finding 9: 5 designs; release binary: blinky, rv_soc in `install/defaults_noop.py`); FIR places only with it |
 | `dsp_pipeline` | `false` | yosys: `xilinx_dsp_qor -pipeline` (plugin) instead of synth_xilinx's `xilinx_dsp` | changes the netlist of every multiplier design; equivalence by random simulation only, and the FIR is slower in Vivado's P&R with it (215.75 -> 205.68 MHz, Finding 8) |
 | `async_reg` | `true` | yosys: `xilinx_asyncreg -xdc <the project XDC>` (plugin) after flatten: ASYNC_REG flip-flops are kept as flip-flops | JSON identical to plain synth_xilinx on designs without ASYNC_REG (blinky, rv_soc in `install/defaults_noop.py`); x_async_* match Vivado (3 FDRE, no SRL) |
-| `clkbuf_keep_buffer_inputs` | `false` | yosys: `clkbufmap_gapfix` instead of `clkbufmap` (BUFIO/BUFR inputs stay on the unbuffered clock) | tested as a plugin on two designs only |
+| `clkbuf_keep_buffer_inputs` | `false` | yosys: `clkbufmap_gapfix` instead of `clkbufmap` (BUFIO/BUFR inputs stay on the unbuffered clock) | not a no-op: rv_soc's netlist differs only in the inserted BUFG's `$auto$` name, which changes nextpnr's hash order and the bitstream; fixes bufio_iddr and oserdes; bufr then stops on a hold violation (`install/defaults_noop.py --candidates`, docs/release-0.1.md) |
 | `cell_timing` | `"stub"` | `auto`: the calibrated chipdb (`cal/chipdb-xc7a50t.bin`) for xc7a35t*-1 parts; `stub`: never | changes placement everywhere; Vivado's timer on the calibrated placements is better on 4 designs and worse on bram (155.09 -> 149.88), one seed each (Finding 10) |
-| `placer` | `"auto"` | `auto`: `--placer static` if the yosys netlist has at most 3000 cells, else nextpnr's default (heap); `static`, `heap` force one | upstream placer, no draft; Vivado's timer on the static placements is 3-34 % better than on heap placements on all 5 designs (Finding 7); not better on the LiteX SoCs (> 3000 cells), hence the limit |
+| `placer` | `"auto"` | `auto`: `--placer static` at every size (0.1; was: up to 3000 cells, else heap); `static`, `heap` force one | upstream placer, no draft; Vivado's timer on the static placements is 3-34 % better than on heap placements on all 5 qor designs (Finding 7); LiteX DDR/eth SoCs equal within 2 % under Vivado's timer and HeAP does not route mc12_a100 (docs/wip/placement-global.md) |
 
 All options off (`hardblock_timing`, `dsp_cascade`, `dsp_pipeline`, `async_reg`, `clkbuf_keep_buffer_inputs` false,
 `cell_timing = "stub"`, `placer = "heap"`) gives the plain flow: no yosys script change, no nextpnr argument and the
@@ -506,6 +511,132 @@ with the committed ofx (`git archive HEAD`) and the new one are identical, and n
 (`build/ofx/devices/noop/*.old`, `*.new3`); `ofx dfx verify --run` on dfx100 gives the same lines as
 `build/ofx/dfx100_verify.log` (`noop/dfx100_verify_run.log`).
 
+### 5. All other parts, Kintex-7 and GTP (2026-11-06)
+Status: the user asked to put Artix-7 first. Results for the other families are recorded as they stand.
+Unfinished items are marked "deprioritised (user: Artix-7 first)".
+
+Every blinky and DFX example was rebuilt from an empty `build/` (`build/ofx/devices/v3/drive3.sh`, `OFX_MAX_NEXTPNR=2`).
+- Logs and tables: `build/ofx/devices/v3/` (`summary.py` prints the tables).
+- Kintex-7 logs: `build/ofx/devices/k7/`.
+- Nothing ran on hardware.
+
+**Bitstream decode check** (new `flow/device_bitcheck.py <example>...`). For each build it runs two checks:
+1. **Frames:** it parses the `.bit` and compares every frame with the `.frames` file that fasm2frames wrote. The ECC word is masked.
+2. **Decode and re-encode:** it decodes the `.bit` back to FASM (prjxray `bit2fasm`), then encodes that FASM again with fasm2frames. The frames must be identical to the build's own.
+
+If both pass, every set bit decodes to a known prjxray-db feature and nothing is lost on the way back. "Unknown-bit lines" is the count of `unknown` lines in the decoded FASM.
+
+The decoded feature set never equals nextpnr's `.fasm` line for line, on any family. Each blinky shows about 215 lines that only nextpnr writes and 92-128 lines that only the decoder writes. These are aliases: pips without bits, `PRECYINIT` and BUFG input aliases written in a different form. The re-encode check shows they encode the same bits. Results are in `build/ofx/devices/bitcheck/<example>.json` and `summary1.txt`.
+
+**blinky on every part with a chipdb** (56 LUT, 28 FF, 7 CARRY4 on each):
+
+| example | part | IDCODE bit = prjxray-db | bitstream | Fmax (nextpnr) | frames check | decoded FASM re-encoded | unknown bits | byteman round trip (differ / omitted) | peak RSS |
+|---|---|---|---|---|---|---|---|---|---|
+| blinky_a50 | xc7a50tcsg324-1 | 0x0362C093 | 2,192,176 B | 391.54 MHz | match | 0 frames differ | 0 | 0 / 3 | 0.62 GB |
+| blinky_b3 | xc7a35tcpg236-1 | 0x0362D093 | 2,192,174 B | 391.54 | match | 0 | 0 | 0 / 3 | 0.62 GB |
+| blinky_cma7 | xc7a35tcpg236-1 | 0x0362D093 | 2,192,178 B | 372.58 | match | 0 | 0 | 0 / 0 | 0.62 GB |
+| blinky_s25 | xc7s25csga324-1 | 0x037C4093 | 1,241,968 B | 372.58 | match | 0 | 0 | 0 / 0 | 0.39 GB |
+| blinky_cms7 | xc7s25csga225-1 | 0x037C4093 | 1,241,970 B | 391.54 | match | 0 | 0 | 0 / 20 | 0.39 GB |
+| blinky_s75 | xc7s75fgga484-1 | 0x037C8093 | 3,686,976 B | 391.54 | match | 0 | 0 | 0 / 0 | 1.22 GB |
+| blinky_s100 | xc7s100fgga484-1 | 0x037C7093 | 3,686,979 B | 391.54 | match | 0 | 0 | 0 / 0 | 1.22 GB |
+| blinky_z10 | xc7z010clg400-1 | 0x03722093 | 2,083,904 B | 372.58 | match | 0 | 0 | 1 / 26 | 0.39 GB |
+| blinky_az10 | xc7z010clg400-1 | 0x03722093 | 2,083,906 B | 391.54 | match | 0 | 0 | 0 / 36 | 0.39 GB |
+| blinky_cora | xc7z007sclg400-1 | 0x03723093 | 2,083,907 B | 391.54 | match | 0 | 0 | 0 / 20 | 0.39 GB |
+| blinky_z030 | xc7z030sbg485-1 | 0x0372C093 | 5,980,082 B | 372.58 | match | 0 | 0 | 0 / 0 | 1.32 GB |
+| blinky_z035 | xc7z035ffg676-1 | 0x03732093 | 13,321,570 B | 391.54 | match | 0 | 0 | 0 / 0 | 4.65 GB |
+| blinky_z045 | xc7z045ffg900-1 | 0x03731093 | 13,321,570 B | 391.54 | not run (deprioritised) | | | 0 / 0 | 4.65 GB |
+| blinky_z100 | xc7z100ffg900-1 | 0x03736093 | 17,416,514 B | 391.54 | not run (deprioritised) | | | 0 / 0 | 4.66 GB |
+| blinky_k70t | xc7k70tfbg676-1 | 0x03647093 | 3,011,490 B | 399.04 | match | 0 | 0 | 0 / 0 | 0.75 GB |
+
+Rebuild determinism: these blinkies were also built in an earlier, unverified run (`build/ofx/devices/v2/`).
+- For the 12 parts in both runs (a50, b3, cma7, s25, cms7, s75, s100, z10, az10, cora, z030, z035), the `.frames` are byte-identical (`v2/*.after.sha` vs `v3/*.after.sha`).
+- The `.bit` files differ only in the date in the header.
+
+Notes on the parts:
+- xc7s75 uses the xc7s100 fabric and xc7z035 uses the xc7z045 fabric, so they have the same frame counts. xc7z007s is the xc7z010 die.
+- The byteman "omitted" frames come from its device model, as described in Results 4.
+
+**DFX** (`ofx dfx build --run` + `ofx dfx verify --run`; static LFSR + adder; RMs xor/andn):
+
+| example | part | verify | `ofx dfx build` peak RSS |
+|---|---|---|---|
+| dfx_a50, dfxpp_a50 | xc7a50tcsg324-1 | 10 PASS 0 FAIL; auto pins 10 PASS 0 FAIL 2 INFO (re-run 2026-11-06 20:4x, `v3/dfx_a50_verify.log`) | |
+| dfx_b3 | xc7a35tcpg236-1 | 10 PASS 0 FAIL | 0.67 GB |
+| dfx_cms7 | xc7s25csga225-1 | 10 PASS 0 FAIL | 0.35 GB |
+| dfx_s75 | xc7s75fgga484-1 | 10 PASS 0 FAIL | 1.26 GB |
+| dfxpp_s100 | xc7s100fgga484-1 | 10 PASS 0 FAIL 2 INFO | 1.27 GB |
+| dfx_z035 | xc7z035ffg676-1 | 10 PASS 0 FAIL | 4.89 GB |
+| dfxpp_cora | xc7z007sclg400-1 | 10 PASS 0 FAIL 2 INFO | 0.37 GB |
+| dfxpp_z030 | xc7z030sbg485-1 | 10 PASS 0 FAIL 2 INFO | 1.35 GB |
+| dfx_k70t | xc7k70tfbg676-1 | 10 PASS 0 FAIL | 0.77 GB |
+
+Not re-run in this pass (deprioritised, user: Artix-7 first):
+- dfx_s25, dfxpp_s25, dfx_z10, dfxpp_z10, dfx_cora, dfx_z030, dfx_s100, dfx_z045: 10 PASS 0 FAIL in the earlier unverified run (`v2/`, `drive_devices.out`).
+- dfx_z100 and dfxpp_z045/z100: never verified.
+
+**Kintex-7.** Two separate sources:
+- **The installed openXC7 package (`upstream-2026-11-04`) has no kintex7 directory.**
+- **openXC7's prjxray-db at the same revision (a8b09269) has one.** It has fabrics xc7k70t, xc7k160t, xc7k325t and xc7k480t (the xc7k420t parts map to the xc7k480t fabric), plus their parts. It also has the core segbits: CLB, INT, BRAM, DSP, IOB33/IOB18/IOI, clocking, CMT, CFG, GTX, PCIe.
+  - A project-local sparse checkout is in `build/src/meta-openXC7-prjxray-db`, holding the xc7k70t and xc7k325t fabrics.
+  - Tile types in the xc7k70t tilegrid that have config bits but no segbits: `GTX_INT_INTERFACE`, `HCLK_*_BOT_UTURN`, `LIOB33_SING`, `LIOI3_SING`, `RIOB18_SING`, `RIOI_SING`, `MONITOR_BOT_FUJI2`.
+- `flow/device.py` now falls back to that checkout for families missing from the installed package:
+  - new `extra_dbs` and `extra_chipdb_dirs`;
+  - `db_root()` and the `OFX_DB_ROOT` variable, which bitparse and bit2fasm now use.
+  - `ofx build` and `ofx dfx build` pass `--chipdb`/`--db-root` for such parts. `ofx/design.py` reads their package pins.
+  - With an installed part nothing changes: `device.env()` is the same and `bitparse.DB` is the same path.
+- **xc7k70t: works offline.**
+  - The chipdb is generated with the stock nextpnr-xilinx generator and openXC7's kintex7 metadata (meta 8a3f5a0): 57 s, 2.4 GB peak, `build/chipdb/k7/chipdb-xc7k70t.bin`.
+  - The generator reports 1918 of 31067 tile pips (6.17 %) "NOT expressible", against 6.04 % on xc7a50t.
+  - `examples/blinky_k70t` builds with `ofx build`: 399 MHz, IDCODE 0x03647093 = prjxray-db, the decode check passes. Pins are HR bank 16 pins from the prjxray-db package file, not a board.
+  - `examples/dfx_k70t` (region `SLICE_X12Y100:SLICE_X15Y149`, region DRC 0 split INT pairs, 200 tiles, 72 frames) gives verify 10 PASS 0 FAIL.
+  - Partial headers say `7k70tfbg676` with IDCODE 0x03647093. region2v ran on the xc7k70t graph (`build/region2v/xc7k70t/`).
+  - No Vivado cross-check is possible: the installed Vivado has no Kintex-7 part data. So the prjxray kintex7 bits themselves are unchecked against Vivado.
+- **xc7k325t: not built, deprioritised (user: Artix-7 first).**
+  - The chipdb generator was OOM-killed at 5.9 GB RSS while other jobs ran on this 12 GB machine.
+  - A retry with an 8 GB cap was stopped by the change of priority.
+  - `examples/blinky_k325t` exists (bank 12 HR pins, xc7k325tffg900-2) and is not built.
+- **Virtex-7:** openXC7's prjxray-db has `virtex7` (xc7vx485t, the VC707 part), and nextpnr-xilinx ships VC707 examples. Not fetched or tried; deprioritised.
+
+**Artix-7 dies.**
+- prjxray-db (installed and openXC7) has only the xc7a50t, xc7a100t and xc7a200t fabrics, with parts xc7a35t/a50t/a100t/a200t.
+- The openXC7 inventory has nothing more.
+- **xc7a12t, xc7a15t, xc7a25t and xc7a75t have no part files in any prjxray-db, so no open build is possible today.**
+  - xc7a15t and xc7a75t are the xc7a50t and xc7a100t dies, so they would need only `part.json`/`part.yaml`/`package_pins.csv` (IDCODE, packages). prjxray generates these from Vivado, which has Artix-7 data here.
+  - xc7a12t and xc7a25t are a separate die and need a fuzzed fabric.
+- The Vivado cross-check of the Artix-7 blinkies (a35t cpg236, a50t, a100t, a200t) and of `gtp_b3` is below, under "Vivado cross-check".
+
+**GTP (transceivers).**
+- Which of our parts have usable GT data (`build/ofx/devices/gt_survey.txt`):
+  - **artix7:** GTP_CHANNEL_0..3 / GTP_COMMON segbits (with the xc7a200t MID_LEFT/RIGHT variants) and PCIE_BOT. The chipdbs have the GTPE2/IBUFDS_GTE2 site types. **Usable:** xc7a35t/a50t (cpg236: 2 lanes, csg325/fgg484: 4; csg324 bonds none), xc7a100t, xc7a200t.
+  - **spartan7:** the xc7s25/xc7s50 tilegrids contain GTP tiles but the family has no segbits. Spartan-7 parts have no transceivers.
+  - **zynq7:** the xc7z030/045/100 tilegrids have GTX tiles, but there are no zynq7 GT segbits or site metadata. **Not usable.**
+  - **kintex7 (openXC7 db):** GTX_CHANNEL/COMMON segbits, and the generated xc7k70t chipdb has GTXE2 site types. Not built.
+- **`examples/gtp_b3` builds** (xc7a35tcpg236-1, Basys 3 part, MGT pins from prjxray-db; the Basys 3 board does not wire the MGTs). It contains:
+  - IBUFDS_GTE2 on MGTREFCLK0 (B8/A8);
+  - GTPE2_COMMON PLL0;
+  - GTPE2_CHANNEL 0 (TX D2/D1, RX B4/A4), 16-bit TX/RX, TXOUTCLK through a BUFG clocking a TX counter;
+  - RX data folded into the LEDs.
+  
+  Results:
+  - nextpnr places the COMMON at GTP_COMMON_X97Y127 and the channel at GTP_CHANNEL_0_X97Y110, and routes them. 464 MHz usrclk.
+  - The FASM has 171 GTPE2_CHANNEL and 21 GTPE2_COMMON parameter lines.
+  - The decode check passes: frames match, 135 non-zero frames, decoded FASM re-encodes to 0 differing frames, 0 unknown bits.
+- **Bug found: nextpnr-xilinx's GT FASM writer does not use the UNISIM defaults.**
+  - yosys writes only the parameters an instance sets. For every missing parameter, nextpnr's writer (`fasm.cc` `write_gtp_channel`/`write_gtp_pll`, and the same for GTX) uses its own default, mostly 0.
+  - `build/ofx/devices/gt_defaults.py` compares those defaults with yosys `cells_xtra.v`:
+
+    | primitive | defaults that differ from UNISIM | parameters never read |
+    |---|---|---|
+    | GTPE2_CHANNEL | 114 of the 227 parameters it reads | 15 |
+    | GTPE2_COMMON | 4 of 24 (PLL0/1_FBDIV 1 vs 4, PLL0/1_FBDIV_45 4 vs 5) | 9 |
+    | GTXE2_CHANNEL | 111 of 195 | 15 |
+    | GTXE2_COMMON | 3 of 13 | 16 |
+
+    Examples: CHAN_BOND_MAX_SKEW 0 vs 7, RX_DATA_WIDTH 0 vs 20, RX/TX_CLKMUX_EN 0 vs 1, PMA_RSV 0 vs 0x333.
+  - **Impact:** a GTP instance that relies on defaults either stops with `ERROR: CHAN_BOND_MAX_SKEW may only range from 1 to 14, but is: 0` (the first gtp_b3 build), or gets wrong configuration bits silently.
+  - **Workaround in the example:** `examples/gtp_b3/gt_params.py` writes every UNISIM parameter with its default, and the design carries the full lists. Not fixed in nextpnr, not reported upstream.
+  - Nothing GT-related is timed, simulated or tried on silicon.
+
 ### Zynq-7000: PL, PS7 and booting the PS (2026-11-06)
 
 ofx builds the Zynq **programmable logic (PL)**, including a design that instantiates the `PS7` cell, and makes
@@ -709,8 +840,11 @@ Every hard-coded device reference in `flow/` and what was done with it:
 - byteman's device model writes 1 frame for the right-hand IO column of some rows (xc7a100t c57, xc7z020 c73,
   xc7a200t c105, xc7s50 c43 and T r1 c37), so a byteman `-o full` of a design with IOs there loses their
   configuration; `ofx dfx verify` compensates (`_bmcmp.py`), a plain byteman round trip does not.
-- Built per family: xc7a35t, xc7a100t, xc7a200t, xc7s50, xc7z020. Other sizes (xc7s25/s100, xc7z010/z030/...)
-  resolve but were not built. No Kintex/Virtex (no prjxray-db).
+- Built per family (Results 4 and 5): every part with an installed chipdb (xc7a35t/a50t/a100t/a200t, xc7s25/s50/s75/s100,
+  xc7z007s/z010/z020/z030/z035/z045/z100) and xc7k70t from openXC7's kintex7 prjxray-db. Not possible: xc7a12t/a15t/a25t/a75t
+  (no prjxray part files). Deprioritised (user: Artix-7 first): xc7k325t (chipdb generation needs > 6 GB), Virtex-7.
+- nextpnr-xilinx's GT FASM writer uses its own defaults (mostly 0) for GT parameters missing from the netlist instead of
+  the UNISIM defaults (Results 5, GTP); a GT design must set every parameter.
 - region2v's simulation vectors are tied to the custom-instruction slot interface.
 - VHDL: no `library unisim`; no external names; the GHDL/yosys path does not report what Vivado's VHDL front end
   would warn about. VHDL designs larger than the examples untested.

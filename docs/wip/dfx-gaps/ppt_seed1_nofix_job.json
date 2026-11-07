@@ -1,0 +1,45 @@
+{
+ "flow": "/home/finnf/open-dfx-xc7/flow",
+ "argv": [
+  "--run",
+  "--seed",
+  "1",
+  "--out",
+  "build/dfxgaps/ppt_seed1_nofix"
+ ],
+ "design": {
+  "shell_spec": "ports.json",
+  "out": "build/patched/rv_ppt_native",
+  "variant": "partpin3",
+  "partpins": "auto",
+  "pp_register": [
+   "ready"
+  ],
+  "rms": {
+   "xor": "rm_core_xor.v",
+   "andn": "rm_core_andn.v",
+   "add": "rm_core_add.v",
+   "rot": "rm_core_rot.v"
+  },
+  "default_rms": [
+   "xor",
+   "andn",
+   "add",
+   "rot"
+  ],
+  "place_union": [
+   "xor",
+   "andn",
+   "add",
+   "rot"
+  ],
+  "grey_clock_leaf": true,
+  "fix_endpoints": false,
+  "pin_module_ends": true,
+  "pin_w_module": 0.5,
+  "pin_exclude_wrap_exits": true
+ },
+ "chipdb": "toolchain/openxc7/share/nextpnr/himbaechel/xilinx/chipdb-xc7a50t.bin",
+ "variant": "partpin3",
+ "npwait": "/home/finnf/open-dfx-xc7/ofx/npwait.sh"
+}

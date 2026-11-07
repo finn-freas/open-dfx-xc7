@@ -25,13 +25,18 @@ CONFIG = {
         "v2": "build/nextpnr-build/place_v2/nextpnr-himbaechel",
         "v3": "build/nextpnr-build/place_v3/nextpnr-himbaechel",
         "v4": "build/nextpnr-build/place_v4/nextpnr-himbaechel",
+        "v5": "build/nextpnr-build/place_v5/nextpnr-himbaechel",
+        "v6": "build/nextpnr-build/place_v6/nextpnr-himbaechel",
+        "v7": "build/nextpnr-build/place_v7/nextpnr-himbaechel",
+        "v8": "build/nextpnr-build/place_v8/nextpnr-himbaechel",
+        "v9": "build/nextpnr-build/place_v9/nextpnr-himbaechel",
         "perm": "build/nextpnr-build/qorperm/nextpnr-himbaechel",
     },
     "chipdb": qor_bench.NIGHTLY_CHIPDB,
     "chipdb_cal": ROOT / "build" / "chipdb-cal" / "on" / "chipdb-xc7a50t.bin",
     "chipdb_rcal": ROOT / "build" / "chipdb-rcal" / "on" / "chipdb-xc7a50t.bin",
     "npwait": ROOT / "ofx" / "npwait.sh",
-    "max_nextpnr": 2,
+    "max_nextpnr": 3,
     "designs": ["rv_soc", "bram", "rv_big", "ddr"],
     "periods": [5],
     "seeds": [1, 2, 3],
@@ -59,6 +64,7 @@ CONFIG = {
     },
     "variants": {
         "pl_base": {"bin": "ref", "args": TMG},
+        "plh_base": {"bin": "ref", "args": ["-o", "hardblock-timing"]},
         "pl_off": {"bin": "v1", "args": TMG},
         "pl_ct10": {"bin": "v1", "args": TMG + ["--tmg-crit-target", "1.0"]},
         "pl_ct10_f7": {"bin": "v1", "args": TMG + ["--tmg-crit-target", "1.0", "--tmg-crit-floor", "0.7"]},
@@ -81,7 +87,33 @@ CONFIG = {
         "pl3_off": {"bin": "v3", "args": TMG + []},
         "plp_cal": {"bin": "perm", "args": TMG + ["-o", "lut-perm-timing"], "cal": True},
         "plp_rcal": {"bin": "perm", "args": TMG + ["-o", "lut-perm-timing"], "cal": True, "rcal": True},
+        "plp_dqcal": {"bin": "perm", "args": TMG + ["-o", "lut-perm-timing", "-o", "dsp-cascade-place"], "cal": True, "dspq": True},
+        "plp_dqrcal": {"bin": "perm", "args": TMG + ["-o", "lut-perm-timing", "-o", "dsp-cascade-place"], "cal": True, "rcal": True, "dspq": True},
         "pl4_off_rcal": {"bin": "v4", "args": TMG + [], "cal": True, "rcal": True},
+        "pl5_off_rcal": {"bin": "v5", "args": TMG + [], "cal": True, "rcal": True},
+        "pl6_off_rcal": {"bin": "v6", "args": TMG + [], "cal": True, "rcal": True},
+        "pl6_sd_rcal": {"bin": "v6", "args": TMG + ["-o", "static-delay=786,63,29,37,7"], "cal": True, "rcal": True},
+        "pl6_sdpc_rcal": {"bin": "v6", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["-o", "predict-cal=665,682,313,1.235"], "cal": True, "rcal": True},
+        "pl6_sdtw15_rcal": {"bin": "v6", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-timingweight", "15"], "cal": True, "rcal": True},
+        "pl6_sdce4_rcal": {"bin": "v6", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-critexp", "4"], "cal": True, "rcal": True},
+        "pl7_off_rcal": {"bin": "v7", "args": TMG + [], "cal": True, "rcal": True},
+        "pl7_mxpc_rcal": {"bin": "v7", "args": TMG + ["-o", "static-delay=matrix", "-o", "predict-cal=665,682,313,1.235"], "cal": True, "rcal": True},
+        "pl8_off_rcal": {"bin": "v8", "args": TMG + [], "cal": True, "rcal": True},
+        "pl8_sdarc5_rcal": {"bin": "v8", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-arc-ratio", "0.5"], "cal": True, "rcal": True},
+        "pl8_sdarc10_rcal": {"bin": "v8", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-arc-ratio", "1.0"], "cal": True, "rcal": True},
+        "pl8_sdarc10_dqrcal": {"bin": "v8", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-arc-ratio", "1.0"], "cal": True, "rcal": True, "dspq": True},
+        "pl8_sdarc2_rcal": {"bin": "v8", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-arc-ratio", "0.2"], "cal": True, "rcal": True},
+        "pl8_arc2_rcal": {"bin": "v8", "args": TMG + ["--placer-static-arc-ratio", "0.2"], "cal": True, "rcal": True},
+        "pl9_off_rcal": {"bin": "v9", "args": TMG + [], "cal": True, "rcal": True},
+        "pl9_sdwp_rcal": {"bin": "v9", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-weighted-precond"], "cal": True, "rcal": True},
+        "pl9_sdwptw15_rcal": {"bin": "v9", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-weighted-precond", "--placer-static-timingweight", "15"], "cal": True, "rcal": True},
+        "pl6_te2_rcal": {"bin": "v6", "args": TMG + ["--placer-static-timing-every", "2"], "cal": True, "rcal": True},
+        "pl6_sdte2_rcal": {"bin": "v6", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-timing-every", "2"], "cal": True, "rcal": True},
+        "pl6_sd_dqrcal": {"bin": "v6", "args": TMG + ["-o", "static-delay=786,63,29,37,7"], "cal": True, "rcal": True, "dspq": True},
+        "pl5_pc_rcal": {"bin": "v5", "args": TMG + ["-o", "predict-cal=665,682,313,1.235"], "cal": True, "rcal": True},
+        "pl5_pc_cal": {"bin": "v5", "args": TMG + ["-o", "predict-cal=665,682,489,1.391"], "cal": True},
+        "pl5_off_dqrcal": {"bin": "v5", "args": TMG + [], "cal": True, "rcal": True, "dspq": True},
+        "pl5_pc_dqrcal": {"bin": "v5", "args": TMG + ["-o", "predict-cal=665,682,313,1.235"], "cal": True, "rcal": True, "dspq": True},
         "pl4_sw20_rcal": {"bin": "v4", "args": TMG + ["--placer-static-timingweight", "20"], "cal": True, "rcal": True},
         "pl4_ce1_rcal": {"bin": "v4", "args": TMG + ["--placer-static-critexp", "1"], "cal": True, "rcal": True},
         "pl4_ce4_rcal": {"bin": "v4", "args": TMG + ["--placer-static-critexp", "4"], "cal": True, "rcal": True},
@@ -344,6 +376,44 @@ def soc_vivado(name, clock):
             "dir": str(d)}
 
 
+def log_metrics(log):
+    """Placement quality besides Fmax, from nextpnr's log: HPWL after legalisation, placer1's final wirelength
+    cost, routed wires and overused wires in router2's first iteration (congestion), router iterations and time."""
+    t = log.read_text(errors="replace") if log.exists() else ""
+    f = lambda pat: [float(x) for x in re.findall(pat, t)]
+    leg = f(r"HPWL after legalise: ([0-9.]+)")
+    wl = f(r"wirelen = ([0-9]+)")
+    it = re.findall(r"iter=(\d+) wires=(\d+) overused=(\d+)", t)
+    rt = f(r"Router2 time ([0-9.]+)s")
+    return {"hpwl_legal": leg[-1] if leg else None, "wirelen_sa": wl[-1] if wl else None,
+            "wires": int(it[-1][1]) if it else None, "overused_iter1": int(it[0][2]) if it else None,
+            "router_iters": int(it[-1][0]) if it else None, "router_s": rt[-1] if rt else None}
+
+
+def metrics(designs, periods, vnames, seeds):
+    lines = ["| design | variant | HPWL after legalisation | placer1 wirelength | routed wires | overused wires, router iter 1 | "
+             "router iterations | router s | total nextpnr s |", "|---|---|---|---|---|---|---|---|---|"]
+    data = {}
+    mean = lambda xs: statistics.mean([x for x in xs if x is not None]) if any(x is not None for x in xs) else None
+    for design in designs:
+        for period in ([10] if design in CONFIG["socs"] else periods):
+            for v in vnames:
+                rows = []
+                for sd in seeds:
+                    d = run_dir(design, period, v, sd)
+                    st = json.loads((d / "status.json").read_text()) if (d / "status.json").exists() else {}
+                    m = log_metrics(d / "nextpnr.log")
+                    m["total_s"] = st.get("pnr", {}).get("seconds")
+                    rows.append(m)
+                agg = {k: mean([r[k] for r in rows]) for k in rows[0]}
+                data[f"{design}|{v}"] = {"per_seed": rows, "mean": agg}
+                g = lambda k, fmt="{:.0f}": "-" if agg[k] is None else fmt.format(agg[k])
+                lines.append(f"| {design} | {v} | {g('hpwl_legal')} | {g('wirelen_sa')} | {g('wires')} | "
+                             f"{g('overused_iter1')} | {g('router_iters', '{:.1f}')} | {g('router_s', '{:.1f}')} | "
+                             f"{g('total_s', '{:.1f}')} |")
+    return "\n".join(lines) + "\n", data
+
+
 def stats(xs):
     xs = [x for x in xs if x is not None]
     if not xs:
@@ -387,6 +457,7 @@ def main():
     ap.add_argument("--seeds", nargs="+", type=int, default=CONFIG["seeds"])
     ap.add_argument("--xprep", action="store_true", help="write Vivado sources of the finished runs into build/qor/place/xsrc")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--metrics", action="store_true", help="wirelength, congestion and runtime per variant (seed means)")
     ap.add_argument("--noop", nargs=2, metavar=("A", "B"), help="compare the .frames of two variants")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
@@ -400,6 +471,13 @@ def main():
                     fb, gb = frames_of(design, period, a.noop[1], s)
                     same = fa.exists() and fb.exists() and fa.read_bytes() == fb.read_bytes()
                     print(f"{design} p{period:g} s{s}: frames {'IDENTICAL' if same else 'DIFFER'} ({fa} vs {fb})")
+        return
+    if a.metrics:
+        md, data = metrics(a.designs, a.periods, a.variants, a.seeds)
+        CONFIG["out"].mkdir(parents=True, exist_ok=True)
+        (CONFIG["out"] / ("metrics_" + "_".join(a.variants) + ".md")).write_text(md)
+        (CONFIG["out"] / ("metrics_" + "_".join(a.variants) + ".json")).write_text(json.dumps(data, indent=1) + "\n")
+        print(md)
         return
     if a.report:
         md, data = report(a.designs, a.periods, a.variants, a.seeds)

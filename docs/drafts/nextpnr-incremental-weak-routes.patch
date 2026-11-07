@@ -1,0 +1,90 @@
+From dcbe61cd04307857ea56b35dd0158bcd24409688 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 6 Nov 2026 22:40:30 -0500
+Subject: [PATCH] xilinx: -o prerouted-strength=weak, a replayed routing the
+ router may rip up
+
+---
+ himbaechel/uarch/xilinx/xilinx.cc | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 5fcd510e..92ad0dcf 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -89,6 +89,10 @@ po::options_description XilinxImpl::getUArchOptions()
+                            "before routing, give the nets named in this file the routes they had in a reference "
+                            "build (scripts/routing_dump.py from that build's --write JSON), locked; the router "
+                            "then routes only what is new -- a frozen routing, for adding to a routed design");
++    specific.add_options()("prerouted-strength", po::value<std::string>(),
++                           "with -o prerouted: 'locked' (default) keeps the reference routes fixed; 'weak' gives "
++                           "them to the router as a starting routing that it may rip up and reroute (an "
++                           "incremental build after a design change, flow/incremental.py)");
+     specific.add_options()("partition-pins", po::value<std::string>(),
+                            "with -o prerouted: lines '<net>\\t<wire>' naming the wire at which each net crosses the "
+                            "edge of a routing-contained pblock; the net's locked route outside ends (or starts) "
+@@ -1651,6 +1655,10 @@ void XilinxImpl::apply_prerouted()
+     if (!args.options.count("prerouted"))
+         return;
+     std::string path = args.options.at("prerouted").as<std::string>();
++
++    const bool replay_is_weak = args.options.count("prerouted-strength") &&
++                                args.options.at("prerouted-strength").as<std::string>() == "weak";
++
+     std::ifstream in(path);
+     if (!in)
+         log_error("cannot read prerouted file '%s'\n", path.c_str());
+@@ -1674,6 +1682,9 @@ void XilinxImpl::apply_prerouted()
+         NetInfo *ni = it->second.get();
+         std::vector<std::pair<WireId, PipId>> previous;   // the route this replaces, if any
+         const bool route_clocks_got_here_first = !ni->wires.empty();
++
++        const PlaceStrength replay_strength =
++                (replay_is_weak && !route_clocks_got_here_first) ? STRENGTH_WEAK : STRENGTH_LOCKED;
+         if (route_clocks_got_here_first) {
+             // route_clocks got here first.  The reference's tree replaces
+             // its work even when it reached every sink: a clock with a sink
+@@ -1720,7 +1731,7 @@ void XilinxImpl::apply_prerouted()
+                 }
+                 const bool wire_is_still_free = (bound_net == nullptr);
+                 if (wire_is_still_free) {
+-                    ctx->bindWire(w, ni, STRENGTH_LOCKED);
++                    ctx->bindWire(w, ni, replay_strength);
+                     wires_bound.push_back(w);
+                 }
+             } else {
+@@ -1736,7 +1747,7 @@ void XilinxImpl::apply_prerouted()
+                     reference_route_collided = true;
+                     break;
+                 }
+-                ctx->bindPip(p, ni, STRENGTH_LOCKED);
++                ctx->bindPip(p, ni, replay_strength);
+                 pips_bound.push_back(p);
+             }
+         }
+@@ -1753,11 +1764,11 @@ void XilinxImpl::apply_prerouted()
+                     continue;
+                 const bool wire_came_from_no_pip = (w.second == PipId());
+                 if (wire_came_from_no_pip)
+-                    ctx->bindWire(w.first, ni, STRENGTH_LOCKED);
++                    ctx->bindWire(w.first, ni, replay_strength);
+                 else {
+                     const bool pip_is_free_again = ctx->checkPipAvail(w.second);
+                     if (pip_is_free_again)
+-                        ctx->bindPip(w.second, ni, STRENGTH_LOCKED);
++                        ctx->bindPip(w.second, ni, replay_strength);
+                 }
+             }
+             collided++;
+@@ -1797,7 +1808,7 @@ void XilinxImpl::apply_prerouted()
+                     if (!joins_the_reference || path.empty())
+                         continue;
+                     for (PipId p : path)
+-                        ctx->bindPip(p, ni, STRENGTH_LOCKED);
++                        ctx->bindPip(p, ni, replay_strength);
+                     rejoined++;
+                 }
+             }
+-- 
+2.53.0
+

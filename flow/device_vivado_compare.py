@@ -84,6 +84,12 @@ def compare(name, part, ours, theirs, out):
         io[p] = {"tile": t["tile"], "site": t["site"], "same": ta.get(t["tile"], set()) == tb.get(t["tile"], set()),
                  "only_ofx": sorted(ta.get(t["tile"], set()) - tb.get(t["tile"], set())),
                  "only_vivado": sorted(tb.get(t["tile"], set()) - ta.get(t["tile"], set()))}
+    gt = {}
+    for t in sorted(set(ta) | set(tb)):
+        if re.match(r"GT[PX]_(COMMON|CHANNEL)", t):
+            gt[t] = {"ofx": len(ta.get(t, ())), "vivado": len(tb.get(t, ())), "common": len(ta.get(t, set()) & tb.get(t, set())),
+                     "only_ofx": sorted(ta.get(t, set()) - tb.get(t, set())),
+                     "only_vivado": sorted(tb.get(t, set()) - ta.get(t, set()))}
     ttype = lambda feats: collections.Counter(re.sub(r"_X\d+Y\d+$", "", f.split(".", 1)[0]) for f in feats)
     res = {"design": name, "part": part,
            "idcode": {"ofx": a["regs"].get("IDCODE"), "vivado": b["regs"].get("IDCODE"),
@@ -94,7 +100,7 @@ def compare(name, part, ours, theirs, out):
            "fasm_features": {"ofx": len(fa), "vivado": len(fb), "common": len(fa & fb)},
            "fasm_unknown_lines": {"ofx": ua, "vivado": ub},
            "features_by_tile_type": {"ofx": dict(ttype(fa)), "vivado": dict(ttype(fb))},
-           "io_tiles": io}
+           "io_tiles": io, "gt_tiles": gt}
     (out / f"{name}.json").write_text(json.dumps(res, indent=1) + "\n")
     return res
 
@@ -123,6 +129,8 @@ def main():
         for k, v in r["regs"].items():
             if v["ofx"] != v["vivado"]:
                 print(f"  {k}: ofx {v['ofx']} vivado {v['vivado']}")
+        for t, v in r["gt_tiles"].items():
+            print(f"  GT tile {t}: ofx {v['ofx']} vivado {v['vivado']} common {v['common']} features")
         for p, v in r["io_tiles"].items():
             if not v["same"]:
                 print(f"  pin {p} {v['tile']}: only ofx {v['only_ofx']} only vivado {v['only_vivado']}")

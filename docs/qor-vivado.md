@@ -504,6 +504,582 @@ Remaining gap, `area_all` against Vivado's own build:
 - nextpnr still uses sites that hold only its own LUTs: 71-98 on the small designs, 124 on arty_ddr3 and 899 on arty_eth. Most of them are S feed-throughs from counter flip-flops. Vivado does the same routing but does not count it.
 - Open: LiteX LUTRAM (memory mapping cost), bram's three-operand adders, control sets, the Fmax cost of the pairing, and a Vivado-timer check of the new placements.
 
+## Finding 13 (2026-11-06): nextpnr's implementation timed by Vivado pip for pip; routing and placer delay models calibrated (nextpnr drafts)
+Method (flow/xroute.py, vivado/build_xroute.tcl, flow/xroute_cmp.py, flow/xroute_fit.py, flow/xroute_predict.py; CONFIG blocks, dry run by default):
+- nextpnr is re-run with the source build's exact command plus `--sdf`, in build/xroute/npr/<name>/. done.json there records that the FASM (sorted lines) is identical to the source build's.
+- Netlist: the yosys netlist, rewired to nextpnr's connectivity:
+  - the cells nextpnr adds (LUT1 feed-throughs to CARRY4 S/DI, constant LUTs, duplicated LUTs);
+  - INV/BUF turned into LUT1;
+  - every CARRY4 rebuilt from nextpnr's physical cells.
+  Every original pin is checked against nextpnr's net.
+- Placement: every cell is `place_cell`ed at nextpnr's BEL and fixed. LUT pins get LOCK_PINS from `X_ORIG_PORT`. RAM32M macros take `LOC`.
+- Routing:
+  - nextpnr's tile pips are translated to Vivado nodes and set as `ROUTE` (absolute node names), then `IS_ROUTE_FIXED`;
+  - `route_design -preserve` completes only what could not be set;
+  - then report_timing (5000 setup and 5000 hold paths), `get_net_delays` for every arc, and `get_pips` per net.
+- Identity is checked twice: Vivado's pips per net against nextpnr's, and both bitstreams decoded with bit2fasm.
+- nextpnr's side is its SDF (slow max), mapped pin by pin to Vivado's report. Re-adding the SDF arcs reproduces nextpnr's own critical path exactly.
+- Paths through a net whose Vivado pips differ from nextpnr's are excluded ("strict").
+- Source builds: build/qor/oxc7/cal_static/{blinky,bram,rv_soc}_p5/s1 and dspq_cal/{rv_mul,rv_big}_p5/s1 (Finding 10 chipdb, static placer, 5 ns).
+- Vivado outputs: C:\Users\finnf\open-dfx-xc7-vivado\build\xroute\<name>\.
+- Tables: build/xroute/verify/r3/table_{cal,perm,cal_rcal}_strict.md. They were re-generated on 2026-11-06 from the stored Vivado outputs, and they equal the earlier tables in build/xroute/cmp.
+
+### Identity
+| design | nets whose Vivado pips differ / routed nets | pips only nextpnr / only Vivado (of nextpnr's) |
+|---|---|---|
+| blinky | 0 / 37 | 0 / 0 (of 191) |
+| rv_soc | 0 / 1734 | 0 / 0 (of 24406) |
+| rv_mul | 1 / 2601 | 25 / 24 (of 34875) |
+| rv_big | 2 / 2610 | 6 / 6 (of 38003) |
+| bram | 104 / 1458 | 300 / 364 (of 22922): nextpnr leaves a LUT O6 through the AMUX pin where Vivado's site router uses the A pin |
+| fir | not imposed: Vivado refuses a 5LUT route-through next to an SRL in the same SLICEM | |
+
+Decoded bitstreams (bit2fasm), nextpnr's against Vivado's:
+- blinky: 1327 features in common; nextpnr-only 20 (constant-net pips, clock buffer bits, 1 CYINIT), Vivado-only 9 (unused-IOB settings, 1 CYINIT).
+- rv_mul: 77653 in common; rv_big: 85355 in common. The differences are constant-net routing and LUT INIT bits.
+
+### nextpnr's post-route SDF used predicted delays for permuted LUT inputs (fixed, opt-in)
+- The bug: `fixup_routing` moves a permuted LUT input's port but leaves the route ending on the old pin, so the SDF printed `predictArcDelay` (0 ps inside a site) for 30-65 % of LUT input arcs.
+- The fix: docs/drafts/nextpnr-lut-perm-timing.patch (`-o lut-perm-timing`, build `qorperm`) rebinds the last hop.
+- Unchanged by it: nextpnr's printed Fmax and `--report` (computed before fixup).
+- No-op, re-verified 2026-11-06 on blinky, rv_soc and bram (build/xroute/verify/r3/perm/result2.txt):
+  - option off: FASM, SDF and report identical to `qordsp`;
+  - option on: FASM identical as sorted lines, every permuted hop rebound (51 / 3502 / 2311).
+
+### Per-component error, nextpnr minus Vivado on the identical implementation
+Full table: build/xroute/verify/r3/table_perm_strict.md (arcs / mean / mean abs / p90 abs, ps). nextpnr timer = SDF with `-o lut-perm-timing`; Vivado timer for Vivado.
+- Cells are close:
+  - LUT -50 to +21 ps mean (+76 on blinky's one arc);
+  - FF clock-to-Q -16 to +10;
+  - CARRY4 -32 to -3;
+  - RAMB36/DSP48E1/ICAPE2 arcs 0 (they come from prjxray's SDF).
+- Setup checks:
+  - FF setup +46 to +103 ps (blinky, bram), -36 to -132 ps (CPUs);
+  - RAMB36 setup -69 to -166 ps;
+  - LUTRAM (RAMD32) setup +341 to +400 ps (pessimistic).
+- Routing is the error. Every class is 0.3-0.7 ns too fast per arc in nextpnr: single -380 to -505, double -421 to -484, hex -476 to -593, long -452 to -712, bounce -372 to -415 (blinky's single arc +109), local (LOGIC_OUTS -> IMUX only) -277 to -343 ps mean. The clock net's insertion delay is 0.46-0.78 ns low; it cancels in the skew.
+- Hold:
+  - nextpnr has no fast corner for routing (`getPipDelay` is one value), so its hold slack is 0.5-1.3 ns per path larger than Vivado's (path T hold: bram +1254, rv_soc +588, rv_mul +521, rv_big +713 ps mean);
+  - RAMB36 hold is 0.50-0.65 ns low, DSP48E1 hold 0.74-0.79 ns low;
+  - Vivado finds real hold violations on two of these implementations: bram WHS -0.094 ns, rv_soc -0.135 ns.
+- On identical routes, nextpnr's Fmax claim is optimistic against Vivado's timer:
+
+| design | nextpnr claim MHz (nextpnr timer) | identical implementation MHz (Vivado timer) | claim error | Vivado MHz, worst fully routed path | claim error vs that |
+|---|---|---|---|---|---|
+| blinky | 364.70 | 361.93 | +0.8 % | 361.93 | +0.8 % |
+| bram | 142.07 | 131.30 | +8.2 % | 131.30 | +8.2 % |
+| rv_soc | 133.08 | 97.03 | +37.2 % | 97.03 | +37.2 % |
+| rv_mul | 132.96 | 89.33 | +48.8 % | 105.15 | +26.4 % |
+| rv_big | 124.18 | 91.56 | +35.6 % | 99.11 | +25.3 % |
+
+Finding 10's smaller errors (6.3 % mean) came from Vivado re-routing nextpnr's placement with its own, better router.
+
+### Routing-delay calibration (docs/drafts/nextpnr-route-timing-cal, opt-in chipdb)
+Fit (flow/xroute_fit.py):
+- least squares of the per-arc error against the number of pips of each wire class on the arc (class = regex on the pip's destination wire);
+- fitted on blinky, rv_soc and bram only;
+- one additive slow-corner delay per class goes into the chipdb (`--route-timing`, build/chipdb-rcal/route_timing_xc7a35t_1.json, chipdb build/chipdb-rcal/on).
+
+Fitted adds (ps): IMUX +413, FAN/CTRL +280, BYP +98, single +22, double +30, quad +26, hex +26, long +30, bounce +5, BRAM inputs -44, hard-block outputs -10, CLB site outputs -56. Most of the missing delay is a fixed cost at the interconnect input mux, not in the wires.
+
+Re-verified 2026-11-06 (build/xroute/verify/r3):
+- the two drafts apply on a fresh nextpnr-stock export;
+- the generator equals the rcal worktree's;
+- chipdb without the option is byte-identical to build/chipdb-cal/on, and with the JSON to build/chipdb-rcal/on;
+- a refit on the current data moves no class by more than 55 ps (ctrl 280 -> 225, loose set) and the test mean by 6 ps.
+
+Per-arc net delay error, nextpnr minus Vivado (slow max), offline (SDF arcs plus the per-class additions; build/xroute/fit/eval.json):
+
+| arcs | before: mean / mean abs / p90 abs (ps) | after |
+|---|---|---|
+| fitted designs (blinky, rv_soc, bram), 10017 arcs | -478 / 481 / 757 | -5 / 154 / 307 |
+| not fitted (rv_mul, rv_big), 13885 arcs | -517 / 520 / 828 | -49 / 166 / 329 |
+
+Per setup path, same implementation, offline (strict: paths without a Vivado-unrouted net; build/xroute/verify/rep/eval_strict.log), mean error:
+
+| design | before (ps) | after (ps) |
+|---|---|---|
+| blinky | -163 | +108 |
+| bram | -507 | +77 |
+| rv_soc | -897 | +173 |
+| rv_mul | -688 | +35 |
+| rv_big | -552 | +6 |
+
+An earlier "0.6-0.7 ns residual" on the CPUs counted paths through nets that Vivado had left unrouted; it was a measurement artifact.
+
+End to end: nextpnr re-run with the calibrated chipdb (`rcal`, build `qorperm`, `-o lut-perm-timing`) makes a new implementation, which is again imposed on Vivado pip for pip (build/xroute/verify/r3/table_cal_rcal_strict.md):
+
+| design | nextpnr claim, cal chipdb | Vivado on that implementation (worst fully routed path) | error | nextpnr claim, rcal chipdb | Vivado on that implementation | error |
+|---|---|---|---|---|---|---|
+| rv_mul (not fitted) | 132.96 | 105.15 | +26.4 % | 86.63 | 94.61 | -8.4 % |
+| rv_big (not fitted) | 124.18 | 99.11 | +25.3 % | 87.80 | 83.29 | +5.4 % |
+
+- MHz. nextpnr timer for the claims, Vivado timer for the rest.
+- rv_big_rcal: Vivado's router left 3 pins unrouted after the fixed routes were set.
+- So the claim error drops from +25 % to within 9 %, both signs, on designs not used in the fit.
+
+Clock leaf and carry chain (JSON v2, docs/drafts/nextpnr-route-timing-cal.md):
+- Every clock-tree arc from the BUFG to an FF clock pin is 0.77-0.78 ns short in nextpnr: rv_soc mean 0.896 ns in nextpnr against 1.675 ns in Vivado's timer, on 879 arcs. A `clock_leaf` class of +775 ps puts blinky's clock pins at 1.671 ns; Vivado measures 1.645. Fmax is unchanged, because the add cancels in the skew.
+- CARRY4 cell arcs already agree with Vivado: CIN -> O/CO within 5 ps, S -> O/CO within 19-43 ps.
+- The COUT -> CIN hop is corrected by the existing CLB-output class.
+- So the long-carry-path optimism is in routing and the clock leaf, not in the carry cells.
+
+### Placer delay model (docs/drafts/nextpnr-placer-delay-cal, opt-in)
+The placer sees routing delay through two models that are not the router's:
+- **Global placer.** The static placer uses a fixed formula in xilinx.cc: 500 + 48*min(dy,6) + 24*max(dy-6,0) + 24*min(dx,12) + 12*max(dx-12,0) ps. It never reads the chipdb, so the route-calibrated chipdb does not change the global placement: HPWL after legalisation is identical with both chipdbs on rv_soc, bram and rv_big (build/qor/place/metrics_plp_cal_plp_rcal_pl5_pc_rcal.md).
+- **Refinement and pre-route timing.** placer1 and the pre-route timer use `predictDelay`, which reads a delay matrix measured on the chipdb.
+
+flow/xroute_predict.py recomputes both for every routed arc of the identical implementations above and compares them with Vivado's routed delay of that arc. Fits are least squares on blinky, rv_soc and bram; test = rv_mul and rv_big; outputs in build/xroute/predict/.
+
+| model | test arcs: mean / mean abs / p90 abs (ps) |
+|---|---|
+| static placer formula (current) | -433 / 447 / 888 |
+| static placer, fitted `-o static-delay=786,63,29,37,7` | -28 / 269 / 534 |
+| predictDelay, cell-calibrated chipdb (current) | -731 / 732 / 1206 |
+| predictDelay, route-calibrated chipdb (current) | -538 / 542 / 985 |
+| predictDelay, fitted `-o predict-cal=665,682,313,1.235` (rcal chipdb) | -33 / 259 / 527 |
+
+- A LUT input fed from the same slice: predictDelay says 0 ps, Vivado 0.67 ns mean. Another slice of the same tile: 150 ps vs 0.68 ns.
+- Between tiles, Vivado's routed delay grows about 1.2-1.4 times as fast with distance as the delay matrix, which is the cheapest route through the routing graph.
+- The static formula's distance slopes are of the right size, but its constant is about 0.3 ns low.
+
+### Placement round 2
+Variants (flow/place_bench.py; 3 seeds; static placer; route-calibrated chipdb `rcal` unless named):
+- `plp_cal` / `plp_rcal`: build `qorperm` with the cell- / route-calibrated chipdb;
+- `pl5_pc_*`: `-o predict-cal`;
+- `pl6_sd_*`: `-o static-delay=786,63,29,37,7`; `pl6_sdpc_*`: both;
+- `pl6_te2_*`: `--placer-static-timing-every 2`.
+
+No-op with the options off, `.frames` identical:
+- place_v5 vs place_v4 on rv_soc, bram and rv_big, 3 seeds each (build/qor/place/r13/run4b.log);
+- place_v6 vs place_v4 on rv_soc, 3 seeds (run6b.log).
+
+nextpnr timer, route-calibrated chipdb, 3 seeds, mean (min-max) MHz:
+
+| design | plp_rcal | pl5_pc_rcal | pl6_sd_rcal | pl6_sdpc_rcal |
+|---|---|---|---|---|
+| rv_soc | 99.13 (93.93-103.48) | 95.70 (90.09-102.49) | 97.34 (93.99-99.80) | 95.37 (87.40-99.92) |
+| bram | 125.40 (122.52-128.53) | 121.94 (110.95-128.63) | 128.07 (121.80-133.05) | 125.32 (119.08-129.48) |
+| rv_big | 87.08 (86.10-88.58) | 90.14 (88.72-90.88) | 83.41 (78.30-87.40) | 83.94 (82.43-86.07) |
+| rv_mul (`-pipeline`, `_dq`) | 87.15 (84.42-90.40) | 92.90 (90.69-94.52) | 91.76 (87.36-98.50) | - |
+
+Placement quality besides Fmax, seed means (`place_bench.py --metrics`, build/qor/place/metrics_*.md):
+
+| design | variant | HPWL after legalisation | routed wires | overused wires, router iteration 1 | router iterations |
+|---|---|---|---|---|---|
+| rv_soc | plp_rcal | 17142 | 43024 | 1798 | 9.3 |
+| rv_soc | pl6_sd_rcal | 17514 | 43061 | 1760 | 12.7 |
+| bram | plp_rcal | 21741 | 46319 | 1265 | 15.3 |
+| bram | pl6_sd_rcal | 21894 | 46422 | 1359 | 14.7 |
+| rv_big | plp_rcal | 25725 | 72728 | 2413 | 18.7 |
+| rv_big | pl6_sd_rcal | 25980 | 72356 | 2426 | 11.0 |
+
+- In nextpnr's own (now calibrated) timer, none of the delay-model options gains consistently: rv_mul +5 to +7 %, rv_big -4 %, rv_soc -2 to -4 %, within the seed spread.
+- The fitted global-placer model (`static-delay`) costs 1-2 % HPWL.
+- Wall times are not reported. The machine ran at load 15-20 (8 agents), so the nextpnr seconds in status.json are not comparable between runs.
+
+**Vivado timer on nextpnr's placement** (Vivado routes; mean of 3 seeds in MHz; `place_bench.py --report`; runs in open-dfx-xc7-vivado/build/place_xtime on C:):
+
+| variant | rv_soc | bram | rv_big |
+|---|---|---|---|
+| pl_base: stub chipdb, Finding 11 | 116.81 | 155.87 | 104.95 |
+| plp_cal: cell-calibrated chipdb | 117.84 | 147.28 | 92.20 |
+| plp_rcal: route-calibrated chipdb | 117.18 | 149.35 | 94.57 (seeds 4-8) |
+| pl5_pc_rcal: predict-cal | 116.00 | 149.69 | 90.84 |
+| pl6_sd_rcal: static-delay | 115.02 | 150.42 | 99.44 |
+| pl6_sdpc_rcal: static-delay + predict-cal | 119.18 (2 seeds) | 152.65 | 96.56 |
+| pl7_mxpc_rcal: delay matrix + predict-cal for the global placer | 116.66 | 153.95 | 96.73 |
+| pl6_sdce4_rcal: static-delay, critexp 4 | 112.80 | 153.02 | 96.94 |
+
+- The cell-calibrated chipdb makes the placements worse in Vivado's eyes: bram -5.5 %, rv_big -12 % against the stub chipdb.
+- Feeding calibrated delays to the global placer wins back part of that loss: bram 147-149 -> 150-154, rv_big 92-95 -> 97-99.
+- No variant beats the stub chipdb's placement, and rv_soc stays within its seed spread (107-126).
+- The gap to Vivado placing the same netlist is unchanged: rv_soc 157.63, bram 170.88 MHz (Finding 11).
+- Two Vivado runs were not finished when this was written: the timing-arc term (pl8) and the weighted preconditioner (pl9).
+
+Other results:
+- eth SoC, 3 seeds: plp_rcal 68.95, pl5_pc_rcal 70.08, pl_base 68.64 MHz.
+- rv_mul (`-pipeline` netlist): plp_dqcal 109.64, pl5_pc_dqrcal 107.86 MHz.
+- Static vs HeAP placer, Vivado timer, 3 seeds:
+  - DDR: static 83.92 (2 seeds), HeAP 84.46.
+  - eth: static 68.64, HeAP 67.39.
+  - So Fmax is equal within the seeds, but static needs 1.5-2.3x less nextpnr time and far fewer router iterations (docs/wip/placement-global.md).
+- Router gap: with the rcal chipdb, nextpnr's claim (calibrated timer on its own routes) is 99 / 125 / 57 MHz on rv_soc / bram / eth. Vivado's timer, with Vivado routing the same placements, gives 117 / 149 / 69. So nextpnr's routing costs about 15-20 % on its own.
+
+The nextpnr timer alone cannot rank these: with the rcal chipdb its claims moved from 133 to 99 MHz (rv_soc) without any placement change. The Vivado timings of all variants (sources in build/qor/place/xsrc) were queued but had not run when this was written: Vivado was held by other work. Results go here and in docs/wip/placement-global.md.
+
+
+### Open
+- fir cannot be imposed: it needs a LUT route-through next to an SRL, which Vivado treats as illegal.
+- bram's 104 nets leave through the OUTMUX; ROUTE alone cannot express that.
+- nextpnr has no fast-corner routing delay, so hold is not calibrated. The fast-corner timer is now the XDC agent's work.
+- One part and corner: xc7a35t-1, slow max.
+
+## Finding 14 (2026-11-06): timing-driven synthesis, retiming, FSM extraction, resource sharing, and the LiteX LUTRAM gap
+Question: how much does yosys's netlist cost against Vivado's own synthesis, which yosys options or fixes close it, and why does the LiteX DDR3 SoC use 320 LUTRAM sites against Vivado's 142? Everything below is opt-in; the default flow is unchanged.
+
+Method:
+- Netlist variants: flow/synth_timing.py (CONFIG block, dry run by default, cached by a hash of binary, script and RTL in build/qor/synx/synth/<design>/<key>/ with meta.json, yosys.log, stat.txt).
+  - `ys`: default `synth_xilinx -flatten -abc9`. `ys_dspq`: with the DSP pipeline draft (Finding 8).
+  - `t_dff` / `d_dff`: `abc9 -dff` on `ys` / `ys_dspq`.
+  - `t_retime_full` / `d_retime_full`: before LUT mapping, every flip-flop without keep/ASYNC_REG/DONT_TOUCH is legalised to a plain DFF and passed through `abc -dff`, whose script contains ABC's `dretime`; then the normal abc9 LUT mapping. This is the only retiming this yosys has (`synth_xilinx -retime` does not exist).
+  - `t_cal`: abc9 with a flat 7-series LUT model, 200 ps on every input (Finding 10's mean Vivado O6 arc), and 450 ps wire delay per level (`-W 450`; Vivado's mean net delay per logic level on the 100 worst rv_soc/rv_big paths is 0.48-0.82 ns). yosys's built-in model has LUT6 inputs at 642/631/472/407/238/127 ps and `-W 300`. `t_cal_dff` = both.
+  - `m_keepmem`: the new yosys draft (LUTRAM section below).
+- Vivado as the referee for synthesis only: flow/qor_synx.py writes each yosys netlist as EDIF. vivado/build_synx.tcl links it, or runs `synth_design` on the RTL for the `viv*` rows. It then runs the same `opt_design`, `place_design -directive Default` and `route_design`, and dumps 1000 setup paths. Outputs are in C:\Users\finnf\open-dfx-xc7-vivado\build\qor_synx\<design>_<variant>\.
+  - Placement and routing are Vivado's in every row; only the netlist differs.
+  - Fmax is from Vivado's timer, on the main clock, with ICAP paths excluded (as in Finding 3).
+  - `viv_*` rows pass `synth_design` options through synth_opts.txt: `-retiming`, `-fsm_extraction off`, `-resource_sharing off`.
+- Area uses Vivado's post-route "Slice LUTs" from the same P&R, and nextpnr's post-route LUT sites counted by the same rule (flow/qor_area.py, Finding 12).
+- Checks:
+  - Every yosys variant with numbers below was simulated in lockstep against the default netlist under the rv_soc firmware test (flow/synth_timing_equiv.py -> flow/qor_area_sim.sh). The test runs 157836 cycles and 11 operand vectors through the CPU, compares tx/led every cycle, and checks the answers.
+  - The LUTRAM fix has its own testbench.
+- Synthesis runtime is yosys wall time from meta.json on a machine shared by 8 agents, so it is indicative only.
+
+Vivado P&R of each netlist, Default directive, one run per row (flow/qor_synx_table.py, build/qor/synx/finding14_table.json; Vivado log C:\Users\finnf\open-dfx-xc7-vivado\build\qor_synx\vivado_20261106_215945.log, rv_soc_viv/ys and rv_big_viv from vivado_20261106_134010.log). Fmax is Vivado's timer. Area is Vivado's post-route utilisation. Synthesis time is Vivado `synth_design` or yosys wall time:
+
+| netlist | Fmax MHz excl. ICAP (Vivado timer) | worst path: levels (LUT, CARRY4) | post-route LUT sites | LUTRAM | FF | CARRY4 | synthesis s |
+|---|---|---|---|---|---|---|---|
+| rv_soc Vivado synth_design | 171.00 | 3 (3, 0) | 1041 | 50 | 771 | 63 | 52.4 |
+| rv_soc Vivado -retiming | 179.50 | 2 (2, 0) | 1032 | 50 | 844 | 63 | 61.0 |
+| rv_soc yosys `ys` | 157.63 | 6 (6, 0) | 1122 | 56 | 768 | 92 | 7.5 |
+| rv_soc `t_dff` | 162.63 | 8 (4, 4) | 1090 | 56 | 739 | 86 | 12.9 |
+| rv_soc `t_retime_full` | 160.41 | 6 (6, 0) | 1206 | 56 | 716 | 86 | 10.3 |
+| rv_soc `t_cal` | 164.20 | 8 (4, 4) | 1141 | 56 | 768 | 92 | 8.9 |
+| rv_soc `t_cal_dff` | 165.84 | 8 (4, 4) | 1126 | 56 | 739 | 83 | 13.2 |
+| rv_big Vivado synth_design | 177.68 | 8 (4, 4) | 1554 | 50 | 1159 | 123 | 188.3 |
+| rv_big Vivado -retiming | 177.68 | 8 (4, 4) | 1554 | 50 | 1159 | 123 | 66.9 |
+| rv_big yosys `ys` | 111.07 | 11 (1, 8) | 1630 | 56 | 1116 | 148 | 19.4 |
+| rv_big `ys_dspq` | 156.59 | 5 (5, 0) | 1644 | 56 | 1066 | 148 | 23.3 |
+| rv_big `d_dff` | 168.52 | 4 (4, 0) | 1588 | 56 | 1023 | 142 | 48.3 |
+| rv_big `d_retime_full` | 162.39 | 5 (5, 0) | 1780 | 56 | 1001 | 142 | 31.4 |
+
+Vivado synthesis options, synth only (post-synthesis "Slice LUTs" / CARRY4 / FF against the default `synth_design` of the same design):
+- rv_soc: default 1009 / 63 / 771. `-resource_sharing off` gives 1040 / 71 / 767. `-fsm_extraction off` gives 1026 / 63 / 767.
+- rv_big: default 1560 / 123 / 1159. `-resource_sharing off` gives 1594 / 131 / 1094. `-fsm_extraction off` gives 1579 / 123 / 1097.
+
+What this says (one run per row; the spread over three place directives on the same netlist was 157.6-165.9 MHz for rv_soc `ys`, so differences under about 5 % are within placement noise):
+- Retiming:
+  - Vivado's `-retiming` lifts rv_soc from 171.0 to 179.5 MHz: 37 backward moves, +73 FF, the worst path down to 2 LUT levels.
+  - On rv_big Vivado reports 74 backward moves, but its post-route numbers are identical to the default run (not investigated).
+  - yosys's only retiming (`t_retime_full`, ABC `dretime`) gives +1.8 % on rv_soc and +3.7 % on rv_big over the matching baseline (162.39 vs `ys_dspq` 156.59). It costs +84 / +136 LUT sites.
+  - `abc9 -dff` does better at no area cost: rv_soc +3.2 % (162.63) at -32 LUT sites. rv_big on top of the DSP draft: 156.59 -> 168.52 MHz (+7.6 %) at -56 LUT sites, which brings rv_big to 5.2 % under Vivado's own netlist (from 37.5 % under with plain `ys`).
+- Timing-driven LUT mapping: the flat calibrated abc9 model (`t_cal`) helps under Vivado's timer, rv_soc 157.63 -> 164.20 (+4.2 %), although nextpnr's own timer ranked it worse (133.42 vs 143.82, Finding 14 nextpnr json).
+  - Combined `t_cal_dff`: 165.84 MHz (+5.2 %), 1126 LUT sites (+4), 739 FF. rv_soc goes from 7.8 % to 3.0 % under Vivado's netlist.
+  - Both stay at 8 logic levels on the worst path, against Vivado's 3. That path is BRAM -> logic (see the abc9 arrival note below).
+- Resource sharing and FSM extraction in Vivado are worth 1-3 % LUTs on these CPUs. Turning sharing off adds 8 CARRY4, the same direction as yosys's missing `share -aggressive` (Finding 12).
+- Synthesis time: yosys 7.5-48 s against Vivado 52-188 s on these designs. `-dff` roughly doubles yosys's time on rv_big (23 -> 48 s with the DSP draft) and on rv_mul. On arty_ddr3 it takes 195 s against 33 s.
+
+LiteX LUTRAM gap (arty_ddr3, 320 vs 142 LUTRAM sites): root cause and fix.
+- 176 of the 320 sites are one memory: the L2 cache tag memory `tag_mem`, 512 x 22, single port, synchronous write-first read (`if (we) tag_mem_dat0 <= dw; else tag_mem_dat0 <= tag_mem[adr];`). Two bits of the written tag are constant 0 in this SoC.
+- During `synth_xilinx`'s `prepare` step, `opt` (opt_dff) turns those two bits of the read register into a `$sdff` with sync reset `we`. The register is now split into two FF cells.
+- `memory_dff` runs later (in `coarse`) and logs "no output FF found" for tag_mem. The read port stays asynchronous, block RAM cannot implement that, and memory_libmap picks 44 RAM256X1S (176 LUT sites) plus a fabric register. Vivado uses one RAMB18 for it.
+- Reproduced in 11 lines (build/qor/synx/lutram/tm2.v): 44 RAM256X1S. The same memory without the constant bits (tm.v) gives 1 RAMB18E1.
+- Fix, docs/drafts/yosys-opt-dff-keep-memrd-regs.{patch,md} (+26 lines in passes/opt/dff), built as build/yosys-build/yosys-synx/yosys:
+  - Opt-in with `scratchpad -set opt_dff.keep_memrd_regs 1`.
+  - opt_dff then does not infer a sync reset on part of a register whose D comes from a `$memrd` data port. A reset over the whole register is still inferred.
+- Scripted alternatives tried first, rejected:
+  - `memory_dff` before the full `opt` (`m_memdff`): on rv_soc it merges the address register of the boot RAM instead of its output register, +58 FF and +54 LUT cells.
+  - `opt -nosdff` until `memory -nomap` (`m_nosdff`): fixes tag_mem but adds 210 LUT cells on arty_ddr3, because sync-reset inference moves for every register.
+  - The manual `prepare` script itself (`t_prep`) gives a byte-identical netlist to `synth_xilinx` on rv_soc (build/qor/synx/noop.json).
+- No-op check: with the option off, the same binary gives byte-identical netlists to the option-on run on rv_soc, rv_mul, rv_big, bram and fir; only arty_ddr3 changes.
+  - The rebuilt binary has the same cell counts as oss-cad-suite's yosys on all six designs. Auto-generated names differ, because NEW_ID contains the source path.
+- Effect on arty_ddr3 (yosys stat): 44 RAM256X1S -> 0, RAMB18E1 37 -> 38, LUT cells 5141 -> 5197 (+56), FF 3741 -> 3738, MUXF7/8 3 -> 8. Synthesis 36.3 s -> 37.7 s.
+  - The +56 LUTs come from yosys putting the RAM in SDP x36 READ_FIRST mode and emulating write-first in fabric: tm2 gets 21 FDRE + 22 LUT3 next to the RAMB18E1. Vivado uses the RAMB18's own WRITE_FIRST mode.
+- nextpnr post-route, by Vivado's LUT-site rule (flow/qor_area_litex.py variants `area_keepmem`, `area_pnr_keepmem`; seed 1; build/qor/area/litex/arty_ddr3/<variant>/):
+
+| arty_ddr3 | LUT sites (O5+O6 pairs) | + sites with only nextpnr LUTs | LUTRAM sites | FF | sys_clk MHz (nextpnr timer, seed 1) |
+|---|---|---|---|---|---|
+| Vivado own | 4340 (936) | - | 142 | 3677 | - |
+| area_ref (Finding 12) | 5153 (620) | 433 | 320 | 3741 | 110.89 |
+| area_keepmem | 5040 (613) | 435 | 144 | 3738 | 97.20 |
+| area_pnr (Finding 12) | 4850 (923) | 387 | 320 | 3741 | 107.02 |
+| area_pnr_keepmem | 4682 (971) | 406 | 144 | 3738 | 102.33 |
+
+  - LUTRAM is now at Vivado's level (144 vs 142). With the nextpnr area options, LUT sites go from +11.8 % to +7.9 % over Vivado.
+  - Seeds 2 and 3 (flow/qor_synx_seeds.py, seed set in gap_build.CONFIG, build/qor/area/litex_seeds/s<seed>/, log build/qor/synx/logs/seeds.log):
+    - area_ref: LUT sites 5188 / 5176, sys_clk 105.33 / 106.28 MHz.
+    - area_keepmem: LUT sites 5028 / 5001, sys_clk 104.69 / 88.98 MHz.
+    - Over 3 seeds: LUT sites -2.6 % (median 5176 -> 5028), and nextpnr-timer sys_clk median 106.28 -> 97.20 MHz (-8.5 %). The best seeds are 110.89 vs 104.69.
+  - So the fix trades nextpnr Fmax for area. The critical sys_clk path now starts at the tag RAM's clock-to-out: `tag_mem.0.0.DOADO7`, clk-to-q 2.45 ns in nextpnr's model, against a 0.35 ns flip-flop before. The tag compare is behind it.
+  - Vivado faces the same block RAM. Vivado P&R of the same netlists (flow/ddr_xtime.py `--variant keepmem --modes free`; C:\Users\finnf\open-dfx-xc7-vivado\build\ddr3_xtime\arty_ddr3_keepmem_free against arty_ddr3_gapfix_free; Vivado's timer at 100 MHz):
+    - WNS +0.418 -> +0.334 ns, about 104.4 -> 103.5 MHz.
+    - LUT sites 4821 -> 4664 (-3.3 %), LUTRAM 320 -> 144, Block RAM tiles 21.5 -> 22, FF 3738 -> 3767.
+    - So under Vivado's placer and timer the area gain costs under 1 % Fmax. The -8.5 % above is how nextpnr handles the RAM clock-to-out path.
+  - The qor_synx flow (vivado/build_synx.tcl) failed placement on the arty_ddr3 keepmem netlist ("un-associated IO delay instances"; the default netlist was not tried in that flow). The cause was not checked; that flow reloads opt.dcp before place_design. So ddr_xtime was used here.
+  - The write-first emulation adds a LUT level after the RAM. Using TDP WRITE_FIRST would remove it (not done).
+- Function: flow/qor_memdff_sim.sh simulates RTL, stock netlist and patched netlist of tm.v and tm2.v in lockstep: 512 writes to fill the memory, then 200000 random cycles.
+  - Result: 0 mismatches (build/qor/synx/lutram/sim/*.sim.log).
+  - yosys's cells_sim RAMB18E1 returns X in SDP x36 mode, so the script carries a minimal model of exactly that mode, which stops the run if any other mode is used.
+  - Negative control: one LUT3 INIT of the patched tm2 netlist set to 0 gives 100422 mismatching cycles.
+  - No gate-level testbench exists for the whole SoC; the change is confined to tag_mem (one "Keeping" log line per opt run, and the other 5 designs are unchanged).
+- arty_eth (636 vs 512 LUTRAM): the draft changes nothing. Its LUTRAM is 147 RAM32M + 8 RAM64M from FIFOs, a different gap that is still open.
+
+FSM extraction against Vivado:
+- arty_ddr3: yosys extracts no FSM. 15 state registers (the 8 bank machines, refresher, multiplexer, wishbone2csr, litedramwishbone2native, fullmemorywe, choose_req/cmd grant) are rejected only because "Register has an initialization value"; LiteX gives every register one.
+  - Vivado extracts 4 of them (log C:\Users\finnf\open-dfx-xc7-vivado\build\ddr3\vivado.log): refresher, multiplexer and litedramwishbone2native kept 'sequential' (binary, as in the RTL), wishbone2csr 'one-hot'.
+  - So for 3 of the 4 Vivado keeps the same encoding yosys leaves in place. FSM encoding is not where the LiteX area gap is.
+- rv_soc/rv_big: yosys recodes picorv32's `cpu_state` (already one-hot in the RTL) and `mem_wordsize` to one-hot. Vivado extracts `mem_state` (sequential) and the bridge `state` (one-hot).
+  - `t_nofsm` (`fsm_encoding none` on every wire): rv_soc 1057 -> 1054 LUT cells, rv_big 1448 -> 1446, arty_ddr3 5141 -> 5136.
+  - nextpnr-timer Fmax over 3 seeds (build/qor/synx/nextpnr_ys_t_cal_..._s_share.json): rv_soc 143.82 -> 142.49, rv_big 103.64 -> 104.12, within the seed noise of Finding 4.
+- Vivado `-fsm_extraction off`: the synth-only rows of the Vivado table above.
+
+Resource sharing:
+- yosys `share -aggressive` (Finding 12's `-share_aggressive`): CARRY4 rv_soc 92 -> 64, rv_big 148 -> 96, but LUT cells +7 % / +10 %, and depth goes up (max LUT levels 7 -> 8, rv_soc).
+  - nextpnr-timer Fmax over 3 seeds: rv_soc 143.82 -> 124.84 (-13 %), rv_big 103.64 -> 103.17.
+  - Synthesis: rv_soc 9.2 s -> 33.3 s, arty_ddr3 32.8 s -> 77.0 s.
+- Vivado `-resource_sharing off` against the default (auto): the synth-only rows of the Vivado table above.
+
+abc9 and timing-driven LUT mapping:
+- A delay target (`abc9.D`, Finding 5) changes nothing. A `&dch` x2 script on the flat model (`t_cal_dch2`) gives rv_soc 133.05 vs `t_cal` 133.42 MHz, and rv_big 103.78 vs 104.13 (nextpnr timer, mean of 3 seeds, build/qor/synx/nextpnr_ys_t_cal_..._s_share.json).
+- yosys's BRAM clock-to-out never reaches ABC.
+  - RAMB36E1's `(posedge CLKARDCLK => DOADO) = 2454` arc is conditional on `&DOA_REG`; the 882 ps arc is on `|DOA_REG`. With DOA_REG = 0 neither condition holds. The intent was presumably `!DOA_REG` for the 2454 ps arc.
+  - But the cause is deeper. With the RAMB18E1/RAMB36E1 models overridden so that the arc is 0, 2454 or 5000 ps, or conditioned on `!DOx_REG`, abc9's input.xaig is byte-identical, ABC reports the same mapped delay (`Del = 1548`), and the rv_soc netlist is byte-identical (build/qor/synx/arrival/).
+  - So abc9 maps BRAM-fed logic as if the RAM output arrived at time 0.
+  - On rv_soc the critical paths under Vivado's timer are exactly those: boot RAM -> picorv32 `reg_out`. Vivado's own netlist has 3 LUT levels there (Default: 171.0 MHz). Yosys's has 6 LUT levels (157.6 MHz), on the same Vivado P&R.
+  - The XAIG's `i` section carries no arrival value at all: no float 2454 or 882 (RAM), nor 303 (FDRE clock-to-out), in input.xaig.
+  - Keying write_xaiger's arrival map by the sigmapped bit, as the primary inputs are looked up, changed nothing (tried in build/src/yosys-synx, reverted).
+  - Found in round 2 below: abc9's default writer (`write_xaiger2`) emits no arrival times at all; `abc9.xaiger=1` restores them.
+- abc9 with the flat calibrated model (`t_cal`): see the Vivado table above.
+
+Retiming:
+- yosys has no register retiming except ABC's `dretime` through `abc -dff` (`t_retime_full`) and `abc9 -dff`, which only lets ABC merge/sweep flip-flops (`t_dff`). The Vivado table above compares both with Vivado's `synth_design -retiming`.
+- arty_ddr3: `t_retime_full` moves no flip-flop (3741 before and after). A likely reason, not verified: LiteX gives every register an init value.
+
+DSP accumulators (pw_dsp power designs, open flow 6.8-7.8x Vivado's LUTs, build/power/fit.md):
+- pw_dsp8 with stock yosys: 4 DSP48E1, 96 CARRY4, 548 FDRE, 620 LUTs. All eight 48-bit accumulators `p[i] <= p[i] + m[i]` are in fabric.
+- Root cause: MACs i and i+1 have identical inputs (`a[i] = s[i/2]`, `b[i] = s[i/2+1]`). opt_merge merges their multipliers, so each multiplier output then feeds two accumulators. xilinx_dsp packs the A/B/M registers ("ffA2 ffB2 ffM") but no post-adder for a multiplier with two users.
+- With the pairs made distinct (`a[i] = s[i/2][24:0] ^ i`, build/qor/synx/dspacc/pw_dsp8u.v), the same yosys packs every accumulator: 8 DSP48E1 with "postadder ... ffP", 0 CARRY4, 164 FDRE, 313 LUTs. The init value on `p` does not matter (pw_dsp8n.v, same result).
+- So yosys's accumulator packing works. These designs hit a pass-order interaction: merging duplicate multipliers before DSP packing.
+- Not changed here. A fix would let xilinx_dsp duplicate a multiplier that feeds several post-adders, or run opt_merge on `$mul` only after DSP packing.
+
+Checks (all PASS, 157836 cycles, 0 tx/led mismatches, 11/11 vectors; build/qor/synx/equiv/<design>/<variant>_<key>/sim/<design>/sim.log):
+- rv_soc: `t_dff`, `t_retime_full`, `t_cal`, `t_cal_dff`, `m_nosdff`.
+- rv_big: `t_dff`, `t_retime_full`, `d_dff`, `d_retime_full`, `m_nosdff`. rv_mul: `m_nosdff`.
+- `t_cal` is also proven with `equiv_struct`/`equiv_induct` on rv_soc (870 `$equiv` cells, 0 unproven). The `-dff` and retiming variants move registers, so the structural check does not apply to them.
+- The earlier lockstep negative control (Finding 12: one flipped LUT INIT gives 400 mismatching cycles) shows the bench detects a single wrong LUT.
+
+
+### Finding 14, round 2 (2026-11-06 night): BRAM arrival found, DSP accumulators, arty_eth LUTRAM
+
+**abc9 and the block RAM clock-to-out: root cause.**
+- abc9 writes the netlist it hands to ABC with `write_xaiger2`, unless `-dff` is given. The code is passes/techmap/abc9.cc: `xaiger = design->scratchpad_get_int("abc9.xaiger", 2)`, and `-dff` forces 1.
+- write_xaiger2 writes no arrival-time section. So every blackbox output reaches ABC at time 0: block RAM, DSP, LUTRAM, and the flip-flop clock-to-out.
+- This is why the round-1 model overrides had no effect.
+- The older `write_xaiger` (`scratchpad -set abc9.xaiger 1`, an existing option, so no code change) does write them. On rv_soc, ABC's mapped delay goes from 3440 ps (RAMB36 arc set to 0) to 4335 ps (the real arc), and the netlist changes.
+- It also means the `-dff` variants of round 1 (`t_dff`, `t_cal_dff`, `d_dff`) already had the arrival times, because `-dff` selects the old writer. `x1_cal_dff` gives the same cell counts as `t_cal_dff`.
+- Vivado P&R and timer, Default directive, one run each:
+
+| netlist | Fmax MHz (Vivado timer) | post-route LUT sites | FF | CARRY4 | yosys s |
+|---|---|---|---|---|---|
+| rv_soc Vivado synth_design | 171.00 | 1041 | 771 | 63 | 52.4 (Vivado) |
+| rv_soc Vivado -retiming | 179.50 | 1032 | 844 | 63 | 61.0 (Vivado) |
+| rv_soc `ys` | 157.63 | 1122 | 768 | 92 | 7.5 |
+| rv_soc `x1` (abc9.xaiger 1) | 162.44 | 1194 | 768 | 90 | 11.5 |
+| rv_soc `x1_cal` (+ flat calibrated LUT model) | 176.77 | 1188 | 768 | 87 | 10.5 |
+| rv_big Vivado synth_design | 177.68 | 1554 | 1159 | 123 | 188.3 (Vivado) |
+| rv_big `ys_dspq` | 156.59 | 1644 | 1066 | 148 | 23.3 |
+| rv_big `dx1` | 162.65 | 1618 | 1068 | 146 | 27.8 |
+| rv_big `dx1_cal` | 169.15 | 1674 | 1058 | 143 | 43.0 |
+
+- On rv_soc, `x1_cal` is 3.4 % above Vivado's own netlist on Vivado's P&R, and 1.5 % below Vivado with `-retiming`. It costs 66 more LUT sites than plain yosys (147 more than Vivado).
+- rv_big `dx1_cal` is 4.8 % under Vivado.
+- These are single runs: the spread over place directives on one netlist was up to 5 % (round 1). A run with the Explore and ExtraTimingOpt directives on `x1_cal` / `dx1_cal` is queued; see docs/wip/synthesis.md.
+- With nextpnr (the open flow's placer), nextpnr timer, mean of seeds 1-3. Same build and options as round 1; build/qor/synx/logs/np_x1.log, build/qor/oxc7/synx_<variant>_noicap/:
+  - rv_soc: `ys` 143.82, `x1` 143.99, `x1_cal` 147.11 MHz (+2.3 %).
+  - rv_big: `ys_dspq` 133.09, `dx1` 148.24 (+11.4 %), `dx1_cal` 131.68 MHz.
+  - LiteX SoCs, `abc9.xaiger 1` alone, nextpnr, seed 1 (flow/qor_area_litex.py variant `area_x1`; build/qor/area/litex/<d>/area_x1/):
+    - arty_ddr3: system clock 106.2 MHz, against 110.89 for area_ref seed 1, and 105.33 / 106.28 for seeds 2 and 3. Same LUT sites (5160 vs 5153).
+    - arty_eth: system clock 93.1 vs 101.9 (one seed each).
+    - The system clock is reported under a different net name in these runs (`main_crg_clkout_buf0` / `etherbone_clk` instead of `sys_clk`).
+    - So no LiteX gain is shown, and arty_eth may lose; more seeds and a Vivado-timer run are needed.
+  - So the arrival times help the CPU designs under both placers. The calibrated LUT model helps rv_soc under both, but rv_big only under Vivado's placer. There is no single best preset yet.
+- Lockstep firmware simulation PASS for `x1`, `x1_cal`, `dx1`, `dx1_cal` (157836 cycles, 0 mismatches).
+
+**DSP accumulators (pw_dsp).**
+- Opt-in prepare variant `k_mul` in flow/synth_timing.py: `$mul` cells carry `keep` during `prepare`'s opt, and the attribute is removed before `map_dsp`. So identical multipliers are no longer merged before xilinx_dsp has packed each one with its accumulator.
+- No-op: byte-identical netlists on rv_soc, rv_mul, rv_big, bram and fir.
+- Effect (flow/qor_pwdsp_kmul.sh, yosys stat; synthesis time unchanged within noise):
+
+| design | DSP48E1 | CARRY4 | FF | LUT |
+|---|---|---|---|---|
+| pw_dsp8 | 4 -> 8 | 96 -> 0 | 548 -> 164 | 620 -> 305 |
+| pw_dsp32, pw_dsp32_p5 | 16 -> 32 | 384 -> 0 | 2084 -> 548 | 2352 -> 1047 |
+| pw_dsp64 | 32 -> 64 | 768 -> 0 | 4132 -> 1060 | 4665 -> 2030 |
+
+- The check uses a pw_dsp8 copy whose output xors one accumulator of each identical pair; the original output is constant 0. RTL, stock and `k_mul` netlists in lockstep for 20000 cycles: 0 mismatches, with 18747 output changes. Negative control: one LUT2 INIT changed gives 18749 mismatches.
+
+**arty_eth LUTRAM (636 vs 512 sites): cause and an opt-in rule.**
+- Vivado's own synthesis puts three synchronous FIFO memories into block RAM: `storage_12` 16x70 (RAMB36), `mem_2` 128x12 (RAMB18) and `mem_3` 32x42 (RAMB36). Source: the "Block RAM: Final Mapping Report" in C:\Users\finnf\open-dfx-xc7-vivado\build\eth\vivado.log.
+- yosys's memory_libmap cost model keeps them in LUTRAM: 12 RAM32M, 7 RAM32M and 8 RAM64M, about 108 LUT sites.
+- Raising the LUTRAM cost in the libmap file is not selective: it also moves the depth-2 memories to flip-flops.
+- flow/synth_blockrule.py (opt-in, two yosys passes): `ram_style = "block"` for memories whose read ports are all synchronous, that hold more than 1024 bits, and that have no ram_style of their own.
+  - The threshold is fitted to these designs: rv_soc's register file is exactly 1024 bits, and Vivado keeps it in LUTRAM.
+  - arty_eth: RAM32M 147 -> 133, RAM64M 8 -> 0 (620 -> 532 LUTRAM sites at 4 per primitive; Vivado 504 + 8 SRL), RAMB18 12 -> 13, RAMB36 27 -> 29.
+  - No-op: arty_ddr3 is identical to the default netlist, and rv_soc with the rule equals rv_soc without it.
+- flow/qor_blockrule_sim.sh: RTL, LUTRAM netlist and block-RAM netlist of the three FIFO shapes, with Xilinx's unisim RAMB18E1/RAMB36E1 models from the local Vivado install. 100000 random cycles each, 0 mismatches.
+  - The first 16 cycles have no writes, because glbl holds GSR for 100 ns and the model ignores writes then. The first 64 cycles are not compared.
+  - Negative control: WRITE_MODE_A set to WRITE_FIRST gives 62422 mismatches.
+- yosys uses 2 RAMB36 for the 16x70 FIFO (two read ports) where Vivado uses 1.
+- nextpnr post-route, seed 1, LUT sites by Vivado's rule (flow/qor_area_litex.py variants `area_blockrule` / `area_pnr_blockrule`, netlist from build/gap/arty_eth/blockrule/):
+  - LUTRAM 636 -> 548 sites (Vivado 512).
+  - LUT sites 6389 -> 6315 (area_ref) and 6137 -> 6104 (with the nextpnr area options).
+  - sys_clk, nextpnr timer: 101.93 -> 89.92 and 94.63 -> 89.43 MHz.
+  - Single seed, but the same direction as the arty_ddr3 LUTRAM fix: nextpnr pays for the RAM clock-to-out paths that Vivado absorbs.
+- Vivado P&R of the arty_eth netlist with the rule: queued (docs/wip/synthesis.md).
+
+## Finding 15 (2026-11-07): packing and detailed placement against Vivado's placement (nextpnr draft `nextpnr-packing-dpl`)
+Method:
+- nextpnr: own tree build/src/nextpnr-dpl = ce3f7c18 + install/patches/nextpnr (TREE 961ea46e); builds build/nextpnr-build/dpl0 (base), dpl1 (+ `-o carry-di-bypass`), dpl2 (+ `-o dpl`). Every run: `--placer static -o hardblock-timing`, route-calibrated chipdb build/chipdb-rcal/on (Finding 13), 5 ns for the qor designs, 100 MHz sys_clk for eth. Variants dp0 (base), dp1 (carry-di-bypass), dp2dp (carry-di-bypass + dpl). Harness flow/dpl_bench.py (nextpnr through ofx/npwait.sh); runs in build/qor/oxc7/<variant>/<design>_p<ns>/s<seed>/.
+- Vivado's timer: vivado/dpl_dump.tcl places the yosys netlist itself ("free", opt + place + route) or imposes our placement fixed and places only what nextpnr made itself ("placed", the Finding 3 method), routes, and dumps cells, the 1000 worst paths as pin lists, utilisation, congestion, routed PIP count and step times. Runner flow/dpl_vivado.sh / flow/dpl_queue.sh (one invocation per design under vivado/vivado_slot.sh). Output C:\Users\finnf\open-dfx-xc7-vivado\build\dpl_xtime\<name>\.
+- Metrics: flow/dpl_metrics.py on a dump plus the yosys netlist (slices, LUT/FF per slice, LUT-FF pairs on the direct D path, carry S-LUT in the carry's slice, HPWL in prjxray grid units, FF slice x control-set pairs, critical-path hops); one row per dump with flow/dpl_summary.py.
+- Mixed placements: flow/dpl_mix.py takes one placement's slices (which cells share a slice, on which bels) to the mean position the same cells have in the other placement and legalises them slice by slice (carry chains as one column piece; RAMB/DSP from the global source). `vpack_nglob` = Vivado's packing at our positions, `npack_vglob` = ours at Vivado's, `vpack_vglob` = Vivado's own through the same legaliser (control).
+
+### Diagnosis (Vivado timer, seed 1)
+| | rv_soc Vivado | rv_soc ours (dp0) | bram Vivado | bram ours (dp0) | rv_mul Vivado |
+|---|---|---|---|---|---|
+| Fmax, MHz (Vivado timer; rv_soc excl. ICAP) | 157.63 | 126.17 | 170.88 | 150.13 | 111.27 |
+| slices (Vivado count) | 398 | 497 | 290 | 369 | 551 |
+| LUTs / FFs per used slice | 3.56 / 2.42 | 3.00 / 1.98 | 3.58 / 3.15 | 3.06 / 2.56 | 3.54 / 2.52 |
+| LUT->FF pairs on the direct D path | 83.0 % | 98.6 % | 73.7 % | 87.7 % | 86.3 % |
+| carry S LUT in the carry's slice | 100 % | 65.6 % | 92.0 % | 81.6 % | 100 % |
+| HPWL, all signal nets (grid units) | 17141 | 19875 | 21092 | 22327 | 22151 |
+| routed signal PIPs (Vivado router) | 39688 | 43670 | 20771 | 22428 | 46691 |
+| FF slice x control-set pairs (minimum) | 319 (130) | 388 (130) | 157 (62) | 193 (62) | 432 |
+| worst 200 paths: mean hops / net delay ns | 29.7 / 2.99 | 36.4 / 3.74 | 13.8 / 1.45 | 22.7 / 2.09 | 28.4 / 2.85 |
+
+- LUT-FF pairing is **not** the gap: nextpnr pairs more often than Vivado (98.6 vs 83.0 %, 87.7 vs 73.7 %). Carry chains are aligned in both (0 broken links). F7/F8 use is equal (same netlist). DSP/BRAM to logic distance is not worse in ours (rv_soc 9.3 vs 24.5 grid units; bram 17.2 vs 18.1).
+- What differs: 25-27 % more slices (fewer LUTs and FFs per slice), 6-16 % more HPWL and 8-10 % more routed PIPs, 20-23 % more FF slice/control-set pairs, and the critical paths have 23-64 % more hops with 25-44 % more net delay.
+- One packing cause found in the code (pack_carry.cc): every CARRY4 DI input without a single-load LUT gets a feed-through LUT on the position's 5LUT (rv_soc 366 of 368, bram 357/392, rv_big 590/592), and only LUT1-LUT5 may be the S LUT. The S LUT and the DI feed-through share the 5 inputs of one LUT6 site, so S LUTs with 5 inputs or a LUT6 get a feed-through too and sit elsewhere (S feed-throughs: rv_soc 145 of 376, bram 125/392, rv_big 144/603). Vivado feeds DI from the X pin (AX..DX -> xCY0 mux) and keeps the S LUT in the carry slice (100 % on rv_soc and rv_mul). In the imposed placement this shows as 65.6 % / 81.6 % S-LUT co-location.
+
+### Fix 1: `-o carry-di-bypass` (packing)
+DI comes in through the X pin unless it is constant or DI0 of a chain head whose CYINIT already uses AX; the X-pin use goes into the cell tags (`x_sigs`), so slice validity keeps a flip-flop bypass or MUXF7/F8 select off it; S may then be a LUT6. Routing and FASM needed no change (the chipdb has the AX -> ACY0 site pip; AX is the FASM default). nextpnr side, mean of seeds 1-3 (nextpnr timer for Fmax):
+
+| design | LUT cells dp0 -> dp1 | slices dp0 -> dp1 | nextpnr PIPs dp0 -> dp1 | nextpnr Fmax dp0 -> dp1 -> dp2dp | nextpnr s dp0 / dp1 / dp2dp |
+|---|---|---|---|---|---|
+| rv_soc | 1748 -> 1538 (-12 %) | 495 -> 449 (-9 %) | 28980 -> 29425 | 99.1 -> 92.1 -> 93.2 | 79 / 63 / 53 |
+| rv_mul | 2443 -> 2147 (-12 %) | 683 -> 639 (-6 %) | 40464 -> 40517 | 90.3 -> 86.9 -> 89.9 | 47 / 67 / 53 |
+| rv_big | 2494 -> 2198 (-12 %) | 744 -> 677 (-9 %) | 49107 -> 49150 | 87.1 -> 84.0 -> 87.2 | 48 / 40 / 33 |
+| bram | 1370 -> 1090 (-20 %) | 341 -> 287 (-16 %; Vivado 290) | 32540 -> 32488 | 125.4 -> 130.4 -> 134.8 | 27 / 25 / 27 |
+| eth (LiteX) | 10754 -> 10089 (-6 %) | 2868 -> 2796 (-3 %) | 190569 -> 192588 | 57.0 -> 60.2 -> 60.6 | 121 / 108 / 114 |
+
+- bram now uses as many slices as Vivado (287 vs 290). On the CPUs nextpnr's own timer drops 3-7 % with dp1 alone; the critical paths there are 9-level LUT chains without a carry (e.g. rv_mul s1, identical cell sequence, 10.77 vs 11.39 ns, all in the routing), i.e. a different placement of the same path, not a slower carry. Vivado-timed numbers: see "Vivado-timed comparison" below.
+
+### Fix 2: `-o dpl[=R,P,C,E]` (timing-driven detailed placement)
+After placer1 refinement (XilinxImpl::postPlace, before fixup_placement): each unclustered LUT/FF with an arc of criticality >= C (0.8) is offered every compatible bel within R (2) tiles of the criticality-weighted centre of its connections, as a move or a swap with an unclustered cell of the same type; kept when both tiles stay legal (isBelLocationValid) and the crit^E-weighted (E = 4) predicted delay of both cells' arcs drops. Arc model: LUT input 665/682 ps from its own slice/tile, LUT -> FF of its own position 0, between tiles 313 + 1.235 x delay matrix (the fit of docs/drafts/nextpnr-placer-delay-cal.md). P = 3 passes with timing re-analysed between them. rv_soc s1: 25 candidate cells, 28 + 9 + 8 moves; a wider setting (`dpl=3,4,0.5,3`, variant dp2w) moves 136-262 cells per pass but is not better in nextpnr's timer (rv_soc 93.1, rv_mul 86.6, rv_big 88.4, bram 131.4, mean of 3 seeds). Runtime: the pass was not timed on its own; total nextpnr time with it is within the run-to-run spread (table above; the machine is shared).
+- nextpnr timer, mean of 3 seeds, dp1 -> dp2dp: rv_soc +1.2 %, rv_mul +3.5 %, rv_big +3.8 %, bram +3.4 %, eth +0.7 %.
+
+### Correctness
+- No-op: with the options off, dpl1 and dpl2 give FASM identical to dpl0 (rv_soc, bram, seed 1; `dpl_bench.py --noop`); with carry-di-bypass on the FASM differs (positive control).
+- All 30 dp1 and dp2dp FASMs (5 designs x 3 seeds) assemble with fasm2frames (prjxray-db with the ICAP/DNA bits of install/patches).
+- rv_soc dp1 s1 and dp2dp s1: bitstream decoded back to a netlist (fasm2bels) passes the firmware test bench 11/11 vectors (flow/dpl_check.sh -> flow/bit2netlist.sh). rv_mul/rv_big cannot be decoded (fasm2bels has no DSP_L tile; the same on dp0).
+
+### Vivado-timed comparison and mixed placements
+Seed 1 unless stated, Vivado routing and timer on each placement (flow/dpl_summary.py; rv_soc Fmax excludes the ICAP endpoint; HPWL in grid units, PIPs = Vivado's routed signal PIPs):
+
+| placement | rv_soc Fmax | slices | HPWL | PIPs | bram Fmax | slices | HPWL | PIPs |
+|---|---|---|---|---|---|---|---|---|
+| Vivado places the yosys netlist (opt + place + route) | 157.63 | 398 | 17141 | 39688 | 170.88 | 290 | 21092 | 20771 |
+| Vivado's slices at Vivado's positions through dpl_mix's legaliser (`vpack_vglob`, control) | 148.35 | 400 | 19249 | - | queued | | | |
+| Vivado's slices at our dp0 positions (`vpack_nglob`) | 137.91 | 399 | 21475 | - | 145.82 | 299 | 30903 | - |
+| our dp0 slices at Vivado's positions (`npack_vglob`) | 114.90 | 497 | 23061 | - | 147.58 | 369 | 25412 | 22517 |
+| ours, dp0 (base) | 126.17 | 497 | 19875 | 43670 | 150.13 | 369 | 22327 | 22428 |
+| ours, dp1 (carry-di-bypass) | 106.35 | 480 | 19266 | 43352 | 157.18 | 269 | 21079 | 22363 |
+| ours, dp2dp (carry-di-bypass + dpl) | 109.45 | 481 | 19317 | 43978 | 155.35 | 267 | 21200 | 21942 |
+
+rv_mul, seed 1: Vivado 111.27 MHz (551 slices), ours dp0 94.70 (716 slices).
+
+Reading the mixes (rv_soc):
+- The control loses 9.3 MHz against Vivado's own run (148.35 vs 157.63): imposing a placement without opt_design, the ~270 cells `place_cell` cannot take (LUTRAM macros, nextpnr-made cells) and the slice-level legaliser cost that much. Against the control, Vivado's packing at our global positions loses 10.4 MHz (137.91), and our own placement loses another 11.7 MHz (126.17). So on rv_soc **global placement and packing/detailed placement each account for about half** of the gap that is not imposition overhead.
+- Our slices at Vivado's positions are worse than either (114.90; legaliser displacement 2.87 vs 1.49 grid units): our slices group cells that Vivado's placement keeps apart, so our packing is tied to our global placement and cannot be judged apart from it.
+- bram: both mixes are worse than our own placement (Vivado's slices at our positions 145.82, ours at Vivado's 147.58, against 150.13), so on bram neither packing alone nor global placement alone explains the gap; the bram legaliser control was still queued at the stop.
+
+The fixes under Vivado's timer, seeds 1-3 (Fmax per seed; mean; slices, HPWL and Vivado-routed PIPs are seed means):
+
+| design | variant | Fmax per seed, MHz (Vivado timer) | mean | slices | HPWL | PIPs | Vivado route s |
+|---|---|---|---|---|---|---|---|
+| rv_soc (excl. ICAP) | Vivado's own placement | 157.63 (s1) | - | 398 | 17141 | 39688 | 34.6 |
+| rv_soc | dp0 | 126.17 / 109.45 / 115.92 | 117.18 | 503 | 20004 | 43420 | 26.5 |
+| rv_soc | dp1 | 106.35 / 114.77 / 115.92 | 112.35 | 462 | 19548 | 42900 | 24.2 |
+| bram | Vivado's own placement | 170.88 (s1) | - | 290 | 21092 | 20771 | 39.6 |
+| bram | dp0 | 150.13 / 147.28 / 150.63 | 149.35 | 341 | 22833 | 22228 | 39.6 |
+| bram | dp1 | 157.18 / 154.44 / 145.71 | 152.44 | 287 | 21909 | 22041 | 39.4 |
+| rv_mul | Vivado's own placement | 111.27 (s1) | - | 551 | 22151 | 46691 | 33.6 |
+| rv_mul | dp0 | 94.70 / 107.98 / 103.64 | 102.11 | 710 | 23204 | 52116 | 26.3 |
+| rv_mul | dp1 | 107.42 / 89.31 / 94.44 | 97.06 | 661 | 21419 | 50368 | 23.6 |
+
+- carry-di-bypass is an **area and wirelength** gain on all three (slices -7 to -16 %, bram now 287 against Vivado's 290; HPWL -2 to -8 %; routed PIPs -1 to -3 %; Vivado's routing time equal or lower), and **Fmax-neutral within the seed spread** (mean -4.1 % rv_soc, +2.1 % bram, -4.9 % rv_mul, while single seeds move by up to 18 %). It does not close the Fmax gap.
+- dpl (dp2dp), seed 1: rv_soc 109.45 (dp1 106.35), bram 155.35 (dp1 157.18); more seeds were still queued at the stop.
+- The rv_soc seed-1 worst path (FF -> LUT2 -> 4 CARRY4 -> 2 LUT4 -> FDSE S) has the same cells in dp0 and dp1; in dp1 they are spread over SLICE_X30-45 / Y42-68 instead of X34-45 / Y69-82: a different global placement of the same path, not a slower carry.
+- In the imposed placement an S LUT that nextpnr duplicated (`$S_DUP`, 9-11 per design in dp0 and dp1) is not in the yosys netlist, so Vivado drives that S input from the original LUT through a route-through; this penalises both variants alike.
+
+### What is open
+- Vivado-timed dp2dp seeds 2-3, rv_big and eth, and the bram/rv_mul mix controls (queue order in build/qor/dpl/queue/names.txt; restart with `NAMES_FILE=... flow/dpl_queue.sh 1`).
+- The QoR suite (flow/qor_suite.py quick mode) was not run on these variants.
+- The detailed placer's arc model and candidate set are first guesses; under Vivado's timer it has not yet shown a gain (seed 1: rv_soc +3.1 MHz, bram -1.8 MHz against dp1).
+- Two runs of this study briefly shared one Vivado slot (two workers' `mkdir` of the lock directory on /mnt/c both succeeded at the same second); the queue now runs one worker and serialises its acquisition.
+
+## Finding 16 (2026-11-07): the router's share of the gap, and timing-driven router2 options (nextpnr draft `nextpnr-router-timing`)
+Method (flow/route_xtime.py, vivado/build_rte.tcl, flow/route_cmp.py; CONFIG blocks, dry run by default):
+- `vref`: Vivado 2025.2 places and routes the yosys netlist of the Finding 13 source builds (rv_soc, bram: `cal_static`; rv_mul, rv_big: `dspq_cal`, the `-pipeline` netlist) with default directives and **no opt_design**, so the netlist stays the one nextpnr reads. It dumps every primitive's LOC/BEL. Outputs C:\Users\finnf\open-dfx-xc7-vivado\build\rte\<d>_vref\ (slack.txt, timing.rpt, cells.txt, times.txt).
+- `import`: Vivado's sites and BELs are mapped onto nextpnr's packed cell names (CARRY4 by the yosys cell of its first MUXCY, LUTRAM sub-cells by the macro's site and nextpnr's letter) and given to nextpnr as `-o place-import=FILE` (new, in the draft): cells are bound locked where the bel is free and the tile stays legal, carry chains as a whole at their root or not at all; the placer places the rest (nextpnr-made feed-through and duplicated LUTs, chains nextpnr cut differently). build/rte/import/<d>.place; per-run counts in build/rte/npr/<d>_vimp_*/nextpnr.log ("place-import:").
+- `own`: the same nextpnr command as the source build (static placer, `-o hardblock-timing`, `-o dsp-cascade-place`, 5 ns), its own placement. Both chipdbs: `cal` (Finding 10 cell timing) and `rcal` (Finding 13 route calibration, timer within -8.4 / +5.4 % of Vivado on identical implementations).
+- `export` / `vivado`: flow/xroute.py's export of a nextpnr run; Vivado imposes netlist, placement, LUT pins and every pip (`<name>`), or the identical placement with Vivado routing (`<name>_vr`). Each run writes WNS with and without ICAPE2 endpoints and startpoints (slack.txt) and the 200 worst non-ICAP paths with their pins plus every arc's slow-max delay, which flow/route_cmp.py compares path by path.
+- All Fmax below exclude the ICAPE2 path (rv_soc and rv_mul contain one; it limits both tools to about 135 MHz and hides routing). Vivado Fmax = 1000 / (5 - WNS_noicap).
+
+### Reference: Vivado on its own placement (Vivado timer, excl. ICAPE2)
+| design | Vivado place+route of the yosys netlist, no opt_design | place / route s |
+|---|---|---|
+| rv_soc | 173.2 MHz (WNS_noicap -0.774) | 48 / 33 |
+| rv_mul | 157.9 (-1.363) | 45 / 31 |
+| rv_big | 166.7 (-0.999) | 63 / 36 |
+| bram | 172.3 (-0.805) | 49 / 44 |
+
+### nextpnr's router on Vivado's placement
+nextpnr timer with the rcal chipdb (seed 1; `vimp`), against nextpnr on its own placement (`own`, mean of seeds 1-3, same timer):
+
+| design | nextpnr route of Vivado's placement (rcal timer) | nextpnr on its own placement (rcal timer, mean s1-3) | Vivado on its own placement (Vivado timer) |
+|---|---|---|---|
+| rv_soc | 103.92 | 99.13 | 173.2 |
+| rv_mul | 102.16 | 87.15 | 157.9 |
+| rv_big | 104.13 | 90.40 | 166.7 |
+| bram | 131.87 | 125.40 | 172.3 |
+
+- Import fidelity: 1908 (rv_soc), 2387 (rv_mul), 2758 (rv_big) and 1517 (bram) cells bound at Vivado's bel; 35 / 76 / 85 / 9 carry chains could not sit at Vivado's root (nextpnr cuts chains where an intermediate CO is used and duplicates S-driving LUTs, so the chain or one of its LUTs collides with a Vivado cell) and were placed by nextpnr's placer, as were nextpnr's own feed-through LUTs. The placement is therefore Vivado's for most cells but not all.
+- **Routing share (nextpnr timer, not yet Vivado's):** on (mostly) Vivado's placement nextpnr's router reaches 103.9 / 102.2 / 104.1 / 131.9 MHz where Vivado's router reaches 173.2 / 157.9 / 166.7 / 172.3 MHz (Vivado timer) on the exact placement. Read naively that is a 25-40 % routing loss, but it mixes two timers (nextpnr rcal vs Vivado, rcal was -8.4 / +5.4 % from Vivado on identical CPU implementations in Finding 13) and the import's displaced chains. The identical-placement Vivado runs that separate router from import (`<d>_vimp_cal_s1` with nextpnr's pips, `<d>_vimp_cal_s1_vr` with Vivado's) are exported (C:\Users\finnf\open-dfx-xc7-vivado\designs\rte\) and queued, but no Vivado slot was free between 22:00 and 01:30, so they did not run. Placement explains the rest of the gap: nextpnr on its own placement is a further 2-15 % below nextpnr on Vivado's (rcal timer).
+
+### Router options (draft; nextpnr timer with rcal chipdb, own placement, paired mean of seeds 1-3)
+Each variant is compared seed by seed with the same seed's base run (same placement: the router runs after placement and the placer does not see these options). Router2 seconds are means over the seeds on a shared, loaded machine (indicative).
+
+| variant (`--router2-opt`) | rv_soc | rv_mul | rv_big | bram | router2 s (base: 24.9 / 22.0 / 17.6 / 9.9) |
+|---|---|---|---|---|---|
+| base | 99.13 | 87.15 | 90.40 | 125.40 | |
+| `critSeedDelay=1` + `critRipupIters=3` (keep-best) | 102.99 (+4.0 %) | 92.05 (+5.7 %) | 92.27 (+2.1 %) | 130.72 (+4.3 %) | 21.6 / 14.8 / 10.8 / 8.2 |
+| `critSeedDelay=2` + `critRipupIters=3` | 103.92 (+4.9 %) | 91.32 (+4.8 %) | 93.05 (+2.9 %) | 129.62 (+3.4 %) | 20.7 / 21.2 / 12.8 / 10.6 |
+| `critSeedDelay=1` + `critRipupIters=5` | 103.11 (+4.1 %) | 92.05 (+5.7 %) | 92.27 (+2.1 %) | 131.32 (+4.8 %) | 22.5 / 19.5 / 17.6 / 10.9 |
+| `critSeedDelay=1` only | 98.84 (-0.1 %) | 91.46 (+5.0 %) | 92.21 (+2.0 %) | 129.72 (+3.5 %) | 20.0 / 15.5 / 8.6 / 7.7 |
+| `critRipupIters=3` (keep-best) | 102.38 (+3.4 %) | 88.79 (+1.9 %) | 92.28 (+2.1 %) | 127.72 (+1.8 %) | 21.7 / 17.5 / 11.9 / 7.6 |
+| `critRipupIters=3`, no keep-best (first version) | 101.84 (+2.9 %) | 88.56 (+1.6 %) | 92.28 (+2.1 %) | 127.67 (+1.8 %) | 25.8 / 25.5 / 14.3 / 8.8 |
+| `critRipupIters=3 critRipupResetCong=0` | 101.28 (+2.3 %) | 88.87 (+2.0 %) | 92.31 (+2.1 %) | 128.65 (+2.6 %) | 19.8 / 14.3 / 10.7 / 7.9 |
+| `critExp=8 critFloor=0.01` | 96.33 (-2.8 %) | 88.91 (+2.0 %) | 90.63 (+0.3 %) | 128.31 (+2.3 %) | |
+| `critEstWeight=1.0` (A* weight 1 for critical arcs) | 100.45 (+1.4 %) | 87.31 (+0.2 %) | 89.68 (-0.8 %) | 126.53 (+0.9 %) | |
+
+On Vivado's placement (seed 1, rcal timer): `critSeedDelay=1` + `critRipupIters=3` 110.94 / 103.16 / 107.98 / 135.35 against 103.92 / 102.16 / 104.13 / 131.87 (+6.8 / +1.0 / +3.7 / +2.6 %).
+
+- What the two options fix: (1) router2 seeds an arc's forward search with every wire of the net's existing tree near the sink at cost 0, so a critical arc branches off whatever tree is there, whatever that tree's delay from the source; `critSeedDelay` charges a seed its routed delay from the source times the arc's criticality. (2) router2 stops as soon as routing is legal, with criticalities from the pre-route estimate; `critRipupIters` re-routes the critical nets with the routed criticalities and keeps the best legal routing. Neither costs router time on these designs (router2 seconds equal or lower; the machine was shared, so only large changes would show).
+- Rip-up of only the critical arcs of a net (instead of the whole net) tripped router2's tree reconstruction (`cursor_bwd == src_wire_idx`, router2.cc) on rv_big and bram; the draft rips the whole net, as `--tmg-ripup` does.
+- Not worth keeping: a steeper criticality curve (`critExp=8`), a lower A* weight for critical arcs (`critEstWeight=1`): within seed noise or worse.
+- The calibrated routing delays in the router (`rcal` chipdb) are the larger lever by the global-placement agent's measurement (same nextpnr placement, 3 seeds, Vivado routes vs nextpnr routes, Finding 15 work): nextpnr's routes are 15-20 % slower than Vivado's (rv_soc 99.1 vs 117.2 MHz, bram 125.4 vs 149.4, eth 57.1 vs 69.0). The same comparison in this harness (`<d>_own_cal_s1` and `_vr`, and the rcal runs with `--no-vr`) is exported and queued, not run.
+
+### No-op and cost
+- Without the options the draft binary gives FASM identical (sorted, comments dropped) to the release binary on rv_soc, rv_mul, rv_big and bram (build/rte/noop/).
+- Runtime: see the router2 column; the Vivado reference spends 31-44 s routing these designs, nextpnr's router2 8-33 s.
+
+### Open
+- Vivado's timer on every number in the two router tables (queued: flow/route_xtime.py `vivado` stage; the export directories exist). Until then the router options are measured with nextpnr's rcal timer only.
+- Import fidelity: carry chains nextpnr cuts differently and its duplicated S LUTs keep 9-85 chains per design off Vivado's sites; a packer mode that keeps yosys' CARRY4 boundaries would make the import exact.
+- High-fanout and load-dependent delays (Vivado's RC model) are not in nextpnr's router cost; Finding 13 left 0.6-0.7 ns of per-path optimism on the CPUs unexplained, which a load-aware cost for critical arcs might address.
+- Defaults: the options stay opt-in until Vivado's timer confirms them over seeds.
+
 ## nextpnr builds (build/nextpnr-build/, all ce3f7c18 + drafts, cmake flags of docs/buildenv.md, -j4)
 - `qor`: + nextpnr-hardblock-timing.patch (worktree build/src/nextpnr-qor). Log build/nextpnr-build/qor.build.log.
 - `qorfix`: + G1/G3/G8 gapfix drafts + hardblock-timing (build/src/nextpnr-qorfix).

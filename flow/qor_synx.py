@@ -29,7 +29,7 @@ CONFIG = {
     "worst_n": 100,
     "directives": ["Default", "Explore", "ExtraTimingOpt"],
     "npwait": "ofx/npwait.sh",
-    "npwait_max": "2",
+    "npwait_max": "3",
     "nextpnr_build": "qordsp",
     "nextpnr_args": qor_bench.DCP,
     "nextpnr_seeds": [1, 2, 3],
@@ -56,7 +56,7 @@ def src_name(design, vname):
     return f"{design}_{vname}"
 
 
-def prep_one(design, vname, dry):
+def prep_one(design, vname, dry, directives=None):
     d = CONFIG["out"] / "src" / src_name(design, vname)
     v = synth_timing.VARIANTS[vname]
     if is_litex(design):
@@ -92,6 +92,16 @@ def prep_one(design, vname, dry):
         (d / "mode.txt").write_text("edif\n")
     shutil.copyfile(xdc, d / "constraints.xdc")
     (d / "top.txt").write_text(top + "\n")
+    so = d / "synth_opts.txt"
+    if v.get("synth_opts"):
+        so.write_text(v["synth_opts"] + "\n")
+    elif so.exists():
+        so.unlink()
+    dt = d / "directives.txt"
+    if directives is not None:
+        dt.write_text(" ".join(directives) + "\n")
+    elif dt.exists():
+        dt.unlink()
     return d.name
 
 
@@ -240,6 +250,8 @@ def main():
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--nextpnr", action="store_true")
+    ap.add_argument("--directives", nargs="*", default=None,
+                    help="place directives for these names (directives.txt); an empty list = synth/opt only")
     a = ap.parse_args()
     if a.report:
         report(a.designs, a.variants)
@@ -253,7 +265,7 @@ def main():
         for v in a.variants:
             if d in synth_timing.VARIANTS[v].get("skip", ()):
                 continue
-            names.append(prep_one(d, v, dry))
+            names.append(prep_one(d, v, dry, a.directives))
     print("names: " + ",".join(names))
     print(f"vivado: vivado\\run_qor.ps1 -Tag {CONFIG['vivado_tag']} -Script build_synx.tcl -SrcRel build\\qor\\synx\\src "
           f"-Names {','.join(names)} -Run")

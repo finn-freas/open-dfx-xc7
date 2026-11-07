@@ -16,7 +16,7 @@ CONFIG = {
     "mask_columns_from": "CLB_IO_CLK",
 }
 
-DB = CONFIG["root"] / "toolchain" / "openxc7" / "share" / "nextpnr" / "external" / "prjxray-db" / CONFIG["family"]
+DB = device.db_root() / CONFIG["family"]
 
 SYNC = 0xAA995566
 

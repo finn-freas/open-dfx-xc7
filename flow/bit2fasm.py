@@ -17,7 +17,7 @@ CONFIG = {
 }
 
 OXC7 = CONFIG["root"] / "toolchain" / "openxc7"
-DB = OXC7 / "share" / "nextpnr" / "external" / "prjxray-db" / CONFIG["family"]
+DB = device.db_root() / CONFIG["family"]
 
 
 def load_bit2fasm():

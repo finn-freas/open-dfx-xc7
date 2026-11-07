@@ -8,6 +8,7 @@ from . import ROOT
 
 CONFIG = {
     "db": ROOT / "toolchain" / "openxc7" / "share" / "nextpnr" / "external" / "prjxray-db",
+    "extra_dbs": ("build/src/meta-openXC7-prjxray-db",),
     "default_part": "xc7a35tcsg324-1",
     "families": {"xc7a": "artix7", "xc7k": "kintex7", "xc7s": "spartan7", "xc7z": "zynq7"},
     "status": "status.json",
@@ -24,6 +25,9 @@ def family(part):
 
 def package_pins(part):
     f = CONFIG["db"] / family(part) / part / "package_pins.csv"
+    if not f.exists():
+        f = next((ROOT / d / family(part) / part / "package_pins.csv" for d in CONFIG["extra_dbs"]
+                  if (ROOT / d / family(part) / part / "package_pins.csv").exists()), f)
     pins, sites = {}, {}
     if not f.exists():
         return pins, sites

@@ -9,9 +9,12 @@ CONFIG = {
     "part": "xc7a35tcsg324-1",
     "family": "artix7",
     "fabric": "xc7a50t",
-    "env": {"part": "OFX_PART", "family": "OFX_FAMILY", "fabric": "OFX_FABRIC", "part_name": "OFX_PART_NAME"},
+    "env": {"part": "OFX_PART", "family": "OFX_FAMILY", "fabric": "OFX_FABRIC", "part_name": "OFX_PART_NAME",
+            "db_root": "OFX_DB_ROOT"},
     "db": "toolchain/openxc7/share/nextpnr/external/prjxray-db",
+    "extra_dbs": ("build/src/meta-openXC7-prjxray-db",),
     "chipdb_dir": "toolchain/openxc7/share/nextpnr/himbaechel/xilinx",
+    "extra_chipdb_dirs": ("build/chipdb/k7",),
     "inventory": "XILINX-PARTS-INVENTORY.json",
     "families": ("artix7", "kintex7", "spartan7", "zynq7"),
 }
@@ -19,6 +22,11 @@ CONFIG = {
 
 def get(key):
     return os.environ.get(CONFIG["env"][key]) or CONFIG[key]
+
+
+def db_root():
+    env = os.environ.get(CONFIG["env"]["db_root"])
+    return Path(env) if env else CONFIG["root"] / CONFIG["db"]
 
 
 def part_name(part=None):
@@ -30,7 +38,11 @@ def part_name(part=None):
 
 
 def chipdb(fabric=None):
-    return CONFIG["root"] / CONFIG["chipdb_dir"] / f"chipdb-{fabric or get('fabric')}.bin"
+    name = f"chipdb-{fabric or get('fabric')}.bin"
+    main = CONFIG["root"] / CONFIG["chipdb_dir"] / name
+    if main.exists():
+        return main
+    return next((CONFIG["root"] / d / name for d in CONFIG["extra_chipdb_dirs"] if (CONFIG["root"] / d / name).exists()), main)
 
 
 def _yaml_map(path):
@@ -50,12 +62,17 @@ def _yaml_map(path):
 
 
 def resolve(part):
-    db = CONFIG["root"] / CONFIG["db"]
+    roots = [CONFIG["root"] / CONFIG["db"]] + [CONFIG["root"] / d for d in CONFIG["extra_dbs"]]
+    db = roots[0]
     inv_path = CONFIG["root"] / CONFIG["chipdb_dir"] / CONFIG["inventory"]
     inv = json.loads(inv_path.read_text())["parts"] if inv_path.exists() else {}
     family = inv.get(part, {}).get("family")
     if family is None:
         family = next((f for f in CONFIG["families"] if (db / f / part / "part.json").exists()), None)
+    if family is None or not (db / family / part / "part.json").exists():
+        hit = next(((r, f) for r in roots[1:] for f in CONFIG["families"] if (r / f / part / "part.json").exists()), None)
+        if hit:
+            db, family = hit
     if family is None:
         raise ValueError(f"part {part}: not in the openXC7 parts inventory or prjxray-db")
     parts = _yaml_map(db / family / "mapping" / "parts.yaml")
@@ -70,13 +87,16 @@ def resolve(part):
         if not f.exists():
             problems.append(f"missing {what}: {f}")
     return {"part": part, "family": family, "device": dev, "fabric": fabric, "part_name": part_name(part),
-            "chipdb": str(chipdb(fabric)), "generated": inv.get(part, {}).get("generated"), "problems": problems}
+            "chipdb": str(chipdb(fabric)), "db_root": str(db), "db_extra": db != roots[0], "generated": inv.get(part, {}).get("generated"), "problems": problems}
 
 
 def env(part):
     r = resolve(part)
-    return {CONFIG["env"]["part"]: r["part"], CONFIG["env"]["family"]: r["family"], CONFIG["env"]["fabric"]: r["fabric"],
-            CONFIG["env"]["part_name"]: r["part_name"]}
+    e = {CONFIG["env"]["part"]: r["part"], CONFIG["env"]["family"]: r["family"], CONFIG["env"]["fabric"]: r["fabric"],
+         CONFIG["env"]["part_name"]: r["part_name"]}
+    if r["db_extra"]:
+        e[CONFIG["env"]["db_root"]] = r["db_root"]
+    return e
 
 
 if __name__ == "__main__":

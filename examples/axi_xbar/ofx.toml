@@ -1,0 +1,10 @@
+[project]
+name = "axi_xbar"
+top = "axi_xbar"
+board = "arty-a7-35t"
+sources = ["src/axi_xbar.v", "src/axi_tg.v", "src/axi_crossbar.v", "src/axi_crossbar_addr.v", "src/axi_crossbar_rd.v", "src/axi_crossbar_wr.v", "src/axi_register_rd.v", "src/axi_register_wr.v", "src/arbiter.v", "src/priority_encoder.v", "src/axi_ram.v"]
+constraints = ["constraints/axi_xbar.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

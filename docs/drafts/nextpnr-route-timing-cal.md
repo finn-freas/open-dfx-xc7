@@ -39,6 +39,21 @@ result is a single value for min and max).
 - End to end (nextpnr re-run with the chipdb, its new implementation imposed on Vivado): docs/qor-vivado.md
   Finding 13.
 
+## Clock leaf and carry chain (2026-11-06, JSON v2: build/chipdb-rcal2/route_timing_xc7a35t_1.json)
+- Clock tree: on the identical implementations, every BUFG -> FF clock-pin arc (all of them use one HCLK leaf pip)
+  is 0.77-0.78 ns shorter in nextpnr than in Vivado: blinky -770, rv_soc -779 (879 arcs), bram -780 ps, mean
+  1.675 ns Vivado vs 0.896 ns nextpnr on rv_soc. This agrees with the XDC agent's 0.72 ns on one placement.
+  v2 adds a class `clock_leaf` (`^HCLK_LEAF_CLK_B_(TOP|BOT)\d+$`, +775 ps slow). Check on blinky (qorperm,
+  `-o lut-perm-timing`, build/chipdb-rcal2/check): the clock-pin interconnect in the SDF is 0.896 ns with v1 and 1.671
+  ns with v2 (Vivado 1.645 on the identical blinky implementation). Fmax is unchanged (the add cancels in the
+  skew); it matters for port paths (clock to output) and cross-clock paths. The chipdb differs from v1 only in the
+  timing classes (28 clock arcs changed in blinky's SDF, nothing else).
+- Carry chain: CARRY4 cell arcs on Vivado's reported paths agree within 5 ps for CIN -> O/CO (612 arcs) and
+  19-43 ps for S -> O/CO; CYINIT -> O/CO is 160-169 ps low (one per chain start; not changed). The COUT -> CIN hop is
+  +60 ps pessimistic with the v0 chipdb and is already corrected by the `clb_site_out` class (-56 ps, which also
+  matches `CLBLL_LL_COUT_N`). So the 1.1-2.9 ns optimism reported on long carry paths is routing into and out
+  of the chain plus the clock leaf, which v1/v2 address, not the carry cells (build/xroute/predict/carry_arcs.json).
+
 ## Open
 - One part and corner (xc7a35t-1 slow max); the fast corner is not modelled by nextpnr at all.
 - Per setup path (offline, identical routes, paths without a Vivado-unrouted net): rv_mul -688 -> +35 ps, rv_big

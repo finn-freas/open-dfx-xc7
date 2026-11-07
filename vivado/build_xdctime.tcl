@@ -92,6 +92,9 @@ foreach name $CONFIG_NAMES {
                 report_timing -setup -from [all_inputs] -max_paths 2 -nworst 1 -input_pins -file $out/in_setup_[string tolower $corner].rpt
                 report_timing -hold -from [all_inputs] -max_paths 2 -nworst 1 -input_pins -file $out/in_hold_[string tolower $corner].rpt
                 report_timing -setup -to [all_outputs] -max_paths 1 -nworst 1 -input_pins -file $out/out_setup_[string tolower $corner].rpt
+                report_timing -hold -to [all_outputs] -max_paths 1 -nworst 1 -input_pins -file $out/out_hold_[string tolower $corner].rpt
+                report_timing -setup -from [all_registers] -to [all_registers] -max_paths 1 -nworst 1 -input_pins -file $out/reg_setup_[string tolower $corner].rpt
+                report_timing -hold -from [all_registers] -to [all_registers] -max_paths 1 -nworst 1 -input_pins -file $out/reg_hold_[string tolower $corner].rpt
             } cerr]} { puts "corner $corner: $cerr" }
         }
         catch { config_timing_corners -corner Slow -delay_type min_max ; config_timing_corners -corner Fast -delay_type min_max }

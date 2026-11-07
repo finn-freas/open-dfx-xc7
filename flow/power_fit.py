@@ -13,12 +13,16 @@ from ofx import power as P
 CONFIG = {
     "dry_run": True,
     "viv": Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build"),
-    "viv_tags": ("drcpow", "drcpow2"),
+    "viv_tags": ("drcpow", "drcpow_b1", "drcpow_b2"),
     "cache": ROOT / "build" / "power" / "features",
     "out_model": ROOT / "ofx" / "power_model.json",
     "out_md": ROOT / "build" / "power" / "fit.md",
-    "heldout": ("fir_p5", "fir_p10", "rv_mul_p5", "rv_mul_p10", "arty_eth", "mmcme2_adv", "ramb36e1", "dsp_cascade",
-                "oserdes", "drc_pll_vco", "drc_gated", "srl"),
+    "heldout_families": ("rv_mul", "fir", "arty_eth", "mmcme2", "ramb36", "dsp", "oserdes_pin", "srl",
+                         "pw_mmcm"),
+    "family_re": [(re.compile(r"^(rv_\w+?|bram|fir|blinky)_p\d+$"), r"\1"),
+                  (re.compile(r"^(pw_[a-z]+)\d+.*$"), r"\1"),
+                  (re.compile(r"^drc_.*$"), "drc_small"),
+                  (re.compile(r"^(mmcme2|plle2|ramb36|ramb18|dsp|iserdes|idelay|icape2|dt|diff|muxf|ram\d+|dna_port|bufr|bufio|lutram|xadc|iobuf)[_a-z0-9]*$"), r"\1")],
     "less_than": 0.0005,
     "row_re": re.compile(r"^\|\s*(\S.*?)\s*\|\s*(<?[\d.]+)\s*\|", re.M),
     "supply_re": re.compile(r"^\|\s*(Vcc\w+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|", re.M),
@@ -71,14 +75,28 @@ def nnls(X, y, iters=200):
     return x
 
 
+def family(name):
+    for rx, rep in CONFIG["family_re"]:
+        if rx.match(name):
+            return rx.sub(rep, name)
+    return name
+
+
 def builds():
     out = {}
+    pw = ROOT / "designs" / "power"
+    if pw.exists():
+        for d in sorted(pw.iterdir()):
+            out[d.name] = (ROOT / "build" / "power" / "open" / d.name, [d / f"{d.name}.xdc"])
+    out["fir_p5"] = (ROOT / "build" / "qor" / "oxc7" / "area_ref" / "fir_p5" / "s1",
+                     sorted((ROOT / "build" / "qor" / "src" / "fir_p5").glob("*.xdc")))
     for d in sorted((ROOT / "designs" / "drc").iterdir()):
         out[d.name] = (ROOT / "build" / "drc" / d.name, [d / f"{d.name}.xdc"])
     for d in sorted((ROOT / "designs" / "gap").iterdir()):
         out[d.name] = (ROOT / "build" / "gap" / d.name / "ofx", sorted(d.glob("*.xdc")))
     for d in sorted((ROOT / "build" / "qor" / "src").iterdir()):
-        out[d.name] = (ROOT / "build" / "qor" / "oxc7" / "base" / d.name / "s1", sorted(d.glob("*.xdc")))
+        if d.name not in out and not d.name.startswith("fir_"):
+            out[d.name] = (ROOT / "build" / "qor" / "oxc7" / "base" / d.name / "s1", sorted(d.glob("*.xdc")))
     out["arty_ddr3"] = (ROOT / "build/ddr3/arty_ddr3/gapfix", sorted((ROOT / "designs/ddr3/arty_ddr3").glob("*.xdc")))
     out["arty_eth"] = (ROOT / "build/eth/arty_eth/gapfix", sorted((ROOT / "designs/eth/arty_eth").glob("*.xdc")))
     return out
@@ -89,20 +107,30 @@ def val(s):
 
 
 def parse_power(f):
+    """Vivado report_power text. power_mw.rpt (same report after set_units -power mW) has 1000x finer steps; its
+    power values are converted back to W here"""
     t = f.read_text(errors="replace")
-    rec = {"classes": {}, "sub": {}, "rails": {}}
-    sec = t.split("1.1 On-Chip Components", 1)
+    k = 1e-3 if f.name == "power_mw.rpt" else 1.0
+    rec = {"classes": {}, "sub": {}, "rails": {}, "used": {}, "src": f.name}
+    t = t.replace("\r", "")
+    sec = re.split(r"^1\.1 On-Chip Components\n-+\n", t, maxsplit=1, flags=re.M)
     head = sec[0]
     for name, v in CONFIG["row_re"].findall(head):
+        name = name.replace("(mW)", "(W)")
         if name in CONFIG["summary_keys"]:
-            rec[CONFIG["summary_keys"][name]] = val(v)
+            key = CONFIG["summary_keys"][name]
+            rec[key] = val(v) * (k if key in ("total", "dynamic", "static") else 1.0)
     if len(sec) > 1:
-        body = sec[1].split("1.2 Power Supply Summary", 1)[0]
+        body = re.split(r"^1\.2 Power Supply Summary\n-+\n", sec[1], maxsplit=1, flags=re.M)[0]
         for line in body.splitlines():
             m = re.match(r"^\|( *)(\S.*?)\s*\|\s*(<?[\d.]+)\s*\|", line)
             if not m:
                 continue
-            (rec["sub"] if m.group(1).startswith("   ") or len(m.group(1)) > 1 else rec["classes"])[m.group(2)] = val(m.group(3))
+            u = re.match(r"^\|[^|]*\|[^|]*\|\s*(\d+)\s*\|", line)
+            if u:
+                rec["used"][m.group(2)] = int(u.group(1))
+            (rec["sub"] if m.group(1).startswith("   ") or len(m.group(1)) > 1 else rec["classes"])[m.group(2)] = \
+                val(m.group(3)) * k
     for r, v, tot, dyn, st in CONFIG["supply_re"].findall(t):
         rec["rails"][r] = {"voltage": float(v), "total": float(tot), "dynamic": float(dyn), "static": float(st)}
     return rec
@@ -112,14 +140,17 @@ def vivado_power():
     out = {}
     for tag in CONFIG["viv_tags"]:
         for f in sorted((CONFIG["viv"] / tag).glob("*/power.rpt")):
-            out[f.parent.name] = parse_power(f)
+            mw = f.with_name("power_mw.rpt")
+            out[f.parent.name] = parse_power(mw if mw.exists() else f)
     return out
 
 
 def feats(name, build, xdcs, dry):
     c = CONFIG["cache"] / f"{name}.json"
     if c.exists():
-        return json.loads(c.read_text())
+        f = json.loads(c.read_text())
+        if f.get("version") == P.CONFIG["feature_version"]:
+            return f
     np_ = D.find_netlist(build) if build.exists() else None
     if np_ is None or dry:
         return None
@@ -182,12 +213,26 @@ def evaluate(rows, model):
     for r in rows:
         e = P.estimate(r["f"], model)
         v = r["v"]
-        out.append({"name": r["name"], "viv_total": v.get("total", 0.0), "ofx_total": e["total_w"],
+        vl = v.get("used", {}).get("LUT as Logic", 0)
+        ol = r["f"]["counts"].get("LUT", 0)
+        out.append({"name": r["name"], "lut_ratio": (ol / vl) if vl else None,
+                    "viv_total": v.get("total", 0.0), "ofx_total": e["total_w"],
                     "viv_dynamic": v.get("dynamic", 0.0), "ofx_dynamic": e["dynamic_w"],
                     "viv_static": v.get("static", 0.0), "ofx_static": e["static_w"],
                     "classes": {k: (v["classes"].get(k, 0.0), e["classes"][k]) for k in e["classes"]},
                     "rails": {n: (x["total"], e["rails"].get(n, {}).get("total_a", 0.0)) for n, x in v["rails"].items()
                               if x["total"] > 0}})
+    return out
+
+
+def lofo(rows):
+    """leave-one-family-out: every design is predicted by a model that saw no design of its family"""
+    out = []
+    for fam in sorted({r["family"] for r in rows}):
+        tr = [r for r in rows if r["family"] != fam]
+        te = [r for r in rows if r["family"] == fam]
+        if tr and te:
+            out += evaluate(te, fit(tr))
     return out
 
 
@@ -208,15 +253,16 @@ def summary(ev, min_dyn=0.0):
             "static_mape": statistics.mean([pct(e["viv_static"], e["ofx_static"]) for e in sel])}
 
 
-def markdown(train_ev, test_ev, model):
+def markdown(train_ev, test_ev, model, cv_ev=()):
     def rows(ev):
         out = ["| Design | Vivado total W | ofx total W | err % | Vivado dynamic W | ofx dynamic W | err % | "
-               "worst class (Vivado W / ofx W) |", "|---|---|---|---|---|---|---|---|"]
+               "worst class (Vivado W / ofx W) | LUTs ofx/Vivado |", "|---|---|---|---|---|---|---|---|---|"]
         for e in ev:
             wk = max(e["classes"].items(), key=lambda kv: abs(kv[1][0] - kv[1][1]))
             out.append(f"| {e['name']} | {e['viv_total']:.3f} | {e['ofx_total']:.3f} | "
                        f"{pct(e['viv_total'], e['ofx_total']):.1f} | {e['viv_dynamic']:.3f} | {e['ofx_dynamic']:.3f} | "
-                       f"{pct(e['viv_dynamic'], e['ofx_dynamic']):.0f} | {wk[0]} {wk[1][0]:.3f} / {wk[1][1]:.3f} |")
+                       f"{pct(e['viv_dynamic'], e['ofx_dynamic']):.0f} | {wk[0]} {wk[1][0]:.3f} / {wk[1][1]:.3f} | "
+                       f"{'-' if e['lut_ratio'] is None else format(e['lut_ratio'], '.2f')} |")
         return out
     s_te, s_tr = summary(test_ev), summary(train_ev)
     s_te10 = summary(test_ev, 0.010)
@@ -226,7 +272,11 @@ def markdown(train_ev, test_ev, model):
           f"Held-out with Vivado dynamic >= 10 mW ({s_te10.get('n', 0)}): dynamic "
           f"{s_te10.get('dynamic_mape', 0):.0f} % mean abs",
           f"Training ({s_tr.get('n')}): total {s_tr.get('total_mape', 0):.1f} %, dynamic {s_tr.get('dynamic_mape', 0):.0f} %",
-          "", "## Held-out designs", ""] + rows(test_ev) + ["", "## Training designs", ""] + rows(train_ev)
+          f"Leave-one-family-out over all ({summary(cv_ev).get('n', 0)}): total {summary(cv_ev).get('total_mape', 0):.1f} % "
+          f"(max {summary(cv_ev).get('total_max', 0):.1f} %), dynamic {summary(cv_ev).get('dynamic_mape', 0):.0f} % mean abs "
+          f"({summary(cv_ev).get('dynamic_mae_mw', 0):.1f} mW); with Vivado dynamic >= 10 mW "
+          f"({summary(cv_ev, 0.010).get('n', 0)}): dynamic {summary(cv_ev, 0.010).get('dynamic_mape', 0):.0f} %",
+          "", "## Held-out designs", ""] + rows(test_ev) + ["", "## Training designs", ""] + rows(train_ev) +          ["", "## Leave-one-family-out (each design predicted without its family)", ""] + rows(cv_ev)
     md += ["", "## Coefficients (mW per feature unit; features are MHz-weighted, see ofx/power.py)", "",
            "```", json.dumps(model["coef"], indent=1), json.dumps(model["static"]), json.dumps(model["rail_share"]), "```"]
     return "\n".join(md) + "\n"
@@ -248,17 +298,21 @@ def main():
             print(f"skip {name}: no routed open build" + (" (or dry run)" if dry else ""))
             continue
         rows.append({"name": name, "v": v, "f": f})
-    train = [r for r in rows if r["name"] not in CONFIG["heldout"]]
-    test = [r for r in rows if r["name"] in CONFIG["heldout"]]
+    for r in rows:
+        r["family"] = family(r["name"])
+    train = [r for r in rows if r["family"] not in CONFIG["heldout_families"]]
+    test = [r for r in rows if r["family"] in CONFIG["heldout_families"]]
     print(f"{len(rows)} designs with Vivado power and an open build: {len(train)} train, {len(test)} held out")
     if not train:
         return
     model = fit(train)
     tr_ev, te_ev = evaluate(train, model), evaluate(test, model)
+    cv_ev = lofo(rows)
     model.update({"name": "power_model.json", "train": [r["name"] for r in train], "heldout": [r["name"] for r in test],
-                  "heldout_error": summary(te_ev), "train_error": summary(tr_ev),
+                  "heldout_error": summary(te_ev), "train_error": summary(tr_ev), "lofo_error": summary(cv_ev),
+                  "heldout_families": list(CONFIG["heldout_families"]),
                   "vivado": "Vivado 2025.2 report_power, vectorless defaults, xc7a35tcsg324-1, 25 C ambient"})
-    md = markdown(tr_ev, te_ev, model)
+    md = markdown(tr_ev, te_ev, model, cv_ev)
     print(md)
     if dry:
         print("[dry] add --run to write the model")

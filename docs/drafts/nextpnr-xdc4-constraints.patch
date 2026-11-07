@@ -1,0 +1,169 @@
+diff --git a/himbaechel/uarch/xilinx/xdc.cc b/himbaechel/uarch/xilinx/xdc.cc
+index ed120d1e..24c3c133 100644
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -773,15 +773,14 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             // The properties place and route reads: the pad's site, standard, drive,
+             // slew, pull and termination, and the site or bel of a cell
+             const pool<std::string> applied = {"PACKAGE_PIN", "LOC", "BEL", "IOSTANDARD", "DRIVE",
+-                                               "SLEW", "PULLTYPE", "IN_TERM", "IOB", "ASYNC_REG"};
++                                               "SLEW", "PULLTYPE", "IN_TERM", "IOB", "ASYNC_REG", "DIFF_TERM"};
+             // Net properties place and route reads
+             const pool<std::string> net_applied = {"CLOCK_DEDICATED_ROUTE"};
+             const dict<std::string, std::string> why_not_applied = {
+-                    {"DIFF_TERM", "nothing writes the differential termination, so the input is left unterminated"},
+-                    {"KEEP", "synthesis is over when the XDC is read; put it in the RTL for yosys"},
+-                    {"DONT_TOUCH", "synthesis is over when the XDC is read; put it in the RTL for yosys"},
++                    {"KEEP", "synthesis is over when nextpnr reads the XDC; the ofx flow applies it in yosys (flow/xdc_keep.py)"},
++                    {"DONT_TOUCH", "synthesis is over when nextpnr reads the XDC; the ofx flow applies it in yosys (flow/xdc_keep.py)"},
+                     {"KEEP_HIERARCHY", "the netlist is already flat when the XDC is read"},
+-                    {"MARK_DEBUG", "no debug core is inserted"},
++                    {"MARK_DEBUG", "no debug core is inserted here; the ofx flow keeps the net in yosys (flow/xdc_keep.py) and flow/mark_debug.py inserts a LiteScope core"},
+                     {"IODELAY_GROUP", "IDELAYCTRL instances are not grouped by it"},
+                     {"OFFCHIP_TERM", "only Vivado's I/O reports use it"},
+             };
+@@ -1337,9 +1336,79 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 xdc_clock_settings.push_back(cs);
+             }
+         } else if (cmd == "set_clock_latency") {
+-            log_warning("%s is NOT applied: the timing analysis does not model it, so slack is reported without it "
+-                        "(on line %d)\n",
+-                        cmd.c_str(), lineno);
++
++            bool source = false, early = true, late = true, got_value = false, edge_only = false;
++            double value = 0;
++            std::vector<XdcClockPattern> clocks;
++            for (int c = 1; c < int(arguments.size()); c++) {
++                const std::string &a = arguments.at(c);
++                char *end = nullptr;
++                double v = std::strtod(a.c_str(), &end);
++                const bool is_number = !a.empty() && end != nullptr && *end == '\0';
++                if (a == "-source")
++                    source = true;
++                else if (a == "-early" || a == "-min")
++                    late = false;
++                else if (a == "-late" || a == "-max")
++                    early = false;
++                else if (a == "-rise" || a == "-fall")
++                    edge_only = true;
++                else if (a == "-clock") {
++                    log_warning("set_clock_latency -clock (latency on pins) is NOT applied (on line %d)\n", lineno);
++                    goto nextline;
++                } else if (is_number && !got_value) {
++                    value = v;
++                    got_value = true;
++                } else if (a.front() == '[' || a.front() != '-') {
++                    XdcQuery q = parse_query(a.front() == '[' ? a : "[get_clocks " + a + "]", cmd.c_str());
++                    if (!q.supported)
++                        goto nextline;
++                    for (auto &p : query_clocks(q))
++                        clocks.push_back(p);
++                } else {
++                    log_warning("set_clock_latency: unsupported argument '%s', NOT applied (on line %d)\n", a.c_str(),
++                                lineno);
++                    goto nextline;
++                }
++            }
++            if (!got_value || clocks.empty()) {
++                log_warning("set_clock_latency without a value or a clock is NOT applied (on line %d)\n", lineno);
++                goto nextline;
++            }
++            if (!source) {
++                log_info("set_clock_latency %.3f (network latency) has no effect: after placement every clock is "
++                         "propagated, and Vivado ignores network latency on a propagated clock (on line %d)\n",
++                         value, lineno);
++                goto nextline;
++            }
++            if (edge_only)
++                log_warning("set_clock_latency -rise/-fall: taken for both edges (on line %d)\n", lineno);
++            {
++                bool merged = false;
++                for (auto &l : xdc_clock_latencies) {
++                    const bool same_clocks =
++                            l.clocks.size() == clocks.size() &&
++                            std::equal(l.clocks.begin(), l.clocks.end(), clocks.begin(),
++                                       [](const XdcClockPattern &p, const XdcClockPattern &q) {
++                                           return p.pattern == q.pattern;
++                                       });
++                    if (same_clocks) {
++                        if (early)
++                            l.early_ns = value;
++                        if (late)
++                            l.late_ns = value;
++                        merged = true;
++                    }
++                }
++                if (!merged) {
++                    XdcClockLatency l;
++                    l.clocks = clocks;
++                    l.early_ns = early ? value : 0;
++                    l.late_ns = late ? value : 0;
++                    l.lineno = lineno;
++                    xdc_clock_latencies.push_back(l);
++                }
++            }
+         } else if (cmd == "set_case_analysis" || cmd == "set_disable_timing") {
+             log_warning("%s is NOT applied: every timing arc stays timed (on line %d)\n", cmd.c_str(), lineno);
+         } else if (cmd == "set_multicycle_path") {
+@@ -1857,7 +1926,8 @@ void XilinxImpl::add_pblock_routing_tiles(Region *pb_region)
+ // path from it is timed to.
+ void XilinxImpl::apply_xdc_clock_exceptions()
+ {
+-    if (xdc_clock_exceptions.empty() && xdc_clock_settings.empty() && xdc_path_exceptions.empty())
++    if (xdc_clock_exceptions.empty() && xdc_clock_settings.empty() && xdc_path_exceptions.empty() &&
++        xdc_clock_latencies.empty())
+         return;
+     dict<IdString, IdString> clock_primary;
+     for (auto &net : ctx->nets) {
+@@ -1948,6 +2018,31 @@ void XilinxImpl::apply_xdc_clock_exceptions()
+             log_info("    clock '%s': %s %.3f ns (on line %d)\n", clk.c_str(ctx),
+                      cs.is_jitter ? "input jitter" : "uncertainty", cs.value_ns, cs.lineno);
+     }
++
++
++
++
++
++    for (const auto &l : xdc_clock_latencies) {
++        pool<IdString> clocks = resolve(l.clocks, l.lineno);
++        delay_t spread = ctx->getDelayFromNS(std::max(0.0, l.late_ns - l.early_ns));
++        for (auto &net : ctx->nets) {
++            ClockConstraint *cc = net.second->clkconstr.get();
++
++            const bool clock_or_generated_from_it =
++                    cc != nullptr && (clocks.count(cc->name) || (cc->master != IdString() && clocks.count(cc->master)));
++            if (!clock_or_generated_from_it)
++                continue;
++            cc->setup_uncertainty += spread;
++            cc->hold_uncertainty += spread;
++            cc->offset += ctx->getDelayFromNS(l.late_ns);
++        }
++        for (IdString clk : clocks)
++            log_info("    clock '%s': source latency early %.3f / late %.3f ns: %.3f ns against setup and hold of "
++                     "its own paths; edges %.3f ns later against related clocks (on line %d)\n",
++                     clk.c_str(ctx), l.early_ns, l.late_ns, std::max(0.0, l.late_ns - l.early_ns), l.late_ns,
++                     l.lineno);
++    }
+     for (auto &pe : xdc_path_exceptions) {
+         for (IdString clk : resolve(pe.from_clocks, pe.lineno))
+             pe.ex.from_clocks.insert(clk);
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 93726e96..900b9253 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -233,6 +233,15 @@ struct XilinxImpl : HimbaechelAPI
+         int lineno = 0;
+     };
+     std::vector<XdcClockSetting> xdc_clock_settings;
++
++
++    struct XdcClockLatency
++    {
++        std::vector<XdcClockPattern> clocks;
++        double early_ns = 0, late_ns = 0;
++        int lineno = 0;
++    };
++    std::vector<XdcClockLatency> xdc_clock_latencies;
+     // Registers moved into the I/O logic (IOB TRUE), and ASYNC_REG chains kept in one slice
+     void check_clock_placement();
+     // The pad buffers have no timing in the chipdb; port paths take these (see xilinx.cc)

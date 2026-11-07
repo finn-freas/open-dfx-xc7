@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -13,6 +14,8 @@ ROOT = gap_build.ROOT
 VIV = Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build")
 NPR = "build/nextpnr-build/qorarea/nextpnr-himbaechel"
 YS = "build/yosys-build/yosys-area/yosys"
+YS_SYNX = "build/yosys-build/yosys-synx/yosys"
+KEEPMEM = "scratchpad -set opt_dff.keep_memrd_regs 1; "
 CHIPDB = "toolchain/openxc7/share/nextpnr/himbaechel/xilinx/chipdb-xc7a50t.bin"
 BASE_ARGS = ["--timing-allow-fail", "-o", "hardblock-timing", "--placer", "static"]
 
@@ -32,7 +35,16 @@ CONFIG = {
         "area_pnr": {"synth_opts": "", "args": BASE_ARGS + ["-o", "carry-di-bypass", "-o", "lut-pair"]},
         "area_all": {"synth_opts": "-share_aggressive -carry_minwidth 5",
                      "args": BASE_ARGS + ["-o", "carry-di-bypass", "-o", "lut-pair"]},
+        "area_keepmem": {"synth_opts": "", "args": BASE_ARGS, "yosys": YS_SYNX, "yosys_pre": KEEPMEM},
+        "area_x1": {"synth_opts": "", "args": BASE_ARGS, "yosys_pre": "scratchpad -set abc9.xaiger 1; "},
+        "area_blockrule": {"synth_opts": "", "args": BASE_ARGS, "json_from": "blockrule"},
+        "area_pnr_blockrule": {"synth_opts": "", "args": BASE_ARGS + ["-o", "carry-di-bypass", "-o", "lut-pair"],
+                               "json_from": "blockrule"},
+        "area_pnr_keepmem": {"synth_opts": "", "args": BASE_ARGS + ["-o", "carry-di-bypass", "-o", "lut-pair"],
+                             "yosys": YS_SYNX, "yosys_pre": KEEPMEM},
     },
+    "npwait": "ofx/npwait.sh",
+    "npwait_max": "2",
 }
 
 
@@ -50,9 +62,11 @@ def run(design, variant, dry):
     top = (src / "top.txt").read_text().split()[0]
     rtl = [src / f"{top}.v", *sorted(p for p in src.glob("*.v") if p.name != f"{top}.v")]
     out = CONFIG["out"] / design / variant
-    tools = {"nextpnr": str(ROOT / NPR), "chipdb": str(ROOT / CHIPDB), "yosys": str(ROOT / YS),
+    os.environ["OFX_NEXTPNR_BIN"] = str(ROOT / NPR)
+    os.environ["OFX_MAX_NEXTPNR"] = CONFIG["npwait_max"]
+    tools = {"nextpnr": str(ROOT / CONFIG["npwait"]), "chipdb": str(ROOT / CHIPDB), "yosys": str(ROOT / v.get("yosys", YS)),
              "yosys_plugin": str(ROOT / "build/yosys-plugin/clkbufmap_gapfix.so"), "clkbuf_pass": "clkbufmap_gapfix",
-             "synth_opts": v["synth_opts"]}
+             "synth_opts": v["synth_opts"], "yosys_pre": v.get("yosys_pre", ""), "json_from": v.get("json_from")}
     if not dry:
         wait_gate()
     rec = gap_build.build(design, src, top, rtl, src / "nextpnr" / f"{top}.xdc", out, d["freq"], dry, v["args"], tools)

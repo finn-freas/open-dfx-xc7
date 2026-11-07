@@ -1,0 +1,303 @@
+diff --git a/common/kernel/timing.cc b/common/kernel/timing.cc
+index 39ad26b..9e720e0 100644
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -300,6 +300,7 @@ void TimingAnalyser::get_cell_delays()
+ 
+ void TimingAnalyser::get_route_delays()
+ {
++    const bool route_min_delay = bool_or_default(ctx->settings, ctx->id("timing/routeMinDelay"), false);
+     for (auto &net : ctx->nets) {
+         NetInfo *ni = net.second.get();
+         if (ni->driver.cell == nullptr || ni->driver.cell->bel == BelId())
+@@ -308,7 +309,19 @@ void TimingAnalyser::get_route_delays()
+         for (auto &usr : ni->users) {
+             if (usr.cell->bel == BelId())
+                 continue;
+-            ports.at(CellPortKey(usr)).route_delay = DelayPair(ctx->getNetinfoRouteDelay(ni, usr));
++
++
++
++
++
++            int clk_info_count = 0;
++            bool to_clock_pin = route_min_delay &&
++                                ctx->getPortTimingClass(usr.cell, usr.port, clk_info_count) == TMG_CLOCK_INPUT;
++            if (route_min_delay && !to_clock_pin) {
++                DelayQuad q = ctx->getNetinfoRouteDelayQuad(ni, usr);
++                ports.at(CellPortKey(usr)).route_delay = DelayPair(q.minDelay(), q.maxDelay());
++            } else
++                ports.at(CellPortKey(usr)).route_delay = DelayPair(ctx->getNetinfoRouteDelay(ni, usr));
+         }
+     }
+ }
+@@ -1554,6 +1567,25 @@ std::vector<CriticalPath> TimingAnalyser::get_min_delay_violations()
+ 
+                 if (hold_slack <= 0) {
+                     auto report = build_critical_path_report(dom_pair_id, ep.first, false);
++
++
++
++
++                    if (bool_or_default(ctx->settings, ctx->id("timing/holdSlackSegment"), false) &&
++                        !report.segments.empty()) {
++                        delay_t sum = 0;
++                        for (const auto &s : report.segments)
++                            sum += s.delay;
++                        if (sum != hold_slack) {
++                            CriticalPath::Segment seg;
++                            seg.type = CriticalPath::Segment::Type::CLK_TO_CLK;
++                            seg.delay = hold_slack - sum;
++                            seg.from = report.segments.front().from;
++                            seg.to = report.segments.back().to;
++                            seg.net = IdString();
++                            report.segments.insert(report.segments.begin(), seg);
++                        }
++                    }
+                     violations.emplace_back(report);
+                 }
+             }
+diff --git a/himbaechel/arch.h b/himbaechel/arch.h
+index 747187c..c7ca533 100644
+--- a/himbaechel/arch.h
++++ b/himbaechel/arch.h
+@@ -610,6 +610,8 @@ struct Arch : BaseArch<ArchRanges>
+                         uint64_t(1e6);
+             }
+ 
++            if (route_min_scale != 1.0f)
++                return DelayQuad(delay_t(total_delay * route_min_scale), total_delay);
+             return DelayQuad(total_delay);
+         } else {
+             // Pip with no specified delay. Return a notional value so the router still has something to work with.
+@@ -913,6 +915,8 @@ struct Arch : BaseArch<ArchRanges>
+     // Load capacitance and drive resistance for nodes
+     // TODO: does this `dict` hurt routing performance too much?
+     bool fast_pip_delays = false;
++
++    float route_min_scale = 1.0f;
+     dict<WireId, uint64_t> drive_res;
+     dict<WireId, uint64_t> load_cap;
+ 
+diff --git a/himbaechel/uarch/xilinx/hold_fix.cc b/himbaechel/uarch/xilinx/hold_fix.cc
+index 9745796..45ef102 100644
+--- a/himbaechel/uarch/xilinx/hold_fix.cc
++++ b/himbaechel/uarch/xilinx/hold_fix.cc
+@@ -70,7 +70,7 @@ static void wire_xy(Context *ctx, WireId w, int &x, int &y)
+ // path.  Best-effort and side-effect-free on failure -- if it cannot reach the
+ // sink with enough delay it restores the original routing exactly and returns
+ // false, so the caller can fall back to a feedthrough buffer.
+-static bool detour_arc(Context *ctx, NetInfo *net, WireId sink_wire, delay_t extra_delay)
++static bool detour_arc(Context *ctx, NetInfo *net, WireId sink_wire, delay_t extra_delay, bool meet_target = false)
+ {
+     bool sink_is_routed = sink_wire != WireId() && net->wires.count(sink_wire);
+     if (!sink_is_routed)
+@@ -110,8 +110,10 @@ static bool detour_arc(Context *ctx, NetInfo *net, WireId sink_wire, delay_t ext
+         cur = parent;
+     }
+     bool found_private_branch = branch != WireId() && !priv.empty();
+-    if (!found_private_branch)
++    if (!found_private_branch) {
++        { if (getenv("HOLDFIX_VERBOSE")) log_info("Hold-fix detour: no private branch\n"); }
+         return false;
++    }
+     delay_t target = branch_delay + extra_delay;
+ 
+     // Search box: the branch..sink bounding box, expanded by a margin.
+@@ -171,8 +173,10 @@ static bool detour_arc(Context *ctx, NetInfo *net, WireId sink_wire, delay_t ext
+             }
+         }
+     }
+-    if (!distT.count(branch))
++    if (!distT.count(branch)) {
++        { if (getenv("HOLDFIX_VERBOSE")) log_info("Hold-fix detour: branch cannot reach the sink in the box\n"); }
+         return false; // sink unreachable from branch within the box
++    }
+ 
+     // Rip this sink's private branch (leaving the shared trunk intact).
+     for (WireId w : priv)
+@@ -210,6 +214,11 @@ static bool detour_arc(Context *ctx, NetInfo *net, WireId sink_wire, delay_t ext
+             delay_t total = acc + ctx->getPipDelay(dh).maxDelay() + distT.at(n);
+             // Prefer the largest total not exceeding target; penalise overshoot.
+             delay_t score = (total <= target) ? total : (2 * target - total);
++
++
++
++            if (meet_target)
++                score = (total >= target) ? (std::numeric_limits<delay_t>::max() / 2 - (total - target)) : total;
+             if (score > best_score) {
+                 best_score = score;
+                 best = dh;
+@@ -234,6 +243,7 @@ static bool detour_arc(Context *ctx, NetInfo *net, WireId sink_wire, delay_t ext
+     }
+     bool detour_reached_sink = cur == sink_wire;
+     if (!detour_reached_sink) {
++        { if (getenv("HOLDFIX_VERBOSE")) log_info("Hold-fix detour: walk did not reach the sink\n"); }
+         rollback();
+         return false;
+     }
+@@ -253,6 +263,8 @@ static bool detour_arc(Context *ctx, NetInfo *net, WireId sink_wire, delay_t ext
+         ctx->bindPip(p, net, STRENGTH_LOCKED);
+         bound.push_back(p);
+     }
++    if (getenv("HOLDFIX_VERBOSE"))
++        log_info("Hold-fix detour: bound, %d ps of %d ps target (branch %d ps)\n", int(acc), int(target), int(branch_delay));
+     return acc >= target;
+ }
+ 
+@@ -347,6 +359,10 @@ void XilinxImpl::fixup_hold()
+         detour_max_ns = args.options["hold-detour-max"].as<double>();
+     delay_t detour_max = ctx->getDelayFromNS(detour_max_ns);
+     delay_t detour_margin = ctx->getDelayFromNS(0.02); // clear the deficit, don't just meet it
++    const bool upstream_fallback = args.options.count("hold-fix-upstream") != 0;
++
++    const float min_scale = ctx->route_min_scale;
++    int upstream_detours = 0;
+ 
+     if (getenv("HOLDFIX_PROBE")) {
+         // Does device wire iteration itself crash here, before any 2nd router2?
+@@ -392,20 +408,32 @@ void XilinxImpl::fixup_hold()
+         // Collect the unique violating sinks this pass, with the extra delay
+         // each needs.  For a min-delay violation the sum of the path segment
+         // delays IS the (negative) hold slack, so the deficit is its magnitude.
++        struct Upstream
++        {
++            IdString net, sink_cell, sink_port;
++        };
+         struct Target
+         {
+             IdString net, sink_cell, sink_port;
+             delay_t extra;
++
++
++
++
++            std::vector<Upstream> upstream;
+         };
+         std::vector<Target> targets;
+         pool<std::string> seen;
+         for (const auto &cp : violations) {
+             const CriticalPath::Segment *last_routing = nullptr;
++            std::vector<const CriticalPath::Segment *> routing_segs;
+             delay_t sum = 0;
+             for (const auto &seg : cp.segments) {
+                 sum += seg.delay;
+-                if (seg.type == CriticalPath::Segment::Type::ROUTING)
++                if (seg.type == CriticalPath::Segment::Type::ROUTING) {
+                     last_routing = &seg;
++                    routing_segs.push_back(&seg);
++                }
+             }
+             if (!last_routing)
+                 continue;
+@@ -414,7 +442,11 @@ void XilinxImpl::fixup_hold()
+                 continue;
+             seen.insert(key);
+             delay_t extra = (sum < 0 ? -sum : delay_t(0)) + detour_margin;
+-            targets.push_back({last_routing->net, last_routing->to.first, last_routing->to.second, extra});
++            std::vector<Upstream> up;
++            if (upstream_fallback)
++                for (int i = int(routing_segs.size()) - 2; i >= 0; i--)
++                    up.push_back({routing_segs[i]->net, routing_segs[i]->to.first, routing_segs[i]->to.second});
++            targets.push_back({last_routing->net, last_routing->to.first, last_routing->to.second, extra, up});
+         }
+         if (targets.empty())
+             break;
+@@ -425,6 +457,9 @@ void XilinxImpl::fixup_hold()
+         std::vector<Target> ft;
+         int detoured = 0;
+         for (const auto &t : targets) {
++            if (getenv("HOLDFIX_VERBOSE"))
++                log_info("Hold-fix: target %s.%s extra %d ps, %d upstream arc(s)\n", t.sink_cell.c_str(ctx),
++                         t.sink_port.c_str(ctx), int(t.extra), int(t.upstream.size()));
+             bool target_still_exists = ctx->nets.count(t.net) && ctx->cells.count(t.sink_cell);
+             if (!target_still_exists)
+                 continue;
+@@ -442,8 +477,42 @@ void XilinxImpl::fixup_hold()
+                 pr.cell = sink;
+                 pr.port = t.sink_port;
+                 WireId sink_wire = ctx->getNetinfoSinkWire(net, pr, 0);
+-                if (detour_arc(ctx, net, sink_wire, t.extra)) {
++                if (detour_arc(ctx, net, sink_wire, delay_t(t.extra / min_scale), upstream_fallback)) {
++                    detoured++;
++                    continue;
++                }
++
++
++
++                bool detoured_upstream = false;
++                for (const auto &u : t.upstream) {
++                    bool up_exists = ctx->nets.count(u.net) && ctx->cells.count(u.sink_cell);
++                    if (!up_exists)
++                        continue;
++                    NetInfo *un = ctx->nets.at(u.net).get();
++                    CellInfo *uc = ctx->cells.at(u.sink_cell).get();
++                    bool usable_arc = un->driver.cell != nullptr && uc->bel != BelId() && uc->getPort(u.sink_port) == un;
++                    if (!usable_arc)
++                        continue;
++                    PortRef upr;
++                    upr.cell = uc;
++                    upr.port = u.sink_port;
++                    WireId uw = ctx->getNetinfoSinkWire(un, upr, 0);
++                    if (getenv("HOLDFIX_VERBOSE"))
++                        log_info("Hold-fix: try upstream %s -> %s.%s (sink wire %s, routed %d)\n", ctx->nameOf(un),
++                                 ctx->nameOf(uc), u.sink_port.c_str(ctx), uw == WireId() ? "-" : ctx->nameOfWire(uw),
++                                 int(uw != WireId() && un->wires.count(uw)));
++                    if (detour_arc(ctx, un, uw, delay_t(t.extra / min_scale), true)) {
++                        if (getenv("HOLDFIX_VERBOSE"))
++                            log_info("Hold-fix: %s.%s detoured upstream on %s -> %s.%s\n", ctx->nameOf(sink),
++                                     t.sink_port.c_str(ctx), ctx->nameOf(un), ctx->nameOf(uc), u.sink_port.c_str(ctx));
++                        detoured_upstream = true;
++                        break;
++                    }
++                }
++                if (detoured_upstream) {
+                     detoured++;
++                    upstream_detours++;
+                     continue;
+                 }
+             }
+@@ -672,6 +741,9 @@ void XilinxImpl::fixup_hold()
+     if (anything_was_fixed) {
+         log_info("Hold-fix: %d detour(s) + %d feedthrough buffer(s) total; %zu hold violation(s) remain.\n",
+                  total_detours, total_buffers, ctx->timing_result.min_delay_violations.size());
++        if (upstream_fallback)
++            log_info("Hold-fix: %d of the detours on an earlier arc of the path (-o hold-fix-upstream).\n",
++                     upstream_detours);
+ 
+         // The timing analysis in Arch::route ran BEFORE this pass and flagged the
+         // hold violations we have now fixed as a nonfatal error -- a sticky flag
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 5fcd510..0f129b4 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -79,6 +79,12 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("delay-matrix", po::value<std::string>(),
+                            "interconnect delay model: on by default (measured per tile offset); 'off' uses the "
+                            "tuned formula; a path caches the table there; 'build' rebuilds it fresh (the default)");
++    specific.add_options()("route-min-scale", po::value<float>(),
++                           "hold analysis: a routed arc's min delay is K times its max (fast corner against slow "
++                           "corner, fitted against Vivado: 0.39 on xc7a35t-1); off by default (min = max)");
++    specific.add_options()("hold-fix-upstream",
++                           "with -o hold-fix: when a violating path's last arc cannot be lengthened (it stays "
++                           "inside one site) and no buffer fits, detour an earlier routed arc of the same path");
+     specific.add_options()("hold-fix", po::value<std::string>()->implicit_value(""),
+                            "after routing, fix hold-time (min-delay) violations: small deficits by a routing "
+                            "detour, larger ones by a feedthrough LUT; optional value sets the max passes (default 8)");
+@@ -946,6 +952,16 @@ void XilinxImpl::close_routed_tiles()
+ 
+ void XilinxImpl::prePlace()
+ {
++    if (ctx->args.options.count("hold-fix-upstream"))
++        ctx->settings[ctx->id("timing/holdSlackSegment")] = true;
++    if (ctx->args.options.count("route-min-scale")) {
++        float k = ctx->args.options.at("route-min-scale").as<float>();
++        if (!(k > 0.0f && k <= 1.0f))
++            log_error("-o route-min-scale expects 0 < K <= 1\n");
++        ctx->route_min_scale = k;
++        ctx->settings[ctx->id("timing/routeMinDelay")] = true;
++        log_info("Routing min (hold) delay: %.3f x the max delay.\n", k);
++    }
+     apply_holdbufs();
+     apply_preplaced();
+     close_routed_tiles();

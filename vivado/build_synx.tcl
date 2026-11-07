@@ -57,7 +57,10 @@ foreach name $CONFIG_NAMES {
         if {$mode eq "rtl"} {
             foreach f [concat [glob -nocomplain $src/*.v] [glob -nocomplain $src/*.sv]] { read_verilog -sv $f }
             read_xdc [glob $src/*.xdc]
-            step $tf synth { synth_design -top $top -part $CONFIG_PART }
+            set sopts {}
+            if {[file exists $src/synth_opts.txt]} { set sopts [string trim [read [open $src/synth_opts.txt]]] }
+            puts "SYNX_SYNTH_OPTS $name: $sopts"
+            step $tf synth { synth_design -top $top -part $CONFIG_PART {*}$sopts }
         } else {
             file copy -force $src/netlist.edf $out/$top.edf
             read_edif $out/$top.edf

@@ -1,0 +1,10 @@
+[project]
+name = "blinky_k325t"
+top = "blinky_k325t"
+part = "xc7k325tffg900-2"
+sources = ["src/blinky_k325t.v"]
+constraints = ["constraints/blinky_k325t.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

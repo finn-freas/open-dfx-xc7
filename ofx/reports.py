@@ -65,7 +65,23 @@ def print_timing(dirs):
     return bad
 
 
-def print_report(dirs):
+def partition_utilization(d, insts):
+    """Cells of each reconfigurable partition instance in a build's routed json, by cell type (the counterpart of
+    Vivado's report_utilization -pblocks)."""
+    f = next(iter(sorted(Path(d).glob("*_routed.json"))), None)
+    if f is None or not insts:
+        return None
+    m = json.loads(f.read_text())
+    top = next(v for v in m["modules"].values() if v.get("attributes", {}).get("top"))
+    out = {i: {} for i in insts}
+    for name, c in top["cells"].items():
+        for i in insts:
+            if name.startswith(i + "."):
+                out[i][c["type"]] = out[i].get(c["type"], 0) + 1
+    return out
+
+
+def print_report(dirs, insts=()):
     for d in dirs:
         u = utilization(d)
         print(f"== {d}")
@@ -76,6 +92,8 @@ def print_report(dirs):
             print(f"   {name:22s} {v['used']:7d} / {v['total']:7d}  {v['pct']:3d}%")
         for clk, v in (timing(d) or {}).items():
             print(f"   clock {clk}: {v['fmax_mhz']:.2f} MHz ({v['status']} at {v['target_mhz']:.2f} MHz)")
+        for inst, cells in (partition_utilization(d, insts) or {}).items():
+            print(f"   partition {inst}: " + (", ".join(f"{t} {k}" for t, k in sorted(cells.items())) or "no cells"))
         bit = next(iter(sorted(d.glob("*.bit"))), None)
         if bit:
             print(f"   bitstream {bit} ({bit.stat().st_size} bytes)")

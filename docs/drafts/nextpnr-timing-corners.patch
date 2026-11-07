@@ -1,0 +1,595 @@
+--- a/common/kernel/arch_api.h
++++ b/common/kernel/arch_api.h
+@@ -160,6 +160,11 @@
+     virtual bool place() = 0;
+     virtual bool route() = 0;
+     virtual void assignArchInfo() = 0;
++
++
++    virtual int getTimingCornerCount() const = 0;
++    virtual void setTimingCorner(int corner) = 0;
++    virtual std::string getTimingCornerName(int corner) const = 0;
+ };
+ 
+ NEXTPNR_NAMESPACE_END
+--- a/common/kernel/base_arch.h
++++ b/common/kernel/base_arch.h
+@@ -459,6 +459,9 @@
+ 
+     // Flow methods
+     virtual void assignArchInfo() override {};
++    virtual int getTimingCornerCount() const override { return 0; }
++    virtual void setTimingCorner(int corner) override { NPNR_ASSERT(corner == 0); }
++    virtual std::string getTimingCornerName(int corner) const override { return "default"; }
+ 
+     // --------------------------------------------------------------
+     // These structures are used to provide default implementations of bel/wire/pip binding. Arches might want to
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -2187,6 +2187,98 @@
+ 
+ PortInfo &TimingAnalyser::port_info(const CellPortKey &key) { return ctx->cells.at(key.cell)->ports.at(key.port); }
+ 
++void TimingAnalyser::log_corner_summary(const std::string &corner,
++                                        dict<std::string, std::pair<delay_t, std::string>> &worst)
++{
++    build_endpoint_reports(1);
++    dict<std::pair<IdString, int>, domain_id_t> domain_of;
++    for (domain_id_t i = 0; i < domain_id_t(domains.size()); i++)
++        if (!domains.at(i).key.is_async())
++            domain_of[std::make_pair(domains.at(i).key.clock, int(domains.at(i).key.edge))] = i;
++
++    auto startpoint = [&](CellPortKey p, domain_id_t launch, bool longest) {
++        pool<CellPortKey> seen;
++        while (seen.insert(p).second) {
++            auto &pd = ports.at(p);
++            auto a = pd.arrival.find(launch);
++            if (a == pd.arrival.end())
++                break;
++            CellPortKey prev = longest ? a->second.bwd_max : a->second.bwd_min;
++            if (prev.cell == IdString())
++                break;
++            p = prev;
++        }
++        return p;
++    };
++    struct Worst
++    {
++        int count = 0, failing = 0;
++        delay_t slack = 0;
++        std::string at;
++    };
++    std::map<std::string, Worst> lines;
++    for (auto &check : result.endpoint_checks) {
++        if (!check.untimed.empty())
++            continue;
++        CellPortKey ep(check.cell_port.first, check.cell_port.second);
++        auto launch = domain_of.find(std::make_pair(check.clock_pair.start.clock, int(check.clock_pair.start.edge)));
++        for (const bool is_setup : {true, false}) {
++            if (!(is_setup ? check.has_setup : check.has_hold))
++                continue;
++            std::string kind = "reg";
++            if (io_ends.count(ep))
++                kind = "out";
++            else if (launch != domain_of.end() && io_starts.count(startpoint(ep, launch->second, is_setup)))
++                kind = "in ";
++            const delay_t slack = is_setup ? check.setup_slack : check.hold_slack;
++            auto &w = lines[std::string(is_setup ? "setup" : "hold ") + " " + kind];
++            if (w.count == 0 || slack < w.slack) {
++                w.slack = slack;
++                w.at = stringf("%s.%s", ep.cell.c_str(ctx), ep.port.c_str(ctx));
++            }
++            w.count++;
++            if (slack < 0)
++                w.failing++;
++        }
++    }
++    for (auto &l : lines) {
++        log_info("corner %-4s %s: worst slack %7.3f ns at %s (%d endpoint checks, %d failing)\n", corner.c_str(),
++                 l.first.c_str(), ctx->getDelayNS(l.second.slack), l.second.at.c_str(), l.second.count,
++                 l.second.failing);
++        auto found = worst.find(l.first);
++        if (found == worst.end() || l.second.slack < found->second.first)
++            worst[l.first] = std::make_pair(l.second.slack, corner);
++    }
++}
++
++void log_timing_corners(Context *ctx)
++{
++    const int corners = ctx->getTimingCornerCount();
++    if (corners == 0)
++        return;
++    log_break();
++    log_info("Timing at each process corner (-o timing-corners; report only, placement and routing use the default "
++             "delays):\n");
++    dict<std::string, std::pair<delay_t, std::string>> worst;
++    for (int c = 1; c <= corners; c++) {
++        ctx->setTimingCorner(c);
++        TimingAnalyser tmg(ctx);
++        tmg.setup_only = false;
++        tmg.with_clock_skew = true;
++        tmg.setup(false, false, false);
++        tmg.log_corner_summary(ctx->getTimingCornerName(c), worst);
++    }
++    ctx->setTimingCorner(0);
++    std::vector<std::string> keys;
++    for (auto &w : worst)
++        keys.push_back(w.first);
++    std::sort(keys.begin(), keys.end());
++    for (auto &k : keys)
++        log_info("all corners %s: worst slack %7.3f ns (corner %s)\n", k.c_str(), ctx->getDelayNS(worst.at(k).first),
++                 worst.at(k).second.c_str());
++    log_break();
++}
++
+ void timing_analysis(Context *ctx, bool print_slack_histogram, bool print_fmax, bool print_path, bool warn_on_failure,
+                      bool update_results)
+ {
+--- a/common/kernel/timing.h
++++ b/common/kernel/timing.h
+@@ -110,6 +110,9 @@
+     // Every endpoint's setup and hold check, and the worst paths_per_pair setup and hold paths of each clock
+     // pair, into the timing result
+     void build_endpoint_reports(int paths_per_pair);
++
++
++    void log_corner_summary(const std::string &corner, dict<std::string, std::pair<delay_t, std::string>> &worst);
+ 
+     // Enable analysis of clock skew between FFs.
+     bool with_clock_skew = false;
+@@ -297,6 +300,9 @@
+ };
+ 
+ // Perform timing analysis and optionaly print out slack histogram, fmax and critical paths
++
++void log_timing_corners(Context *ctx);
++
+ void timing_analysis(Context *ctx, bool slack_histogram = true, bool print_fmax = true, bool print_path = false,
+                      bool warn_on_failure = false, bool update_results = false);
+ 
+--- a/himbaechel/arch.cc
++++ b/himbaechel/arch.cc
+@@ -168,6 +168,42 @@
+     if (!speed_grade) {
+         log_error("Speed grade '%s' not found in database.\n", speed.c_str());
+     }
++    default_speed_grade = speed_grade;
++    for (const auto &speed_data : chip_info->speed_grades)
++        if (IdString(speed_data.name) == id("CORNERS"))
++            corners_speed_grade = &speed_data;
++}
++
++int Arch::getTimingCornerCount() const
++{
++    if (!args.options.count("timing-corners"))
++        return 0;
++    if (corners_speed_grade == nullptr)
++        log_error("-o timing-corners needs a chipdb with the CORNERS speed grade (xilinx_gen.py --corners)\n");
++    return 2;
++}
++
++std::string Arch::getTimingCornerName(int corner) const { return corner == 1 ? "Slow" : corner == 2 ? "Fast" : "default"; }
++
++void Arch::setTimingCorner(int corner)
++{
++    NPNR_ASSERT(corner >= 0 && corner <= 2);
++    if (corner != 0) {
++        NPNR_ASSERT(corners_speed_grade != nullptr);
++
++
++        const auto &a = default_speed_grade->cell_types, &b = corners_speed_grade->cell_types;
++        if (a.ssize() != b.ssize())
++            log_error("the CORNERS speed grade has %d cell types, the selected one %d\n", int(b.ssize()),
++                      int(a.ssize()));
++        for (int i = 0; i < a.ssize(); i++)
++            if (a[i].type_variant != b[i].type_variant)
++                log_error("cell type %d differs between the CORNERS and the selected speed grade\n", i);
++        const std::string rc = args.options.at("timing-corners").as<std::string>();
++        fast_rc_scale = rc.empty() ? 1.0 : std::stod(rc);
++    }
++    timing_corner = corner;
++    speed_grade = corner == 0 ? default_speed_grade : corners_speed_grade;
+ }
+ 
+ void Arch::set_package(const std::string &package)
+@@ -324,6 +360,8 @@
+     } else {
+         log_error("Himbächel architecture does not support router '%s'\n", router.c_str());
+     }
++
++    log_timing_corners(getCtx());
+     uarch->postRoute();
+     getCtx()->settings[getCtx()->id("route")] = 1;
+     archInfoToAttributes();
+@@ -519,7 +557,8 @@
+             db_binary_search(tp.comb_arcs, [](const CellPinCombArcPOD &arc) { return arc.input; }, from_port.index);
+     if (arc_idx == -1)
+         return false;
+-    delay = DelayQuad(tp.comb_arcs[arc_idx].delay.fast_min, tp.comb_arcs[arc_idx].delay.slow_max);
++    DelayPair d = corner_pair(tp.comb_arcs[arc_idx].delay);
++    delay = DelayQuad(d.min_delay, d.max_delay);
+     return true;
+ }
+ 
+@@ -582,9 +621,10 @@
+ 
+     result.clock_port = IdString(arc.clock);
+     result.edge = ClockEdge(arc.edge);
+-    result.setup = DelayPair(arc.setup.fast_min, arc.setup.slow_max);
+-    result.hold = DelayPair(arc.hold.fast_min, arc.hold.slow_max);
+-    result.clockToQ = DelayQuad(arc.clk_q.fast_min, arc.clk_q.slow_max);
++    result.setup = corner_pair(arc.setup);
++    result.hold = corner_pair(arc.hold);
++    DelayPair clk_q = corner_pair(arc.clk_q);
++    result.clockToQ = DelayQuad(clk_q.min_delay, clk_q.max_delay);
+ 
+     return result;
+ }
+--- a/himbaechel/arch.h
++++ b/himbaechel/arch.h
+@@ -484,6 +484,26 @@
+     const ChipInfoPOD *chip_info;
+     const PackageInfoPOD *package_info = nullptr;
+     const SpeedGradePOD *speed_grade = nullptr;
++
++
++
++
++    int timing_corner = 0;
++    const SpeedGradePOD *default_speed_grade = nullptr;
++    const SpeedGradePOD *corners_speed_grade = nullptr;
++    double fast_rc_scale = 1.0;
++    int getTimingCornerCount() const override;
++    void setTimingCorner(int corner) override;
++    std::string getTimingCornerName(int corner) const override;
++
++    DelayPair corner_pair(const TimingValue &v) const
++    {
++        if (timing_corner == 1)
++            return DelayPair(v.slow_min, v.slow_max);
++        if (timing_corner == 2)
++            return DelayPair(v.fast_min, v.fast_max);
++        return DelayPair(v.fast_min, v.slow_max);
++    }
+ 
+     // Unlike Viaduct, we are not -generic based and therefore uarch must be non-nullptr
+     std::unique_ptr<HimbaechelAPI> uarch;
+@@ -609,6 +629,15 @@
+                         ((pip_tmg->out_res.slow_max + uint64_t(dst_tmg->res.slow_max) / 2) * dst_tmg->cap.slow_max) /
+                         uint64_t(1e6);
+             }
++            if (timing_corner != 0) {
++
++
++                delay_t rc = total_delay - pip_tmg->int_delay.slow_max;
++                DelayPair intrinsic = corner_pair(pip_tmg->int_delay);
++                if (timing_corner == 2)
++                    rc = delay_t(rc * fast_rc_scale + 0.5);
++                return DelayQuad(intrinsic.min_delay + rc, intrinsic.max_delay + rc);
++            }
+ 
+             return DelayQuad(total_delay);
+         } else {
+--- a/himbaechel/uarch/xilinx/gen/xilinx_device.py
++++ b/himbaechel/uarch/xilinx/gen/xilinx_device.py
+@@ -29,6 +29,8 @@
+     max_delay: float = 0
+     resistance: float = 0
+     capacitance: float = 0
++
++    corners: tuple = (0, 0, 0, 0)
+ 
+ @dataclass
+ class SiteWireData:
+@@ -107,6 +109,8 @@
+         return self.data.min_delay
+     def max_delay(self):
+         return self.data.max_delay
++    def corner_delays(self):
++        return self.data.corners
+     def resistance(self):
+         return self.data.resistance
+     def capacitance(self):
+@@ -444,6 +448,7 @@
+                     if "delay" in s2d and s2d["delay"] is not None:
+                         pd.min_delay = min(float(s2d["delay"][0]), float(s2d["delay"][1]))
+                         pd.max_delay = max(float(s2d["delay"][2]), float(s2d["delay"][3]))
++                        pd.corners = tuple(float(v) for v in s2d["delay"])
+                     if "res" in s2d and s2d["res"] is not None:
+                         pd.resistance = float(s2d["res"])
+                     if "in_cap" in s2d and s2d["in_cap"] is not None:
+--- a/himbaechel/uarch/xilinx/gen/xilinx_gen.py
++++ b/himbaechel/uarch/xilinx/gen/xilinx_gen.py
+@@ -98,8 +98,27 @@
+         bba.u16(self.tile_y)
+         bba.slice(f"{context}_sites", len(self.sites))
+ 
++
++
++
++
++CORNERS = False
++
++def ps(v):
++    return int(v * 1000)
++
++def corner_tv(fast, slow):
++
++    return TimingValue(ps(fast[0]), ps(fast[1]), ps(slow[0]), ps(slow[1]))
++
++def grades():
++    return ["DEFAULT", "CORNERS"] if CORNERS else ["DEFAULT"]
++
+ def timing_pip_classs(pip: xilinx_device.PIP):
+-    return f"{'buf' if pip.is_buffered() else 'sw'}_d{pip.max_delay()}_r{pip.resistance()}_c{pip.capacitance()}"
++    name = f"{'buf' if pip.is_buffered() else 'sw'}_d{pip.max_delay()}_r{pip.resistance()}_c{pip.capacitance()}"
++    if CORNERS:
++        name += "_f" + "_".join(str(ps(v)) for v in pip.corner_delays())
++    return name
+ 
+ seen_pip_timings = set()
+ seen_node_timings = set()
+@@ -410,6 +429,11 @@
+                 in_cap=TimingValue(int(pip.capacitance()*1000)), # fF
+                 out_res=TimingValue(int(pip.resistance())), # mohm
+                 is_buffered=pip.is_buffered())
++            if CORNERS:
++                c = pip.corner_delays()
++                ch.timing.set_pip_class("CORNERS", tcls, delay=corner_tv(c[0:2], c[2:4]),
++                    in_cap=TimingValue(int(pip.capacitance()*1000)), out_res=TimingValue(int(pip.resistance())),
++                    is_buffered=pip.is_buffered())
+             seen_pip_timings.add(tcls)
+         rt = PIP_CFG_ROUTETHRU if pip.is_route_thru() else 0
+         # Route-thru pips are not tile config bits at all (they borrow a site
+@@ -424,15 +448,22 @@
+             add_pip(pip.dst_wire().name(), pip.src_wire().name(), pip_class=PipClass.TILE_ROUTING, timing=tcls,
+                 pip_config=rt | rev_nb)
+ 
+-def import_sdf_timings(variant, sdfcell):
++def iopath_tv(entry, corners):
++
++
++    if corners:
++        return corner_tv((entry.rising.minv, entry.rising.maxv), (entry.falling.minv, entry.falling.maxv))
++    return TimingValue(int(min(entry.rising.minv, entry.falling.minv)*1000),
++        int(max(entry.rising.maxv, entry.falling.maxv)*1000))
++
++def import_sdf_timings(variant, sdfcell, corners=False):
+     # TODO: anything other than comb
+     for entry in sdfcell.entries:
+         if isinstance(entry, parse_sdf.IOPath):
+-            variant.add_comb_arc(entry.from_pin, entry.to_pin,
+-                TimingValue(int(min(entry.rising.minv, entry.falling.minv)*1000),
+-                    int(max(entry.rising.maxv, entry.falling.maxv)*1000)))
++            variant.add_comb_arc(entry.from_pin, entry.to_pin, iopath_tv(entry, corners))
+ 
+-def import_bram_timings(timing, sdf, is_virtex7=False):
++def import_bram_timings(timing, sdf, is_virtex7=False, grade="DEFAULT"):
++    corners = grade == "CORNERS"
+     # RAMB18 hold figures read off Vivado's own probed paths on the VC707
+     # oracle (docs/extracted-timing.md), in place of the SDF's generic
+     # (and much wider) device-level hold envelope. No equivalent
+@@ -459,8 +490,7 @@
+ 
+     def import_bus_clkq(cell, port, width, clock, entry):
+         for i in range(width):
+-            cell.add_clock_out(clock, f"{port}{i}", ClockEdge.RISING, TimingValue(int(min(entry.rising.minv, entry.falling.minv)*1000),
+-                int(max(entry.rising.maxv, entry.falling.maxv)*1000)))
++            cell.add_clock_out(clock, f"{port}{i}", ClockEdge.RISING, iopath_tv(entry, corners))
+ 
+ 
+     def import_pin_sethold(cell, port, clock, entry):
+@@ -490,7 +520,7 @@
+     write_modes = ("NC", "RF", "WF")
+     for wsdp, rsdp, mode_a, mode_b in itertools.product((False, True), (False, True), write_modes, write_modes):
+         variant = f"{'WSDP' if wsdp else 'WTDP'}_{'RSDP' if rsdp else 'RTDP'}_{mode_a}_{mode_b}"
+-        bram18 = timing.add_cell_variant("DEFAULT", f"RAMB18E1_RAMB18E1_{variant}")
++        bram18 = timing.add_cell_variant(grade, f"RAMB18E1_RAMB18E1_{variant}")
+ 
+         for entry in sdf.cells[("RAMBFIFO36E1", "RAMBFIFO36E1")].entries:
+             if isinstance(entry, parse_sdf.SetupHoldCheck):
+@@ -514,7 +544,7 @@
+                 if entry.to_pin == "DOBDOU": import_bus_clkq(bram18, "DOBDO", 16, "CLKARDCLK" if rsdp else "CLKBWRCLK", entry)
+                 if entry.to_pin == "DOPBDOPU": import_bus_clkq(bram18, "DOPBDOP", 2, "CLKARDCLK" if rsdp else "CLKBWRCLK", entry)
+ 
+-        bram36 = timing.add_cell_variant("DEFAULT", f"RAMB36E1_RAMB36E1_{variant}")
++        bram36 = timing.add_cell_variant(grade, f"RAMB36E1_RAMB36E1_{variant}")
+ 
+         for u in ('L', 'U'):
+             for entry in sdf.cells[("RAMBFIFO36E1", "RAMBFIFO36E1")].entries:
+@@ -548,6 +578,8 @@
+     parser.add_argument("--device", help="name of device to export", type=str, required=True)
+     parser.add_argument("--constids", help="name of nextpnr constids file to read", type=str, default=path.join(xlbase, "constids.inc"))
+     parser.add_argument("--bba", help="bba file to write", type=str, required=True)
++    parser.add_argument("--corners", action="store_true",
++        help="add the CORNERS speed grade: prjxray's fast and slow corner delays, for nextpnr's two-corner timing")
+     args = parser.parse_args()
+ 
+     # Init database paths
+@@ -574,7 +606,9 @@
+     # Init constant ids
+     ch = Chip("xilinx", args.device, d.width, d.height)
+     ch.strs.read_constids(path.join(path.dirname(__file__), args.constids))
+-    ch.set_speed_grades(["DEFAULT", ]) # TODO: figure out how speed grades are supposed to work in prjxray
++    global CORNERS
++    CORNERS = args.corners
++    ch.set_speed_grades(grades())
+     # Import tile types
+     for tile in d.tiles:
+         tile_type = tile.tile_type()
+@@ -630,46 +664,70 @@
+                         timing_class = f"node_c{node_cap}_c{node_res}"
+                         ch.add_node(node_wires, timing_class=timing_class)
+                         if timing_class not in seen_node_timings:
+-                            ch.timing.set_node_class("DEFAULT", timing_class, delay=TimingValue(0), cap=TimingValue(node_cap), res=TimingValue(node_res))
++                            for g in grades():
++                                ch.timing.set_node_class(g, timing_class, delay=TimingValue(0), cap=TimingValue(node_cap), res=TimingValue(node_res))
+                             seen_node_timings.add(timing_class)
+                     del node_wires
+                 seen_nodes.add(uid)
+     # Stub timing class
+-    ch.timing.set_pip_class("DEFAULT", "SITE_NULL", delay=TimingValue(20))
+-    # Stub bel timings. On virtex7 the LUT comb delay and the FF D/CK->Q
+-    # figures are replaced by the VC707 Vivado-oracle calibration
+-    # (docs/extracted-timing.md): nextpnr's generic guesses of 0.30 ns
+-    # clk->Q and 0.20 ns FF hold measured as low by 3x and 2x respectively
+-    # against Vivado's own probed paths.
+-    lut_delay = TimingValue(45, 124) if is_virtex7 else None
+-    ff_d_setup = TimingValue(34) if is_virtex7 else TimingValue(100, 100)
+-    ff_d_hold = TimingValue(87) if is_virtex7 else TimingValue(200, 200)
+-    ff_clk_q = TimingValue(100, 303) if is_virtex7 else TimingValue(300, 350)
+-    lut = ch.timing.add_cell_variant("DEFAULT", "SLICE_LUTX")
+-    for i in range(1, 6+1):
+-        lut.add_comb_arc(f"A{i}", "O6", lut_delay or TimingValue(100, 125))
+-        if i <= 5: lut.add_comb_arc(f"A{i}", "O5", lut_delay or TimingValue(120, 150))
+-    for i in range(1, 8+1):
+-        lut.add_setup_hold("CLK", f"WA{i}", ClockEdge.RISING, TimingValue(100, 500), TimingValue(100, 200))
+-    lut.add_setup_hold("CLK", "WE", ClockEdge.RISING, TimingValue(100, 600), TimingValue(100, 100))
+-    lut.add_setup_hold("CLK", "DI1", ClockEdge.RISING, TimingValue(100, 100), TimingValue(100, 100))
+-    ff = ch.timing.add_cell_variant("DEFAULT", "SLICE_FFX")
+-    ff.add_setup_hold("CK", "CE", ClockEdge.RISING, TimingValue(100, 100), TimingValue(0, 0))
+-    ff.add_setup_hold("CK", "SR", ClockEdge.RISING, TimingValue(100, 100), TimingValue(0, 0))
+-    ff.add_setup_hold("CK", "D", ClockEdge.RISING, ff_d_setup, ff_d_hold)
+-    ff.add_clock_out("CK", "Q", ClockEdge.RISING, ff_clk_q)
+-
+-    # Load SDF for carry and mux
+-    timings_root = xraydb_root
+-    if "kintex7" in xraydb_root: # TODO: missing
+-        timings_root = xraydb_root.replace("kintex7", "artix7")
+-    slicem_sdf = parse_sdf.parse_sdf_file(path.join(timings_root, "timings", "slicem.sdf"))
+-    mux = ch.timing.add_cell_variant("DEFAULT", "SELMUX2_1")
+-    import_sdf_timings(mux, slicem_sdf.cells[("SELMUX2_1", "SLICEM/F7BMUX")])
+-    carry = ch.timing.add_cell_variant("DEFAULT", "CARRY4")
+-    import_sdf_timings(carry, slicem_sdf.cells[("CARRY4", "SLICEM")])
++    for g in grades():
++        ch.timing.set_pip_class(g, "SITE_NULL", delay=TimingValue(20))
++    def cell_timings(grade):
++
++
++
++
++
++        lut_delay = TimingValue(45, 124) if is_virtex7 else None
++        ff_d_setup = TimingValue(34) if is_virtex7 else TimingValue(100, 100)
++        ff_d_hold = TimingValue(87) if is_virtex7 else TimingValue(200, 200)
++        ff_clk_q = TimingValue(100, 303) if is_virtex7 else TimingValue(300, 350)
++        if grade == "CORNERS":
++
++
++
++            clb = parse_sdf.parse_sdf_file(path.join(xraydb_root.replace("kintex7", "artix7"), "timings", "CLBLL_L.sdf"))
++            o6 = {e.from_pin: iopath_tv(e, True) for e in clb.cells[("LUT6", "SLICEL/A6LUT")].entries
++                  if isinstance(e, parse_sdf.IOPath)}
++            o5 = {e.from_pin: iopath_tv(e, True) for e in clb.cells[("LUT5", "SLICEL/A5LUT")].entries
++                  if isinstance(e, parse_sdf.IOPath)}
++            reg = clb.cells[("REG_INIT_FF", "SLICEL")]
++            ff_clk_q = next(iopath_tv(e, True) for e in reg.entries if isinstance(e, parse_sdf.IOPath))
++            chk = {e.pin: e for e in reg.entries if isinstance(e, parse_sdf.SetupHoldCheck)}
++            tv1 = lambda d: TimingValue(ps(d.minv), ps(d.maxv), ps(d.minv), ps(d.maxv))
++            ff_d_setup, ff_d_hold = tv1(chk["DIN"].setup), tv1(chk["DIN"].hold)
++        lut = ch.timing.add_cell_variant(grade, "SLICE_LUTX")
++        for i in range(1, 6+1):
++            if grade == "CORNERS":
++                lut.add_comb_arc(f"A{i}", "O6", o6[f"A{i}"])
++                if i <= 5: lut.add_comb_arc(f"A{i}", "O5", o5[f"A{i}"])
++                continue
++            lut.add_comb_arc(f"A{i}", "O6", lut_delay or TimingValue(100, 125))
++            if i <= 5: lut.add_comb_arc(f"A{i}", "O5", lut_delay or TimingValue(120, 150))
++        for i in range(1, 8+1):
++            lut.add_setup_hold("CLK", f"WA{i}", ClockEdge.RISING, TimingValue(100, 500), TimingValue(100, 200))
++        lut.add_setup_hold("CLK", "WE", ClockEdge.RISING, TimingValue(100, 600), TimingValue(100, 100))
++        lut.add_setup_hold("CLK", "DI1", ClockEdge.RISING, TimingValue(100, 100), TimingValue(100, 100))
++        ff = ch.timing.add_cell_variant(grade, "SLICE_FFX")
++        ff.add_setup_hold("CK", "CE", ClockEdge.RISING, TimingValue(100, 100), TimingValue(0, 0))
++        ff.add_setup_hold("CK", "SR", ClockEdge.RISING, TimingValue(100, 100), TimingValue(0, 0))
++        ff.add_setup_hold("CK", "D", ClockEdge.RISING, ff_d_setup, ff_d_hold)
++        ff.add_clock_out("CK", "Q", ClockEdge.RISING, ff_clk_q)
++
++
++        timings_root = xraydb_root
++        if "kintex7" in xraydb_root:
++            timings_root = xraydb_root.replace("kintex7", "artix7")
++        slicem_sdf = parse_sdf.parse_sdf_file(path.join(timings_root, "timings", "slicem.sdf"))
++        mux = ch.timing.add_cell_variant(grade, "SELMUX2_1")
++        import_sdf_timings(mux, slicem_sdf.cells[("SELMUX2_1", "SLICEM/F7BMUX")], grade == "CORNERS")
++        carry = ch.timing.add_cell_variant(grade, "CARRY4")
++        import_sdf_timings(carry, slicem_sdf.cells[("CARRY4", "SLICEM")], grade == "CORNERS")
++
++        import_bram_timings(ch.timing, parse_sdf.parse_sdf_file(path.join(timings_root, "timings", "BRAM_L.sdf")), is_virtex7, grade)
+ 
+-    import_bram_timings(ch.timing, parse_sdf.parse_sdf_file(path.join(timings_root, "timings", "BRAM_L.sdf")), is_virtex7)
++    for g in grades():
++        cell_timings(g)
+ 
+     # Import package pins
+     for package_name, package in sorted(d.packages.items(), key=lambda x:x[0]):
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -17,6 +17,7 @@
+  *
+  */
+ 
++#include <array>
+ #include <boost/algorithm/string.hpp>
+ #include <queue>
+ #include <regex>
+@@ -33,6 +34,7 @@
+ 
+ #include "xilinx.h"
+ #include <fstream>
++#include <array>
+ #include <boost/algorithm/string.hpp>
+ 
+ #include "himbaechel_helpers.h"
+@@ -98,6 +100,10 @@
+     specific.add_options()("bram-place", po::value<std::string>(),
+                            "place block RAMs by read-mux group and the rest again around them: on (default; dies with "
+                            "measured clock delays only), off, or force (any die); see bram_place.cc");
++    specific.add_options()("timing-corners", po::value<std::string>()->implicit_value(""),
++                           "after routing, also time the design at the Slow and the Fast process corner and report "
++                           "both (report only; needs a chipdb made with xilinx_gen.py --corners); the optional value "
++                           "is the factor on the RC part of route delays at the Fast corner (default 1)");
+     specific.add_options()("timing-opt", po::value<std::string>(),
+                            "after placing, the timing-driven placement optimisation on the critical paths: R[,N] moves a "
+                            "cell up to R tiles, N rounds (default 30); off unless given");
+@@ -1052,7 +1058,13 @@
+     // BUFGCTRL I -> O, from prjxray's CLK_BUFG_*.sdf (fast min, slow max), which the chipdb leaves out
+     const bool is_bufg_arc = cell->type == id_BUFGCTRL && fromPort.in(id_I0, id_I1) && toPort == id_O;
+     if (is_bufg_arc) {
+-        delay = DelayQuad(ctx->getDelayFromNS(0.026), ctx->getDelayFromNS(0.096));
++
++        if (ctx->timing_corner == 1)
++            delay = DelayQuad(ctx->getDelayFromNS(0.091), ctx->getDelayFromNS(0.096));
++        else if (ctx->timing_corner == 2)
++            delay = DelayQuad(ctx->getDelayFromNS(0.026), ctx->getDelayFromNS(0.029));
++        else
++            delay = DelayQuad(ctx->getDelayFromNS(0.026), ctx->getDelayFromNS(0.096));
+         return true;
+     }
+     const std::string type = cell->type.str(ctx);
+@@ -1085,6 +1097,25 @@
+         return false;
+     }
+     delay = DelayQuad(ctx->getDelayFromNS(found->second));
++    if (ctx->timing_corner != 0) {
++
++
++
++        static const dict<std::string, std::array<double, 4>> corner_ns = {
++                {"LVCMOS33", {0.257, 0.445, 1.418, 1.489}},
++                {"LVCMOS33/12/SLOW", {1.407, 1.407, 3.506, 3.569}},
++        };
++        auto c = corner_ns.find(key);
++        if (c == corner_ns.end()) {
++            if (warned_pad_buffers.insert(key + "/corners").second)
++                log_warning("no per-corner %s buffer delay is known for %s; both corners use %.3f ns\n",
++                            is_input ? "input" : "output", key.c_str(), found->second);
++            return true;
++        }
++        const auto &v = c->second;
++        const int i = ctx->timing_corner == 1 ? 2 : 0;
++        delay = DelayQuad(ctx->getDelayFromNS(v[i]), ctx->getDelayFromNS(v[i + 1]));
++    }
+     return true;
+ }
+ 

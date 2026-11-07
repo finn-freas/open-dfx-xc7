@@ -16,6 +16,8 @@ def main():
     import build_pr_native as b
     b.CONFIG["designs"][CONFIG["design_name"]] = job["design"]
     b.CONFIG["chipdb"] = job["chipdb"]
+    if job.get("db_root"):
+        b.CONFIG["variants"][job["variant"]]["db_root"] = job["db_root"]
     if job.get("npwait"):
         var = b.CONFIG["variants"][job["variant"]]
         os.environ["OFX_NEXTPNR_BIN"] = str(b.ROOT / var["nextpnr"])

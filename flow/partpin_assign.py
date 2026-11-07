@@ -1,5 +1,6 @@
 import argparse
 import collections
+import fnmatch
 import json
 import pickle
 import re
@@ -39,6 +40,82 @@ CONFIG = {
 }
 
 XY_RE = re.compile(r"X(\d+)Y(\d+)")
+
+
+PARTPIN_RE = re.compile(r"^\s*set_property\s+(?:-dict\s+\{\s*)?(HD\.PARTPIN_(?:LOCS|RANGE))\s+(\{[^}]*\}|\S+)\s*\}?\s+"
+                        r"\[\s*get_pins\s+(.*)\]\s*$")
+
+
+def xdc_partpins(path):
+    """HD.PARTPIN_LOCS / HD.PARTPIN_RANGE lines of a Vivado XDC: [(line, prop, value tokens, pin patterns)]."""
+    out = []
+    for k, line in enumerate(Path(path).read_text().splitlines(), 1):
+        line = line.split("#", 1)[0].strip() if not line.lstrip().startswith("#") else ""
+        if "HD.PARTPIN_" not in line:
+            continue
+        m = PARTPIN_RE.match(line)
+        if not m:
+            sys.exit(f"{path}:{k}: cannot read '{line}' (expected set_property HD.PARTPIN_LOCS|HD.PARTPIN_RANGE "
+                     "<value> [get_pins <pins>])")
+        val = m.group(2).strip("{}").split()
+        pins = m.group(3).strip()
+        if pins.startswith("-hier"):
+            pins = pins.split(None, 1)[1]
+        pats = [q for q in re.findall(r"\{([^}]*)\}|(\S+)", pins) for q in q if q]
+        out.append((k, m.group(1), val, pats))
+    return out
+
+
+def tile_rect(grid, spec):
+    """INT tiles of a Vivado range: SLICE_/RAMB/DSP site ranges (region.region_tiles) or INT_L/INT_R tile ranges."""
+    tiles = set()
+    for part in spec:
+        if part.startswith("INT_"):
+            a, _, b = part.partition(":")
+            b = b or a
+            (xa, ya), (xb, yb) = [tuple(map(int, XY_RE.search(t).groups())) for t in (a, b)]
+            for t, v in grid.items():
+                if v["type"] in CONFIG["pin_tile_types"]:
+                    x, y = map(int, XY_RE.search(t).groups())
+                    if min(xa, xb) <= x <= max(xa, xb) and min(ya, yb) <= y <= max(ya, yb):
+                        tiles.add(t)
+        else:
+            tiles |= {t for t in region.region_tiles(grid, part) if grid[t]["type"] in CONFIG["pin_tile_types"]}
+    return tiles
+
+
+def apply_xdc(nets, grid, path):
+    """Restrict each constrained net's candidate tiles; returns the record written to the .json."""
+    inst = CONFIG["rm_inst"]
+    names = {f"{inst}/{n['port']}[{n['bit']}]": n for n in nets}
+    names |= {f"{inst}/{n['port']}": n for n in nets if n["width"] == 1}
+    rec = []
+    for k, prop, val, pats in xdc_partpins(path):
+        hit = sorted({id(n): n for q in pats for nm, n in names.items()
+                      if nm == q or fnmatch.fnmatchcase(nm, glob_escape(q))}.values(),
+                     key=lambda n: (n["port"], n["bit"]))
+        if not hit:
+            sys.exit(f"{path}:{k}: {prop} matches no boundary pin of {inst} ({pats})")
+        if prop == "HD.PARTPIN_LOCS":
+            if len(val) != 1 or not val[0].startswith("INT_") or val[0] not in grid:
+                sys.exit(f"{path}:{k}: HD.PARTPIN_LOCS needs one interconnect tile name (INT_L_X..Y.. / INT_R_X..Y..), "
+                         f"got {val}")
+            allowed = {val[0]}
+        else:
+            allowed = tile_rect(grid, val)
+            if not allowed:
+                sys.exit(f"{path}:{k}: HD.PARTPIN_RANGE {val} covers no interconnect tile")
+        for n in hit:
+            n["allowed_tiles"] = (n.get("allowed_tiles", allowed) & allowed)
+            if not n["allowed_tiles"]:
+                sys.exit(f"{path}:{k}: {n['port']}[{n['bit']}]: no tile left after combining its HD.PARTPIN constraints")
+        rec.append({"line": k, "property": prop, "value": val, "pins": len(hit), "tiles": len(allowed)})
+    return rec
+
+
+def glob_escape(q):
+    """Vivado get_pins pattern -> fnmatch: '*' and '?' are wildcards, brackets are literal."""
+    return "".join("[[]" if ch == "[" else "[]]" if ch == "]" else ch for ch in q)
 
 
 def xy_name(t):
@@ -218,7 +295,10 @@ def assign(nets, cand):
     for n in nets:
         scored = []
         me = n.get("module_end") if CONFIG["module_ends"] else None
+        allowed = n.get("allowed_tiles")
         for k, c in enumerate(by_dir[n["dir"]]):
+            if allowed is not None and c["tile"] not in allowed:
+                continue
             s = CONFIG["w_static"] * static_dist(n, c)
             if me is not None:
                 t = CONFIG["w_module"] * (abs(c["xy"][0] - me[0]) + abs(c["xy"][1] - me[1]))
@@ -244,8 +324,10 @@ def assign(nets, cand):
                 if len(best) == 2:
                     break
             if not best:
-                sys.exit(f"{name}: no free candidate within the {CONFIG['keep_per_net']} nearest; raise tile_cap "
-                         f"or keep_per_net")
+                extra = " (HD.PARTPIN constraints from the XDC limit it to " \
+                        f"{len(todo[name]['allowed_tiles'])} tile(s))" if todo[name].get("allowed_tiles") else ""
+                sys.exit(f"{name}: no free candidate within the {CONFIG['keep_per_net']} nearest{extra}; raise "
+                         f"tile_cap or keep_per_net")
             best.sort(key=lambda b: b[0])
             regret = best[1][0] - best[0][0] if len(best) > 1 else float("inf")
             key = (-regret, best[0][0], name)
@@ -271,6 +353,10 @@ def cmd_assign(a):
     m = partpins.top_module(json.loads(Path(a.placed_json).read_text()))
     nets = boundary_nets(m, a.static_synth, spec)
     endpoints(m, nets, replay_dump.site_map(grid))
+    xrec = apply_xdc(nets, grid, a.xdc) if a.xdc else None
+    if xrec is not None:
+        print(f"HD.PARTPIN constraints from {a.xdc}: {len(xrec)} line(s), "
+              f"{sum(1 for n in nets if 'allowed_tiles' in n)} of {len(nets)} pins constrained")
     res, band = assign(nets, cand)
     pins = []
     for n in nets:
@@ -280,6 +366,8 @@ def cmd_assign(a):
                      "target_y": n["target_y"], "static_dist": s, "slice_dev": t, "cost": cost})
         if CONFIG["module_ends"]:
             pins[-1]["module_end"] = n["module_end"]
+        if "allowed_tiles" in n:
+            pins[-1]["xdc_tiles"] = len(n["allowed_tiles"])
     per_tile = collections.Counter(p["tile_xy"] for p in pins)
     summary = {
         "region": a.region, "placed_json": a.placed_json, "config": {k: (str(v) if isinstance(v, Path) else v)
@@ -294,6 +382,8 @@ def cmd_assign(a):
         "static_dist_mean": sum(p["static_dist"] for p in pins) / len(pins),
         "static_dist_max": max(p["static_dist"] for p in pins),
     }
+    if xrec is not None:
+        summary["xdc_partpins"] = {"xdc": a.xdc, "lines": xrec}
     outs[0].write_text("".join(f"{p['net']}\t{p['wire']}\n" for p in pins))
     outs[1].write_text(json.dumps(summary, indent=1) + "\n")
     if a.endpoint_cells:
@@ -465,6 +555,8 @@ def main():
                         "module-side cells (w_module) instead of a bit-slice target row")
     s.add_argument("--w-module", type=float, default=CONFIG["w_module"])
     s.add_argument("--keep-per-net", type=int, default=CONFIG["keep_per_net"])
+    s.add_argument("--xdc", help="Vivado XDC with HD.PARTPIN_LOCS (one INT tile) and HD.PARTPIN_RANGE (SLICE or INT "
+                                 "tile ranges) on the partition's pins; each constrained pin is placed only there")
     s.add_argument("--exclude-wrap-exits", action="store_true",
                    help="also drop a candidate whose wires outside the region are all _N/_S wrap aliases (nextpnr's "
                         "node has no such wire, so the pin has no route out)")

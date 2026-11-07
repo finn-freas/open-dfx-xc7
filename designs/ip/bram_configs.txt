@@ -1,0 +1,10 @@
+# ofx ip bram vs Vivado blk_mem_gen_v8_4 (xc7a35tcsg324-1): name then Vivado CONFIG properties (key=value).
+# Every config loads designs/ip/bram/<name>.coe (written by flow/ip_compare.py bram --prep) and is built inside
+# designs/ip/bram/<name>_top.v to a bitstream in both flows; the BRAM INIT/INITP bits are compared.
+b01 Memory_Type=Single_Port_RAM Write_Width_A=32 Read_Width_A=32 Write_Depth_A=1024 Register_PortA_Output_of_Memory_Primitives=false
+b02 Memory_Type=Single_Port_ROM Write_Width_A=8 Read_Width_A=8 Write_Depth_A=4096 Register_PortA_Output_of_Memory_Primitives=true
+b03 Memory_Type=True_Dual_Port_RAM Write_Width_A=16 Read_Width_A=16 Write_Width_B=16 Read_Width_B=16 Write_Depth_A=2048 Register_PortA_Output_of_Memory_Primitives=false Register_PortB_Output_of_Memory_Primitives=false
+b04 Memory_Type=Simple_Dual_Port_RAM Write_Width_A=36 Read_Width_A=36 Write_Width_B=36 Read_Width_B=36 Write_Depth_A=512 Register_PortB_Output_of_Memory_Primitives=true
+b05 Memory_Type=Single_Port_ROM Write_Width_A=18 Read_Width_A=18 Write_Depth_A=1024 Register_PortA_Output_of_Memory_Primitives=false
+b06 Memory_Type=Single_Port_ROM Write_Width_A=64 Read_Width_A=64 Write_Depth_A=2048 Register_PortA_Output_of_Memory_Primitives=false
+b07 Memory_Type=Single_Port_RAM Write_Width_A=72 Read_Width_A=72 Write_Depth_A=512 Register_PortA_Output_of_Memory_Primitives=false

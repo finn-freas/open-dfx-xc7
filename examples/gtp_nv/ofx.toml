@@ -1,0 +1,10 @@
+[project]
+name = "gtp_nv"
+top = "gtp_nv"
+part = "xc7a200tsbg484-1"
+sources = ["src/gtp_nv.v"]
+constraints = ["constraints/gtp_nv.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

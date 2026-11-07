@@ -8,6 +8,7 @@ FORMAL_TIMEOUT="${FORMAL_TIMEOUT:-600}"
 FORMAL_MEM_KB="${FORMAL_MEM_KB:-3000000}"
 TAGP="${TAGP:-rv2}"
 STAGES="${STAGES:-partials full}"
+OTHER_REGION="${OTHER_REGION:-1}"
 cd "$(dirname "$0")/.."
 mkdir -p "$OUT" "$BMO"
 mapfile -t RPN < <(awk '{print $1}' "$NAT/region.txt")
@@ -101,17 +102,29 @@ for t in $CFGS; do
     rp=${RPN[$k]}
     n="${rp}_${t}_from_${s}"
     p="$OUT/$n"
+    oth=()
+    if [ "$OTHER_REGION" = 1 ]; then
+      for ((j = 0; j < NRP; j++)); do [ $j = $k ] || oth+=(--other-region "${RPR[$j]}"); done
+    fi
     if ! python3 flow/partial.py "${DIR[$t]}/$TOP.bit" "$p" --design "$TOP" --region "${RPR[$k]}" \
-         --fasm "${DIR[$t]}/$TOP.fasm" --static-pips "$NAT/static.prerouted" --base "${DIR[$s]}/$TOP.bit" --simulate > "$p.log" 2>&1
+         --fasm "${DIR[$t]}/$TOP.fasm" --static-pips "$NAT/static.prerouted" --base "${DIR[$s]}/$TOP.bit" --simulate \
+         "${oth[@]}" > "$p.log" 2>&1
     then echo "FAIL partial $n ($p.log)"; fail=1; continue; fi
+    orc="other-region check not run"
+    if [ "$OTHER_REGION" = 1 ]; then
+      orc=$(grep -oE 'other partition [^ ]+: [0-9]+ configuration frame\(s\) shared with this region, [0-9]+ of its frames written' "$p.log" | sed 's/ configuration frame(s) shared with this region,/ shared,/' | paste -sd ';' -)
+      [ -n "$orc" ] || orc="other-region check MISSING"
+    fi
     sim=$(grep -oE 'crc: OK; base \+ partial == target: True \(0 frames differ\)' "$p.log")
     pad=$(grep -oE 'region check: [0-9]+ frame\(s\) outside region, all of them run-end pad frames: True; pad frames carry the full bitstream.s own content: True' "$p.log" | grep -oE '^region check: [0-9]+')
     g=$(gate "$p.bit" "$k" "$p.log"); gok=$?
     "$BM" XS7 -w -i main "${DIR[$s]}/$TOP.bit" -i main "$p.bit" -o full "$BMO/$n.bit" > "$BMO/$n.log" 2>&1
     bmr=$(cmp_target "$BMO/$n.bit" "${DIR[$t]}/$TOP.bit" "${DIR[$s]}/$TOP.bit"); bok=$?
     rr=$(r2v "$BMO/$n.bit" "$k" "$(rm_of $t $k)" "${TAGP}_bm_$n" "$p.r2v.log" 0); rok=$?
-    if [ -n "$sim" ] && [ -n "$pad" ] && [ $gok = 0 ] && [ $bok = 0 ] && [ $rok = 0 ]; then v=PASS; else v=FAIL; fail=1; fi
-    echo "$v $n: $(stat -c %s "$p.bit") bytes; ${sim:-simulated load NOT exact}; ${pad:-pad check missing} pad frame(s) carry target content; gate: $g; byteman vs original target: $bmr; region2v on byteman result: $rr"
+    ook=0
+    [ "$orc" = "other-region check MISSING" ] && ook=1
+    if [ -n "$sim" ] && [ -n "$pad" ] && [ $gok = 0 ] && [ $bok = 0 ] && [ $rok = 0 ] && [ $ook = 0 ]; then v=PASS; else v=FAIL; fail=1; fi
+    echo "$v $n: $(stat -c %s "$p.bit") bytes; ${sim:-simulated load NOT exact}; ${pad:-pad check missing} pad frame(s) carry target content; gate: $g; $orc; byteman vs original target: $bmr; region2v on byteman result: $rr"
     for ((j = 0; j < NRP; j++)); do
       [ $j = $k ] && continue
       [ -n "${NEGDONE[$k]}" ] && continue

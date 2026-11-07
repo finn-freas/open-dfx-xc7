@@ -1,0 +1,10 @@
+[project]
+name = "gtp_lb"
+top = "gtp_lb"
+part = "xc7a35tcpg236-1"
+sources = ["src/gtp_lb.v"]
+constraints = ["constraints/gtp_lb.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

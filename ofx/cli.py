@@ -11,6 +11,7 @@ from pathlib import Path
 from . import BOARDS, FLOW, ROOT, VERSION
 from . import project as P
 from . import defaults, reports, runner, templates, timing, vhdl
+from . import cli_ip
 from . import drc as drcmod
 from . import power as powermod
 from .stage import stage
@@ -20,6 +21,7 @@ CONFIG = {
     "py": sys.executable,
     "openfpgaloader": ROOT / "toolchain" / "oss-cad-suite" / "bin" / "openFPGALoader",
     "openfpgaloader_partial": ROOT / "build" / "ofl-build" / "partial" / "openFPGALoader",
+    "openfpgaloader_release": ROOT / "toolchain" / "openxc7" / "bin" / "openFPGALoader",
     "byteman": ROOT / "toolchain" / "byteman-build" / "byteman",
     "nextpnr_stock": ROOT / "toolchain" / "openxc7" / "bin" / "nextpnr-xilinx",
     "icap_loader": ROOT / "host" / "icap_load.ps1",
@@ -197,11 +199,17 @@ def cmd_build(a):
         sys.exit(f"ofx: {e}")
     if dp["release"]:
         extra["defaults"] = dp
+    ref = None
+    if getattr(a, "incremental", None):
+        ref = incremental_ref(proj, Path(a.incremental), dry)
+        extra["incremental"] = runner.digest([ref / f"{proj.top}_routed.json"], {}) if not dry else str(ref)
     key = runner.digest(st["inputs"] + [st["xdc"]], extra)
     runner.fresh(out, key, dry)
     npa, npe = timing_nextpnr_args(proj)
     cmd = [CONFIG["py"], runner.flow("build_openxc7.py"), st["dir"], "--top", proj.top, "--xdc", st["xdc"],
            "--part", proj.part, "--seed", str(proj.seed), "--out", out] + npa
+    if proj.device.get("db_extra"):
+        cmd += ["--chipdb", proj.device["chipdb"], "--db-root", proj.device["db_root"]]
     cmd += defaults_args(dp)
     rtl = ["--rtl"] + [str(s) for s in st["sources"]]
     for n in dp["notes"]:
@@ -220,11 +228,50 @@ def cmd_build(a):
             cmd += ["--chipdb", dec["chipdb"]]
         if not dry:
             (out / "ofx_defaults.json").write_text(json.dumps({**dp, "decision": dec}, indent=1) + "\n")
+    if ref is not None:
+        cmd = incremental_cmd(proj, cmd, rtl, ref, out, st["xdc"], dry, {**env_for(proj), **npe},
+                              getattr(a, "incremental_routes", False))
     if not dry:
         cmd.append("--run")
-    runner.run(cmd + rtl, env={**env_for(proj), **npe})
+    runner.run(cmd + ([] if ref is not None else rtl), env={**env_for(proj), **npe})
     if not dry:
         reports.print_report([out])
+
+
+def incremental_ref(proj, ref, dry):
+    """The reference build of `ofx build --incremental`: a build directory with <top>.json and <top>_routed.json.
+    The project's own impl directory is copied aside first, since this build replaces it."""
+    ref = ref.resolve()
+    need = [ref / f"{proj.top}.json", ref / f"{proj.top}_routed.json"]
+    if not all(f.exists() for f in need):
+        if dry:
+            return ref
+        sys.exit(f"ofx build --incremental: {ref} has no {need[0].name} and {need[1].name} (a finished ofx build)")
+    if ref == impl_dir(proj).resolve():
+        keep = proj.build / "incremental_ref"
+        print(f"[{'dry' if dry else 'run'}] copy the reference {ref} to {keep}", flush=True)
+        if not dry:
+            keep.mkdir(parents=True, exist_ok=True)
+            for f in need:
+                shutil.copy(f, keep / f.name)
+        ref = keep
+    return ref
+
+
+def incremental_cmd(proj, cmd, rtl, ref, out, xdc, dry, env, routes=False):
+    """Synthesize into <impl>/synth, match it to the reference (flow/incremental.py), and return the build
+    command that places and routes the matched netlist with the reference's placement replayed (whole tiles),
+    and with routes=True its routing too (faster, but worse timing on rv_soc: docs/incremental.md)"""
+    syn, inc = out / "synth", out / "incremental"
+    i = cmd.index("--out")
+    scmd = cmd[:i + 1] + [syn] + cmd[i + 2:]
+    runner.run(scmd + ["--stop-after", "yosys"] + ([] if dry else ["--run"]) + rtl, env=env)
+    runner.run([CONFIG["py"], runner.flow("incremental.py"), ref, syn / f"{proj.top}.json", inc, "--top", proj.top,
+                "--xdc", xdc, "--ripple", "0"] + ([] if routes else ["--whole-tiles"]), dry=dry)
+    j = cmd.index("--xdc")
+    cmd = cmd[:j + 1] + [inc / "inc.xdc"] + cmd[j + 2:]
+    cmd = cmd + ["--json", inc / f"{proj.top}.json", "--opt", f"preplaced={inc / 'inc.preplaced'}"]
+    return cmd + (["--opt", f"prerouted={inc / 'inc.prerouted'}"] if routes else [])
 
 
 def defaults_args(dp):
@@ -303,7 +350,7 @@ def cmd_report(a):
     if not dirs:
         sys.exit("ofx report: nothing built yet")
     print(f"project {proj.name}: part {proj.part} (family {proj.device['family']}, fabric {proj.device['fabric']})")
-    reports.print_report(dirs)
+    reports.print_report(dirs, [q["inst"] for q in proj.dfx["partitions"]] if a.dfx and proj.dfx else ())
 
 
 def design_dict(proj, st):
@@ -329,6 +376,11 @@ def design_dict(proj, st):
         return d
     if dfx["partpins"] == "auto":
         d.update({"shell_spec": str(st["specs"][p["name"]]), "partpins": "auto", "pp_register": p["register"]})
+        ppx = [str(Path(c).resolve()) for c in proj.constraints if "HD.PARTPIN_" in Path(c).read_text()]
+        if len(ppx) > 1:
+            sys.exit(f"ofx: HD.PARTPIN constraints in more than one XDC ({ppx}); keep them in one file")
+        if ppx:
+            d["partpin_xdc"] = ppx[0]
     elif p["shell"]:
         d["rm_shell"] = str(p["shell"])
     else:
@@ -340,6 +392,57 @@ def dfx_inputs(proj, st):
     files = st["inputs"] + [st["xdc"]] + [v for q in proj.dfx["partitions"] for v in q["rms"].values()]
     files += [st["specs"][q["name"]] for q in proj.dfx["partitions"]] + [q["shell"] for q in proj.dfx["partitions"] if q["shell"]]
     return files
+
+
+RM_OUTPUTS = ("{rm}_n", "{rm}_n_taf", "{rm}_p", "rm_{rm}_synth.*", "cfg_{rm}_linked.*", "cfg_{rm}_proxy.*",
+              "{rm}_place.*", "{rm}_static_place.*", "partials/rm_{rm}_from_*", "partials/rm_*_from_{rm}.*",
+              "checks/*_{rm}_n*", "verify/*{rm}*")
+
+
+def static_rms(proj, a, dd):
+    """RMs whose content the static implementation depends on: the first (anchor) RM in anchors mode, none with
+    automatic partition pins (static is placed and routed against a greybox)."""
+    if dd.get("partpins") == "auto" and not dd.get("place_union"):
+        return []
+    if dd.get("place_union"):
+        return list(dd["place_union"])
+    return [(a.rms or proj.dfx["partitions"][0]["default_rms"])[0]]
+
+
+def child_runs(proj, st, dd, dkey, key, a, dry):
+    """Vivado's child runs: when only RMs were added, removed or changed and the static implementation's inputs are
+    the same, keep static (and every unchanged RM build) and remove only the outputs of the changed RMs. Returns True
+    when it handled the stamp; otherwise (several partitions, first build, unchanged inputs, changed static inputs)
+    the caller's runner.fresh decides, and the stamp gets the per-RM keys."""
+    root = dfx_root(proj)
+    stamp = root / runner.CONFIG["stamp"]
+    if len(proj.dfx["partitions"]) != 1:
+        return False
+    q = proj.dfx["partitions"][0]
+    rms = st["rms"][q["name"]]
+    srm = static_rms(proj, a, dd)
+    sdd = {k: v for k, v in dd.items() if k not in ("rms", "default_rms")}
+    sdd["static_rms"] = {r: str(rms[r]) for r in srm if r in rms}
+    sfiles = [f for f in dfx_inputs(proj, st) if f not in rms.values()] + [rms[r] for r in srm if r in rms]
+    skey = runner.digest(sfiles, dict(dkey, design=sdd))
+    rkeys = {r: runner.digest([f], {}) for r, f in rms.items()}
+    rec = {"inputs": key, "static": skey, "rms": rkeys}
+    old = json.loads(stamp.read_text()) if stamp.exists() else None
+    if old is None or old.get("inputs") == key or old.get("static") != skey:
+        if not dry:
+            runner.fresh(root, key, dry)
+            stamp.write_text(json.dumps(rec) + "\n")
+        return False
+    changed = sorted(r for r in set(old.get("rms", {})) | set(rkeys) if old.get("rms", {}).get(r) != rkeys.get(r))
+    out = dfx_out(proj)
+    gone = [x for r in changed for pat in RM_OUTPUTS for x in sorted(out.glob(pat.format(rm=r)))]
+    print(f"[{'dry' if dry else 'run'}] static inputs unchanged: child runs for RM(s) {changed}; keeping static and "
+          f"the other RM builds; removing {len(gone)} output(s) of the changed RMs", flush=True)
+    if not dry:
+        for x in gone:
+            shutil.rmtree(x) if x.is_dir() else x.unlink()
+        stamp.write_text(json.dumps(rec) + "\n")
+    return True
 
 
 def cmd_dfx_build(a):
@@ -359,7 +462,8 @@ def cmd_dfx_build(a):
         if proj.vhdl_generics:
             dkey["vhdl"]["generics"] = proj.vhdl_generics
     key = runner.digest(dfx_inputs(proj, st), dkey)
-    runner.fresh(dfx_root(proj), key, dry)
+    if not child_runs(proj, st, dd, dkey, key, a, dry):
+        runner.fresh(dfx_root(proj), key, dry)
     argv = []
     if len(proj.dfx["partitions"]) == 1:
         argv += ["--rms"] + (a.rms or proj.dfx["partitions"][0]["default_rms"])
@@ -369,6 +473,8 @@ def cmd_dfx_build(a):
         argv.append("--run")
     job = {"flow": str(FLOW), "design": dd, "argv": argv, "chipdb": proj.device["chipdb"],
            "variant": proj.dfx["variant"]}
+    if proj.device.get("db_extra"):
+        job["db_root"] = proj.device["db_root"]
     if runner.nextpnr_limit() is not None:
         job["npwait"] = str(runner.CONFIG["npwait"])
     jf = dfx_root(proj) / "ofx_job.json"
@@ -603,9 +709,11 @@ def cmd_dfx_load(a):
     print(f"safety record OK: region {r['region']}, {r['region_frames']} frames, sha256 {r['sha256'][:16]}..., "
           f"simulated from {Path(r['simulated']['base']).parent.name}")
     if a.via == "jtag":
-        if not CONFIG["openfpgaloader_partial"].exists():
-            sys.exit(f"ofx: {CONFIG['openfpgaloader_partial']} not built (docs/drafts/openfpgaloader-partial.md)")
-        cmd = [CONFIG["openfpgaloader_partial"], "-b", board_ofl(proj, a), "--partial", b.with_suffix(".bit")]
+        ofl = next((x for x in (CONFIG["openfpgaloader_release"], CONFIG["openfpgaloader_partial"]) if x.exists()), None)
+        if ofl is None:
+            sys.exit(f"ofx: no openFPGALoader with --partial: neither the release install's {CONFIG['openfpgaloader_release']} "
+                     f"nor {CONFIG['openfpgaloader_partial']} (docs/drafts/openfpgaloader-partial.md)")
+        cmd = [ofl, "-b", board_ofl(proj, a), "--partial", b.with_suffix(".bit")]
         runner.run(cmd, dry=dry)
     else:
         cmd = [CONFIG["powershell"], "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", winpath(CONFIG["icap_loader"]),
@@ -643,6 +751,12 @@ def main(argv=None):
     dv.set_defaults(fn=cmd_device)
     b = sub.add_parser("build", help="synth, place and route, bitstream (dry run unless --run)")
     b.add_argument("--run", action="store_true")
+    b.add_argument("--incremental", metavar="REF",
+                   help="reuse the placement and routing of a reference build (its impl directory) for every cell "
+                        "and net the design change left alone, like Vivado's read_checkpoint -incremental "
+                        "(flow/incremental.py)")
+    b.add_argument("--incremental-routes", action="store_true",
+                   help="with --incremental, also replay the reference's routes (slice-level reuse)")
     b.set_defaults(fn=cmd_build)
     pr = sub.add_parser("program", help="program the board with openFPGALoader (dry run unless --run)")
     pr.add_argument("--flash", action="store_true", help="write the SPI flash instead of SRAM")
@@ -705,5 +819,6 @@ def main(argv=None):
     dl.add_argument("--board", help="openFPGALoader board name for --via jtag")
     dl.add_argument("--run", action="store_true")
     dl.set_defaults(fn=cmd_dfx_load)
+    cli_ip.add_parsers(sub)
     a = ap.parse_args(argv)
     a.fn(a)

@@ -113,10 +113,10 @@ cmp_frames() {
     fi
 }
 path_only() {
-    python3 - "$1" "$2" "$WORK" "$REPO" "$PREFIX/opt/oss-cad-suite" <<'PY'
+    python3 - "$1" "$2" "$WORK" "$REPO" "$PREFIX/opt/oss-cad-suite" "$(realpath -m "$PREFIX/opt/oss-cad-suite")" <<'PY'
 import sys
 from pathlib import Path
-mine, ref, work, repo, ocs = sys.argv[1:]
+mine, ref, work, repo, ocs, ocs_real = sys.argv[1:]
 a = sorted(Path(mine).glob("*.json"))
 a = [p for p in a if not p.name.endswith(("_routed.json", "report.json", "versions.json"))]
 if not a or not (Path(ref) / a[0].name).exists():
@@ -125,7 +125,7 @@ x = a[0].read_text()
 y = (Path(ref) / a[0].name).read_text()
 if x == y:
     sys.exit(1)
-x = x.replace(ocs, repo + "/toolchain/oss-cad-suite").replace(work, repo)
+x = x.replace(ocs_real, repo + "/toolchain/oss-cad-suite").replace(ocs, repo + "/toolchain/oss-cad-suite").replace(work, repo)
 sys.exit(0 if x == y else 1)
 PY
 }

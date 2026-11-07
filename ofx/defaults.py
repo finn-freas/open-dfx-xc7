@@ -17,9 +17,9 @@ CONFIG = {
     "cal_chipdb": "share/nextpnr/himbaechel/xilinx/cal/chipdb-{fabric}.bin",
     "ofx_chipdb": "share/nextpnr/himbaechel/xilinx/ofx/chipdb-{fabric}.bin",
     "cal_parts": r"^xc7a35t\w*-1$",
-    "static_max_cells": 3000,
+    "static_max_cells": None,
     "defaults": {
-        "hardblock_timing": False,
+        "hardblock_timing": True,
         "dsp_cascade": True,
         "dsp_pipeline": False,
         "async_reg": True,
@@ -139,10 +139,13 @@ def netlist_info(json_file, top):
 def placer_args(p, cells=None):
     choice = p["placer"]
     if choice == "auto":
+        limit = CONFIG["static_max_cells"]
+        if limit is None:
+            return ["--placer", "static"], "placer: static (auto: static at every size)"
         if cells is None:
-            return None, "placer: auto (static up to %d cells, else heap; decided after synthesis)" % CONFIG["static_max_cells"]
-        choice = "static" if cells <= CONFIG["static_max_cells"] else "heap"
-        why = f"placer: {choice} ({cells} cells, static up to {CONFIG['static_max_cells']})"
+            return None, "placer: auto (static up to %d cells, else heap; decided after synthesis)" % limit
+        choice = "static" if cells <= limit else "heap"
+        why = f"placer: {choice} ({cells} cells, static up to {limit})"
     else:
         why = f"placer: {choice} (set in [build])"
     return (["--placer", "static"] if choice == "static" else []), why

@@ -1,6 +1,7 @@
 param(
     [string[]]$Names = @(),
     [string]$Tag = "xdc",
+    [string]$Script = "build_xdc.tcl",
     [switch]$Run
 )
 $Names = @($Names | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -9,7 +10,7 @@ $CONFIG = @{
     WslProject = "\\wsl.localhost\Ubuntu\home\finnf\open-dfx-xc7"
     WinWork    = "$HOME\open-dfx-xc7-vivado"
     VivadoDirs = @("C:\AMDDesignTools\2025.2\Vivado\bin", "C:\Xilinx\Vivado\2025.2\bin", "C:\Xilinx\2025.2\Vivado\bin")
-    Script     = "build_xdc.tcl"
+    Script     = $Script
     Designs    = "designs\xdc"
     DryRun     = $true
 }
