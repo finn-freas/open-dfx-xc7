@@ -1,0 +1,11 @@
+[project]
+name = "ps7_axi_z7"
+top = "ps7_axi_z7"
+board = "zybo-z7-20"
+sources = ["src/ps7_axi_z7.v", "src/axi_regs.v"]
+constraints = ["constraints/ps7_axi_z7.xdc"]
+seed = 1
+
+[zynq]
+app = ["sw/start.S", "sw/main.c"]
+app_ld = "sw/link.ld"

@@ -1,0 +1,10 @@
+[project]
+name = "blinky_z035"
+top = "blinky_z035"
+part = "xc7z035ffg676-1"
+sources = ["src/blinky_z035.v"]
+constraints = ["constraints/blinky_z035.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

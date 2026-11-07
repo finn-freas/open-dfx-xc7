@@ -1,0 +1,76 @@
+--- a/himbaechel/uarch/xilinx/gen/xilinx_gen.py
++++ b/himbaechel/uarch/xilinx/gen/xilinx_gen.py
+@@ -7,8 +7,24 @@
+ import itertools
+ import parse_sdf
+ import json
++import re
+ 
+ CELL_CAL = {}
++ROUTE_CAL = {}
++
++def route_wire_class(wire_name):
++    for cls, pat in ROUTE_CAL.get("classes", []):
++        if re.match(pat, wire_name):
++            return cls
++    return None
++
++def route_pip_timing(pip, dst_name):
++    base = timing_pip_classs(pip)
++    cls = route_wire_class(dst_name) if ROUTE_CAL else None
++    add = ROUTE_CAL.get("pip_add", {}).get(cls) if cls else None
++    if not add:
++        return base, int(pip.min_delay()*1000), int(pip.max_delay()*1000)
++    return f"{base}_{cls}", max(0, int(pip.min_delay()*1000) + add[0]), max(0, int(pip.max_delay()*1000) + add[1])
+ 
+ def slice_ff_bypass_class(bel_name, bel_pin):
+     if "SLICE_FF_BYPASS" not in CELL_CAL.get("site_pips", {}):
+@@ -414,14 +430,17 @@
+     for pip in tile.pips():
+         if not filters.include_pip(tile.tile_type(), pip):
+             continue
+-        tcls = timing_pip_classs(pip)
+-        if tcls not in seen_pip_timings:
+-            ch.timing.set_pip_class(f"DEFAULT", tcls,
+-                delay=TimingValue(int(pip.min_delay()*1000), int(pip.max_delay()*1000)), # ps
+-                in_cap=TimingValue(int(pip.capacitance()*1000)), # fF
+-                out_res=TimingValue(int(pip.resistance())), # mohm
+-                is_buffered=pip.is_buffered())
+-            seen_pip_timings.add(tcls)
++        def pip_tcls(dst_name):
++            tcls, dmin, dmax = route_pip_timing(pip, dst_name)
++            if tcls not in seen_pip_timings:
++                ch.timing.set_pip_class(f"DEFAULT", tcls,
++                    delay=TimingValue(dmin, dmax),
++                    in_cap=TimingValue(int(pip.capacitance()*1000)),
++                    out_res=TimingValue(int(pip.resistance())),
++                    is_buffered=pip.is_buffered())
++                seen_pip_timings.add(tcls)
++            return tcls
++        tcls = pip_tcls(pip.dst_wire().name())
+         rt = PIP_CFG_ROUTETHRU if pip.is_route_thru() else 0
+         # Route-thru pips are not tile config bits at all (they borrow a site
+         # bel), so the segbits/ppips test does not apply to them.
+@@ -432,7 +451,7 @@
+         if pip.is_bidi():
+             rev_nb = 0 if rt else (
+                 0 if pip_has_bits(tile_type, pip.src_wire().name(), pip.dst_wire().name()) else PIP_CFG_NO_BITS)
+-            add_pip(pip.dst_wire().name(), pip.src_wire().name(), pip_class=PipClass.TILE_ROUTING, timing=tcls,
++            add_pip(pip.dst_wire().name(), pip.src_wire().name(), pip_class=PipClass.TILE_ROUTING, timing=pip_tcls(pip.src_wire().name()),
+                 pip_config=rt | rev_nb)
+ 
+ def import_sdf_timings(variant, sdfcell):
+@@ -561,7 +580,13 @@
+     parser.add_argument("--bba", help="bba file to write", type=str, required=True)
+     parser.add_argument("--cell-timing", help="JSON file with LUT per-pin and FF delays in ps that replace the stub "
+                         "values, and an FF bypass site pip delay (e.g. measured against Vivado); off by default", type=str, default=None)
++    parser.add_argument("--route-timing", help="JSON file with per-wire-class additive pip delays in ps (classes: "
++                        "[name, regex on the pip's destination wire]; pip_add: name -> [fast, slow]), e.g. fitted "
++                        "against Vivado on identical routes; off by default", type=str, default=None)
+     args = parser.parse_args()
++    if args.route_timing:
++        with open(args.route_timing) as f:
++            ROUTE_CAL.update(json.load(f))
+     if args.cell_timing:
+         with open(args.cell_timing) as f:
+             CELL_CAL.update(json.load(f))

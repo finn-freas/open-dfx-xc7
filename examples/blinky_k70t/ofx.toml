@@ -1,0 +1,10 @@
+[project]
+name = "blinky_k70t"
+top = "blinky_k70t"
+part = "xc7k70tfbg676-1"
+sources = ["src/blinky_k70t.v"]
+constraints = ["constraints/blinky_k70t.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

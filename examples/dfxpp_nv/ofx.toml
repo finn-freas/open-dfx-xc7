@@ -1,0 +1,24 @@
+[project]
+name = "dfxpp_nv"
+top = "dfxpp_nv"
+board = "nexys-video"
+sources = ["src/dfxpp_nv.v"]
+constraints = ["constraints/dfxpp_nv.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0
+
+[dfx]
+partpins = "auto"
+rar = false
+compress = false
+decoupler = false
+
+[[dfx.partition]]
+name = "rp0"
+inst = "u_rm"
+region = "SLICE_X12Y100:SLICE_X15Y149"
+ports = "rm/ports.json"
+register = ["ready"]
+rms = { xor = "rm/rm_core_xor.v", andn = "rm/rm_core_andn.v" }

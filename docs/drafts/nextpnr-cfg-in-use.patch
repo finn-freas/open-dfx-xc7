@@ -1,0 +1,50 @@
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index b46044f3..2f60cdab 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -3258,6 +3411,7 @@ struct FasmBackend
+ 
+     void write_cfg()
+     {
++        bool dna_port_used = false;
+         for (auto &cell : ctx->cells) {
+             CellInfo *ci = cell.second.get();
+             if (ci->bel == BelId())
+@@ -3288,8 +3442,20 @@ struct FasmBackend
+                     write_bit("ICAP_WIDTH_X16");
+                 if (width == "X8")
+                     write_bit("ICAP_WIDTH_X8");
++
++
++                const bool is_first_icap = boost::contains(ctx->nameOfBel(ci->bel), "ICAP_X0Y0");
++                if (is_first_icap)
++                    write_bit("IN_USE");
++                else
++                    log_warning("%s: the enable bits of %s are not known; not written\n", ctx->nameOf(ci),
++                                ctx->nameOfBel(ci->bel));
+                 pop();
+             }
++
++
++            if (ci->type == id_DNA_PORT_DNA_PORT)
++                dna_port_used = true;
+             if (ci->type == id_STARTUP_STARTUP) {
+                 std::string prog_usr = str_or_default(ci->params, id_PROG_USR, "FALSE");
+                 bool invalid_prog_usr = prog_usr != "TRUE" && prog_usr != "FALSE";
+@@ -3305,6 +3471,16 @@ struct FasmBackend
+             }
+             pop();
+         }
++        if (!dna_port_used)
++            return;
++        for (int tile = 0; tile < ctx->chip_info->tile_insts.ssize(); tile++) {
++            const std::string tile_name = uarch->tile_name(tile);
++            if (!boost::starts_with(tile_name, "CFG_CENTER_MID_"))
++                continue;
++            push(tile_name);
++            write_bit("DNA_PORT.IN_USE");
++            pop();
++        }
+     }
+ 
+     void write_ibufds_gte2(CellInfo * ci)

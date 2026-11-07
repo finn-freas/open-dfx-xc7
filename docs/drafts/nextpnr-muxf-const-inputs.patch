@@ -1,0 +1,21 @@
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -562,7 +562,17 @@
+                 PortRef pr;
+                 pr.cell = curr;
+                 pr.port = p;
+-                feed_through_muxf(pn, next_type, {pr});
++
++
++
++
++
++
++
++                const bool driver_is_lut = pn->driver.cell->type.str(ctx).substr(0, 3) == "LUT";
++                CellInfo *feed = feed_through_muxf(pn, next_type, {pr});
++                if (!driver_is_lut)
++                    legalise_muxf_tree(feed, mux_roots, seen_leaves);
+                 continue;
+             }
+             seen_leaves.insert(pn->driver.cell->name);

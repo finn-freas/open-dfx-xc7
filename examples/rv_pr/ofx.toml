@@ -1,0 +1,22 @@
+[project]
+name = "rv_pr"
+top = "rv_soc"
+board = "arty-a7-35t"
+sources = ["../../designs/rv_soc/rv_soc.v", "../../designs/rv_soc/uart.v", "../../designs/rv_soc/picorv32.v",
+           "../../designs/rv_soc/pr/rm_stub.v"]
+constraints = ["../../designs/rv_soc/arty_a7_35t.xdc"]
+seed = 1
+
+[dfx]
+partpins = "anchors"
+rar = false
+compress = false
+decoupler = false
+
+[[dfx.partition]]
+name = "rp0"
+inst = "u_rm"
+region = "SLICE_X12Y100:SLICE_X15Y149"
+ports = "../../designs/rv_soc/pr/ports.json"
+shell = "../../designs/rv_soc/pr/rm_shell.v"
+rms = { xor = "../../designs/rv_soc/pr/rm_core_xor.v", andn = "../../designs/rv_soc/pr/rm_core_andn.v" }

@@ -1,0 +1,11 @@
+xilinx_dsp: -pipeline (synth_xilinx -dsp_pipeline)
+
+Under -pipeline, for xc7:
+- input registers of one DSP A or B input that are split over several
+  register cells with the same clock and enable are merged (a reset
+  that not all bits share is moved into D), so A2REG/B2REG are packed;
+- an A/B cascade may pass through two registers (ACASCREG/BCASCREG=2);
+- a reset-free register after a fabric $add tree of DSP P outputs is
+  moved back onto those outputs and packed into PREG where PCOUT is
+  unused.
+Without the option the pass takes the old path.

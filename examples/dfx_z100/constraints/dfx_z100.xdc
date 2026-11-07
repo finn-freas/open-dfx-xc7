@@ -1,0 +1,6 @@
+set_property -dict { PACKAGE_PIN AF14 IOSTANDARD LVCMOS33 } [get_ports clk]
+create_clock -name sys_clk -period 10.000 [get_ports clk]
+set_property -dict { PACKAGE_PIN AA14 IOSTANDARD LVCMOS33 } [get_ports {led[0]}]
+set_property -dict { PACKAGE_PIN AA15 IOSTANDARD LVCMOS33 } [get_ports {led[1]}]
+set_property -dict { PACKAGE_PIN AB14 IOSTANDARD LVCMOS33 } [get_ports {led[2]}]
+set_property -dict { PACKAGE_PIN AB15 IOSTANDARD LVCMOS33 } [get_ports {led[3]}]

@@ -1,0 +1,260 @@
+xilinx: route a greybox build's static side to given partition pins
+
+-o partition-pins-route: for a net with a partition pin (-o partition-pins) and no cell
+in a routing-contained pblock, route its source to the pin, or (undriven net) the pin to
+each sink, outside every routing-contained pblock, before router2; lock the route.
+checkRoutedDesign accepts a net whose route ends at its partition pin.
+
+Draft, not posted. Base: router-region + pblock-replay + pblock-routethru +
+partition-pins + pblock-lutff + carry-replay-order (variant partpin).
+
+diff --git a/common/route/router1.cc b/common/route/router1.cc
+index cd51be78..a0d7fc13 100644
+--- a/common/route/router1.cc
++++ b/common/route/router1.cc
+@@ -1354,7 +1354,23 @@ bool Context::checkRoutedDesign() const
+         if (net_info->users.empty()) {
+             if (ctx->debug)
+                 log("  net without sinks\n");
+-            log_assert(net_info->wires.empty());
++
++
++            pool<WireId> on_pin_route;
++            for (auto &region : ctx->region) {
++                auto pp = region.second->partition_pins.find(net_info->name);
++                if (pp == region.second->partition_pins.end())
++                    continue;
++                WireId cursor = pp->second;
++                while (net_info->wires.count(cursor) && !on_pin_route.count(cursor)) {
++                    on_pin_route.insert(cursor);
++                    PipId pip = net_info->wires.at(cursor).pip;
++                    if (pip == PipId())
++                        break;
++                    cursor = ctx->getPipSrcWire(pip);
++                }
++            }
++            log_assert(net_info->wires.size() == on_pin_route.size());
+             continue;
+         }
+ 
+@@ -1412,6 +1428,12 @@ bool Context::checkRoutedDesign() const
+ 
+         std::function<void(WireId, int)> setOrderNum;
+         pool<WireId> logged_wires;
++        pool<WireId> partition_pins;
++        for (auto &region : ctx->region) {
++            auto pp = region.second->partition_pins.find(net_info->name);
++            if (pp != region.second->partition_pins.end())
++                partition_pins.insert(pp->second);
++        }
+ 
+         setOrderNum = [&](WireId w, int num) {
+             auto &db_entry = *db.emplace(w, std::make_unique<ExtraWireInfo>()).first->second;
+@@ -1432,6 +1454,9 @@ bool Context::checkRoutedDesign() const
+                 if (dest_wires.count(w) != 0) {
+                     if (ctx->debug)
+                         log("  %*s=> sink %d\n", 2 * num, "", dest_wires.at(w).idx());
++                } else if (partition_pins.count(w)) {
++                    if (ctx->debug)
++                        log("  %*s=> partition pin\n", 2 * num, "");
+                 } else {
+                     if (ctx->debug)
+                         log("  %*s=> stub\n", 2 * num, "");
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index a065f399..243a77c1 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -93,6 +93,10 @@ po::options_description XilinxImpl::getUArchOptions()
+                            "with -o prerouted: lines '<net>\\t<wire>' naming the wire at which each net crosses the "
+                            "edge of a routing-contained pblock; the net's locked route outside ends (or starts) "
+                            "there and the router routes the part inside the pblock from (or to) it");
++    specific.add_options()("partition-pins-route",
++                           "with -o partition-pins, for a net with no cell in a pblock (a greybox build): before "
++                           "routing, route its source to its pin, or its pin to its sinks, outside every "
++                           "routing-contained pblock, and lock that route");
+     specific.add_options()("holdbufs", po::value<std::string>(),
+                            "before placing, re-create the reference build's hold-fix feedthrough buffers listed in "
+                            "this file (scripts/routing_dump.py), so -o preplaced / -o prerouted replay them too");
+@@ -1139,6 +1143,7 @@ void XilinxImpl::preRoute()
+     read_partition_pins();
+     apply_prerouted();
+     apply_partition_pins();
++    route_to_partition_pins();
+ }
+ 
+ // -o partition-pins=<file>: one line per net, "<net name>\t<wire>".  Read
+@@ -1245,6 +1250,160 @@ void XilinxImpl::apply_partition_pins()
+                  given, unused, not_in_design);
+ }
+ 
++
++
++
++bool XilinxImpl::route_outside_pblocks(NetInfo *ni, WireId target, const pool<Loc> &closed,
++                                       const pool<WireId> &reserved, std::vector<PipId> &path, int &visits)
++{
++    struct QueuedWire
++    {
++        WireId wire;
++        delay_t cost, togo;
++        bool operator<(const QueuedWire &other) const { return cost + togo > other.cost + other.togo; }
++    };
++    const int max_visits = 2000000;
++    dict<WireId, std::pair<delay_t, PipId>> visited;
++    std::priority_queue<QueuedWire> queue;
++    for (auto &w : ni->wires) {
++        visited[w.first] = std::make_pair(delay_t(0), PipId());
++        queue.push(QueuedWire{w.first, 0, ctx->estimateDelay(w.first, target)});
++    }
++    visits = 0;
++    while (!queue.empty() && visits < max_visits) {
++        QueuedWire q = queue.top();
++        queue.pop();
++        const bool target_reached = (q.wire == target);
++        if (target_reached)
++            break;
++        const bool wire_was_reached_cheaper_since = (q.cost > visited.at(q.wire).first);
++        if (wire_was_reached_cheaper_since)
++            continue;
++        visits++;
++        for (PipId pip : ctx->getPipsDownhill(q.wire)) {
++            Loc l = ctx->getPipLocation(pip);
++            const bool pip_is_in_a_pblock = closed.count(Loc(l.x, l.y, 0)) != 0;
++            const bool pip_is_a_routethru = chip_pip_info(ctx->chip_info, pip).flags == PIP_LUT_ROUTETHRU;
++            if (pip_is_in_a_pblock || pip_is_a_routethru || !ctx->checkPipAvailForNet(pip, ni))
++                continue;
++            WireId dst = ctx->getPipDstWire(pip);
++            const bool wire_is_taken = (ctx->getBoundWireNet(dst) != nullptr);
++            const bool wire_is_another_pin = (dst != target && reserved.count(dst));
++            if (wire_is_taken || wire_is_another_pin)
++                continue;
++            delay_t cost = q.cost + ctx->getPipDelay(pip).maxDelay() + ctx->getWireDelay(dst).maxDelay() +
++                           ctx->getDelayEpsilon();
++            auto it = visited.find(dst);
++            const bool wire_has_a_cheaper_way = (it != visited.end() && it->second.first <= cost);
++            if (wire_has_a_cheaper_way)
++                continue;
++            visited[dst] = std::make_pair(cost, pip);
++            queue.push(QueuedWire{dst, cost, ctx->estimateDelay(dst, target)});
++        }
++    }
++    if (!visited.count(target))
++        return false;
++    path.clear();
++    for (WireId cur = target; visited.at(cur).second != PipId(); cur = ctx->getPipSrcWire(visited.at(cur).second))
++        path.push_back(visited.at(cur).second);
++    std::reverse(path.begin(), path.end());
++    return true;
++}
++
++
++
++
++
++
++
++
++void XilinxImpl::route_to_partition_pins()
++{
++    if (!ctx->args.options.count("partition-pins-route"))
++        return;
++    pool<Loc> closed;
++    for (auto &region : ctx->region)
++        if (region.second->constr_pips)
++            for (auto l : region.second->piplocs)
++                closed.insert(l);
++    pool<WireId> reserved;
++    for (auto &pp : partition_pin_wires)
++        reserved.insert(pp.second);
++    auto in_contained_pblock = [](const CellInfo *ci) {
++        return ci != nullptr && ci->region != nullptr && ci->region->constr_pips;
++    };
++    int to_pin = 0, from_pin = 0, skipped = 0, pips = 0;
++    std::vector<IdString> failed;
++    std::vector<PipId> path;
++    int visits = 0;
++    auto note_failure = [&](NetInfo *ni, WireId target) {
++        log_info("Partition pins: net '%s': no route outside the pblocks to %s (%d wires visited)\n",
++                 ni->name.c_str(ctx), ctx->nameOfWire(target), visits);
++    };
++    for (auto &pp : partition_pin_wires) {
++        auto it = ctx->nets.find(pp.first);
++        const bool this_design_has_no_such_net = (it == ctx->nets.end());
++        if (this_design_has_no_such_net)
++            continue;
++        NetInfo *ni = it->second.get();
++        bool net_has_a_cell_in_a_pblock = in_contained_pblock(ni->driver.cell);
++        for (auto &usr : ni->users)
++            net_has_a_cell_in_a_pblock |= in_contained_pblock(usr.cell);
++        const bool route_reaches_the_pin = ni->wires.count(pp.second) != 0;
++        if (net_has_a_cell_in_a_pblock || route_reaches_the_pin) {
++            skipped++;
++            continue;
++        }
++        const bool net_is_driven = (ni->driver.cell != nullptr);
++        if (net_is_driven) {
++            WireId src = ctx->getNetinfoSourceWire(ni);
++            const bool source_has_no_wire = (src == WireId());
++            if (source_has_no_wire) {
++                failed.push_back(ni->name);
++                continue;
++            }
++            if (!ni->wires.count(src))
++                ctx->bindWire(src, ni, STRENGTH_LOCKED);
++            if (!route_outside_pblocks(ni, pp.second, closed, reserved, path, visits)) {
++                note_failure(ni, pp.second);
++                failed.push_back(ni->name);
++                continue;
++            }
++            for (PipId p : path)
++                ctx->bindPip(p, ni, STRENGTH_LOCKED);
++            pips += path.size();
++            to_pin++;
++            continue;
++        }
++        ctx->bindWire(pp.second, ni, STRENGTH_LOCKED);
++        bool every_sink_reached = true;
++        for (auto &usr : ni->users)
++            for (int i = 0; i < int(ctx->getNetinfoSinkWireCount(ni, usr)); i++) {
++                WireId sink = ctx->getNetinfoSinkWire(ni, usr, i);
++                if (ni->wires.count(sink))
++                    continue;
++                if (!route_outside_pblocks(ni, sink, closed, reserved, path, visits)) {
++                    note_failure(ni, sink);
++                    every_sink_reached = false;
++                    continue;
++                }
++                for (PipId p : path)
++                    ctx->bindPip(p, ni, STRENGTH_LOCKED);
++                pips += path.size();
++            }
++        if (every_sink_reached)
++            from_pin++;
++        else
++            failed.push_back(ni->name);
++    }
++    log_info("Partition pins: %d net(s) routed from their source to the pin, %d from the pin to their sinks, outside "
++             "the pblocks (%d pips, locked); %d reach their pin already or have a cell in a pblock.\n",
++             to_pin, from_pin, pips, skipped);
++    if (!failed.empty())
++        log_error("Partition pins: no route outside the pblocks for %d net(s), e.g. '%s'\n", int(failed.size()),
++                  failed.front().c_str(ctx));
++}
++
+ // -o prerouted=<file>: one line per net, "<net name>\t<wire>;<pip>;<strength>;..."
+ // as nextpnr's own ROUTING attribute spells it (a source wire has an empty
+ // pip).  A net whose name and driver survive packing gets its reference
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index cefe369e..3e033920 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -215,6 +215,9 @@ struct XilinxImpl : HimbaechelAPI
+     dict<IdString, WireId> partition_pin_wires;
+     void read_partition_pins();
+     void apply_partition_pins();
++    void route_to_partition_pins();
++    bool route_outside_pblocks(NetInfo *ni, WireId target, const pool<Loc> &closed, const pool<WireId> &reserved,
++                               std::vector<PipId> &path, int &visits);
+     void apply_preplaced(bool verbose = true);
+     void apply_holdbufs();
+     void close_routed_tiles();

@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: do not pair a flipflop with a LUT or CARRY4 of
+ another pblock
+
+pack_lutffs puts a flipflop in one cluster with the LUT or CARRY4 that
+drives its D, and a cluster is placed as one piece, so
+apply_pblocks_after_packing pulled the flipflop into its driver's pblock
+("cell(s) outside any pblock were packed into a cluster with pblock
+cells").  With an EXCLUDE_PLACEMENT pblock that puts a static flipflop
+inside a reconfigurable partition.  Skip the pairing when the XDC put the
+two cells in different pblocks (a packer-made cell counts under the
+netlist cell it is named after, as in apply_pblocks_after_packing).
+No-op without pblocks.
+---
+ himbaechel/uarch/xilinx/pack.cc  |  4 ++++
+ himbaechel/uarch/xilinx/xdc.cc   | 26 ++++++++++++++++++++++++++
+ himbaechel/uarch/xilinx/xilinx.h |  1 +
+ 3 files changed, 31 insertions(+)
+
+diff --git a/himbaechel/uarch/xilinx/pack.cc b/himbaechel/uarch/xilinx/pack.cc
+index 53795065..6676d7e5 100644
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -470,6 +470,10 @@ void XilinxPacker::pack_lutffs()
+         const bool d_is_undriven = (d == nullptr || d->driver.cell == nullptr);
+         if (d_is_undriven)
+             continue; // an undriven D (yosys's 'x') is not a pairing
++
++
++        if (uarch->cells_in_different_pblocks(d->driver.cell, ci))
++            continue;
+         if (d->driver.cell->type == id_SLICE_LUTX && d->driver.port == id_O6) {
+             CellInfo *lut = d->driver.cell;
+             if (lut->cluster != ClusterId() || !lut->constr_children.empty()) {
+diff --git a/himbaechel/uarch/xilinx/xdc.cc b/himbaechel/uarch/xilinx/xdc.cc
+index f25962c8..6b39a18e 100644
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -804,6 +804,32 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                     cell.second->region != nullptr ? cell.second->region->name : IdString();
+ }
+ 
++
++
++
++
++bool XilinxImpl::cells_in_different_pblocks(const CellInfo *a, const CellInfo *b) const
++{
++    if (pblock_prepack_cells.empty())
++        return false;
++    auto pblock_of = [&](const CellInfo *ci, IdString &pb) {
++        const std::string &name = ci->name.str(ctx);
++        auto fnd = pblock_prepack_cells.find(name);
++        for (size_t dollar = name.rfind('$'); fnd == pblock_prepack_cells.end() && dollar != std::string::npos &&
++                                              dollar > 0;
++             dollar = name.rfind('$', dollar - 1))
++            fnd = pblock_prepack_cells.find(name.substr(0, dollar));
++        if (fnd == pblock_prepack_cells.end())
++            return false;
++        pb = fnd->second;
++        return true;
++    };
++    IdString pa, pb;
++    if (!pblock_of(a, pa) || !pblock_of(b, pb))
++        return false;
++    return pa != pb;
++}
++
+ 
+ 
+ 
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 6da83d02..cefe369e 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -203,6 +203,7 @@ struct XilinxImpl : HimbaechelAPI
+     dict<std::string, IdString> pblock_prepack_cells;
+     dict<BelId, const Region *> exclusive_pblock_bels;
+     void apply_pblocks_after_packing();
++    bool cells_in_different_pblocks(const CellInfo *a, const CellInfo *b) const;
+     void add_pblock_routing_tiles(Region *pb_region);
+     void pack() override;
+     void apply_loc_constraints(const pool<IdString> &only_types = {});

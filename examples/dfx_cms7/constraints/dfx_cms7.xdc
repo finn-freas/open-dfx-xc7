@@ -1,0 +1,6 @@
+set_property -dict { PACKAGE_PIN M9 IOSTANDARD LVCMOS33 } [get_ports clk]
+create_clock -name sys_clk -period 83.333 [get_ports clk]
+set_property -dict { PACKAGE_PIN E2 IOSTANDARD LVCMOS33 } [get_ports {led[0]}]
+set_property -dict { PACKAGE_PIN K1 IOSTANDARD LVCMOS33 } [get_ports {led[1]}]
+set_property -dict { PACKAGE_PIN J1 IOSTANDARD LVCMOS33 } [get_ports {led[2]}]
+set_property -dict { PACKAGE_PIN E1 IOSTANDARD LVCMOS33 } [get_ports {led[3]}]

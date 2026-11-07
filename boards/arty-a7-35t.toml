@@ -1,0 +1,26 @@
+[board]
+name = "Digilent Arty A7-35T"
+part = "xc7a35tcsg324-1"
+openfpgaloader_board = "arty_a7_35t"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Arty-A7-35-Master.xdc (github.com/Digilent/digilent-xdc, master, sha256 3884f49d...8492, read 2026-11-06); the same pins as designs/blinky/arty_a7_35t.xdc and designs/rv_soc/arty_a7_35t.xdc"
+
+[clock]
+port = "clk"
+pin = "E3"
+period_ns = 10.0
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "H5"
+"led[1]" = "J5"
+"led[2]" = "T9"
+"led[3]" = "T10"
+
+[uart]
+uart_txd_in = "A9"
+uart_rxd_out = "D10"
+
+[dfx]
+example_region = "SLICE_X12Y100:SLICE_X15Y149"

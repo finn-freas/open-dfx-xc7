@@ -1,0 +1,13 @@
+{
+ "cl": 6,
+ "cwl": 5,
+ "read_latency": 8,
+ "write_latency": 1,
+ "nphases": 4,
+ "databits": 16,
+ "dfi_databits": 32,
+ "delays": 32,
+ "bitslips": 8,
+ "rdphase": 3,
+ "wrphase": 3
+}

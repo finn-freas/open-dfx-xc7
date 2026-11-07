@@ -1,0 +1,24 @@
+[project]
+name = "dfx_z10"
+top = "dfx_z10"
+board = "zybo-z7-10"
+sources = ["src/dfx_z10.v"]
+constraints = ["constraints/dfx_z10.xdc"]
+seed = 1
+
+[clocks]
+clk = 8.0
+
+[dfx]
+partpins = "anchors"
+rar = false
+compress = false
+decoupler = false
+
+[[dfx.partition]]
+name = "rp0"
+inst = "u_rm"
+region = "SLICE_X28Y50:SLICE_X31Y99"
+ports = "rm/ports.json"
+register = ["ready"]
+rms = { xor = "rm/rm_core_xor.v", andn = "rm/rm_core_andn.v" }

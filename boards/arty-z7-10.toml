@@ -1,0 +1,23 @@
+[board]
+name = "Digilent Arty Z7-10 (programmable logic only)"
+part = "xc7z010clg400-1"
+openfpgaloader_board = "arty_z7_10"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Arty-Z7-10-Master.xdc ('for the ARTY Z7-10 Rev.B', github.com/Digilent/digilent-xdc master c8644a9f, sha256 431481b2...46d2, read 2026-11-06); part from Digilent vivado-boards master d8d43ed9 new/board_files/arty-z7-10/A.0/board.xml (sha256 89a3b943...ac28)"
+notes = "PL pins only (see zybo-z7-10). Clock: the 125 MHz SYSCLK (H16). Digilent's file has no PL pins for the USB-UART, so there is no [uart]."
+
+[clock]
+port = "clk"
+pin = "H16"
+period_ns = 8.0
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "R14"
+"led[1]" = "P14"
+"led[2]" = "N16"
+"led[3]" = "M14"
+
+[dfx]
+example_region = "SLICE_X28Y50:SLICE_X31Y99"

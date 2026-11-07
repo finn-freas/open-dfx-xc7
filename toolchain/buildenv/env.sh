@@ -1,0 +1,10 @@
+BUILDENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export MAMBA_ROOT_PREFIX="$BUILDENV/mamba"
+export BUILDENV_PREFIX="$BUILDENV/env"
+export PATH="$BUILDENV_PREFIX/bin:$BUILDENV/bin:$PATH"
+export CC="$BUILDENV_PREFIX/bin/x86_64-conda-linux-gnu-gcc"
+export CXX="$BUILDENV_PREFIX/bin/x86_64-conda-linux-gnu-g++"
+export CMAKE_PREFIX_PATH="$BUILDENV_PREFIX"
+export PKG_CONFIG_PATH="$BUILDENV_PREFIX/lib/pkgconfig:$BUILDENV_PREFIX/share/pkgconfig"
+export LDFLAGS="-L$BUILDENV_PREFIX/lib -Wl,-rpath,$BUILDENV_PREFIX/lib"
+unset CFLAGS CXXFLAGS CPPFLAGS

@@ -1,0 +1,24 @@
+[project]
+name = "dfx_z030"
+top = "dfx_z030"
+part = "xc7z030sbg485-1"
+sources = ["src/dfx_z030.v"]
+constraints = ["constraints/dfx_z030.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0
+
+[dfx]
+partpins = "anchors"
+rar = false
+compress = false
+decoupler = false
+
+[[dfx.partition]]
+name = "rp0"
+inst = "u_rm"
+region = "SLICE_X28Y100:SLICE_X31Y149"
+ports = "rm/ports.json"
+register = ["ready"]
+rms = { xor = "rm/rm_core_xor.v", andn = "rm/rm_core_andn.v" }

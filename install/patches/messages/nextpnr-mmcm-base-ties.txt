@@ -1,0 +1,6 @@
+xilinx: tie MMCME2_BASE/PLLE2_BASE inputs like the library cells
+
+RST and PWRDWN of the *_BASE cells are invertible, and the MMCME2_ADV
+inputs an MMCME2_BASE lacks (CLKIN2, CLKINSEL, DRP and phase-shift
+ports) are tied as the library cell ties them, as PLLE2_ADV already
+was.

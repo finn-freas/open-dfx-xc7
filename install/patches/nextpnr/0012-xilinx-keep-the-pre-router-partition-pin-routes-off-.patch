@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: keep the pre-router partition-pin routes off other
+ cells' pin-feed wires
+
+-o partition-pins-route locks each pin net's static route before router2 runs.  A route
+may enter a pin-feed wire (site pin, CLB input, bypass, input-mux, fan, control, bounce)
+only on the direct approach to its own target (not through a LUT or a bounce) or on the
+way out of its own site pins.  Before, a delay-only A* could bounce through the bypass
+wire in front of another FF's input and leave that FF unreachable, both for later pin
+nets and for static nets router2 routes afterwards.
+---
+ himbaechel/uarch/xilinx/xilinx.cc | 43 +++++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 243a77c1..139c7327 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -1252,10 +1252,48 @@ void XilinxImpl::apply_partition_pins()
+ 
+ 
+ 
+-
++
++
++
++
++
++
+ bool XilinxImpl::route_outside_pblocks(NetInfo *ni, WireId target, const pool<Loc> &closed,
+                                        const pool<WireId> &reserved, std::vector<PipId> &path, int &visits)
+ {
++    auto is_pin_feed = [&](WireId w) {
++        const std::string name = ctx->getWireName(w)[1].str(ctx);
++        return name.find('.') != std::string::npos || boost::starts_with(name, "CLBL") ||
++               boost::starts_with(name, "BYP") || boost::starts_with(name, "IMUX") ||
++               boost::starts_with(name, "FAN") || boost::starts_with(name, "GFAN") ||
++               boost::starts_with(name, "CTRL") || name.find("BOUNCE") != std::string::npos;
++    };
++    auto is_direct_feed = [&](WireId w) {
++        const std::string name = ctx->getWireName(w)[1].str(ctx);
++        auto has = [&](const char *s) { return name.find(s) != std::string::npos; };
++        const bool site_pin = has(".") && !has("LUT") && !has("CARRY") && !has("MUX") && !has("XOR");
++        const bool feed = boost::starts_with(name, "CLBL") || boost::starts_with(name, "BYP") ||
++                          boost::starts_with(name, "IMUX");
++        return (site_pin || feed) && !has("BOUNCE");
++    };
++    pool<WireId> approach{target};
++    std::vector<WireId> todo{target};
++    for (size_t k = 0; k < todo.size(); k++)
++        for (PipId uh : ctx->getPipsUphill(todo[k])) {
++            WireId w = ctx->getPipSrcWire(uh);
++            if (is_direct_feed(w) && approach.insert(w).second)
++                todo.push_back(w);
++        }
++    todo.clear();
++    for (auto &w : ni->wires)
++        if (ctx->getWireName(w.first)[1].str(ctx).find('.') != std::string::npos && approach.insert(w.first).second)
++            todo.push_back(w.first);
++    for (size_t k = 0; k < todo.size(); k++)
++        for (PipId dh : ctx->getPipsDownhill(todo[k])) {
++            WireId w = ctx->getPipDstWire(dh);
++            if (is_pin_feed(w) && approach.insert(w).second)
++                todo.push_back(w);
++        }
+     struct QueuedWire
+     {
+         WireId wire;
+@@ -1289,7 +1327,8 @@ bool XilinxImpl::route_outside_pblocks(NetInfo *ni, WireId target, const pool<Lo
+             WireId dst = ctx->getPipDstWire(pip);
+             const bool wire_is_taken = (ctx->getBoundWireNet(dst) != nullptr);
+             const bool wire_is_another_pin = (dst != target && reserved.count(dst));
+-            if (wire_is_taken || wire_is_another_pin)
++            const bool wire_feeds_another_pin = !approach.count(dst) && is_pin_feed(dst);
++            if (wire_is_taken || wire_is_another_pin || wire_feeds_another_pin)
+                 continue;
+             delay_t cost = q.cost + ctx->getPipDelay(pip).maxDelay() + ctx->getWireDelay(dst).maxDelay() +
+                            ctx->getDelayEpsilon();

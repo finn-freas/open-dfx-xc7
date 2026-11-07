@@ -1,0 +1,44 @@
+diff --git a/himbaechel/uarch/xilinx/pins.cc b/himbaechel/uarch/xilinx/pins.cc
+index 804a6d93..3a53aedb 100644
+--- a/himbaechel/uarch/xilinx/pins.cc
++++ b/himbaechel/uarch/xilinx/pins.cc
+@@ -201,6 +201,8 @@ void get_invertible_pins(Context *ctx, dict<IdString, pool<IdString>> &invertibl
+     invertible_pins[id_MMCME2_ADV].insert(id_PSINCDEC);
+     invertible_pins[id_MMCME2_ADV].insert(id_PWRDWN);
+     invertible_pins[id_MMCME2_ADV].insert(id_RST);
++    invertible_pins[id_MMCME2_BASE].insert(id_PWRDWN);
++    invertible_pins[id_MMCME2_BASE].insert(id_RST);
+     invertible_pins[id_IDDR].insert(id_CK);
+     invertible_pins[id_ODDR].insert(id_CK);
+     invertible_pins[id_ODDR].insert(id_D1);
+@@ -230,6 +232,8 @@ void get_invertible_pins(Context *ctx, dict<IdString, pool<IdString>> &invertibl
+     invertible_pins[id_PLLE2_ADV].insert(id_CLKINSEL);
+     invertible_pins[id_PLLE2_ADV].insert(id_PWRDWN);
+     invertible_pins[id_PLLE2_ADV].insert(id_RST);
++    invertible_pins[id_PLLE2_BASE].insert(id_PWRDWN);
++    invertible_pins[id_PLLE2_BASE].insert(id_RST);
+     invertible_pins[id_XADC].insert(id_CONVSTCLK);
+     invertible_pins[id_XADC].insert(id_DCLK);
+ }
+@@ -351,6 +355,21 @@ void get_tied_pins(Context *ctx, dict<IdString, dict<IdString, bool>> &tied_pins
+     tied_pins[id_PLLE2_ADV][id_PWRDWN] = false;
+     tied_pins[id_PLLE2_ADV][id_RST] = false;
+ 
++
++
++    tied_pins[id_MMCME2_ADV][id_CLKIN2] = false;
++    tied_pins[id_MMCME2_ADV][id_CLKINSEL] = true;
++    for (int i = 0; i < 7; i++)
++        tied_pins[id_MMCME2_ADV][ctx->id("DADDR[" + std::to_string(i) + "]")] = false;
++    tied_pins[id_MMCME2_ADV][id_DCLK] = false;
++    tied_pins[id_MMCME2_ADV][id_DEN] = false;
++    for (int i = 0; i < 16; i++)
++        tied_pins[id_MMCME2_ADV][ctx->id("DI[" + std::to_string(i) + "]")] = false;
++    tied_pins[id_MMCME2_ADV][id_DWE] = false;
++    tied_pins[id_MMCME2_ADV][id_PSCLK] = false;
++    tied_pins[id_MMCME2_ADV][id_PSEN] = false;
++    tied_pins[id_MMCME2_ADV][id_PSINCDEC] = false;
++
+     // Misc clock buffers
+     tied_pins[id_BUFGCE_DIV][id_CE] = true;
+     tied_pins[id_BUFGCE_DIV][id_CLR] = false;

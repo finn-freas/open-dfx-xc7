@@ -1,0 +1,6 @@
+xilinx: take IOSTANDARD/DRIVE/SLEW/DIFF_TERM from the IO buffer
+
+pack_io copied only the top-level port's attributes to the PAD cell, so
+an IOBUF/OBUF/IBUFDS parameter such as DRIVE(8) was dropped.  The
+buffer's parameters now reach each of its pads unless the port has the
+same property from the XDC, which wins as in Vivado.

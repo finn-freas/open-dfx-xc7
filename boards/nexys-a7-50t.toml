@@ -1,0 +1,27 @@
+[board]
+name = "Digilent Nexys A7-50T"
+part = "xc7a50tcsg324-1"
+openfpgaloader_board = "nexys_a7_50"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Nexys-A7-50T-Master.xdc ('for the Nexys A7-50T', github.com/Digilent/digilent-xdc master c8644a9f, sha256 7c395ac9...77f4, read 2026-11-06); board part from Digilent vivado-boards master d8d43ed9 new/board_files/nexys-a7-50t/D.0/1.3/board.xml (sha256 6e16bf49...ebb0)"
+notes = "Digilent's board.xml gives part xc7a50ticsg324-1L (industrial, -1L), which is not in the openXC7 parts inventory. The preset uses xc7a50tcsg324-1: same die (IDCODE), package and pins; the -1L timing is not modelled by nextpnr anyway. Only led[0..3] of the 16 LEDs are in the preset."
+
+[clock]
+port = "clk"
+pin = "E3"
+period_ns = 10.0
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "H17"
+"led[1]" = "K15"
+"led[2]" = "J13"
+"led[3]" = "N14"
+
+[uart]
+uart_txd_in = "C4"
+uart_rxd_out = "D4"
+
+[dfx]
+example_region = "SLICE_X12Y100:SLICE_X15Y149"

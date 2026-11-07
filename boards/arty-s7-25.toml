@@ -1,0 +1,27 @@
+[board]
+name = "Digilent Arty S7-25"
+part = "xc7s25csga324-1"
+openfpgaloader_board = "arty_s7_25"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Arty-S7-25-Master.xdc ('for the Arty S7-25 Rev. E', github.com/Digilent/digilent-xdc master c8644a9f, sha256 a2bdf7e3...43c8, read 2026-11-06); part from Digilent vivado-boards master d8d43ed9 new/board_files/arty-s7-25/E.0/board.xml (sha256 26602f19...db89)"
+notes = "The clock is the 12 MHz CLK12MHZ input (F14, LVCMOS33). The 100 MHz CLK100MHZ (R2) is in bank 34 with IOSTANDARD SSTL135 (the DDR3 bank) and is not used by this preset. The xc7s25 has slices Y0..Y99 only, so the example region is SLICE_X12Y50:SLICE_X15Y99."
+
+[clock]
+port = "clk"
+pin = "F14"
+period_ns = 83.333
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "E18"
+"led[1]" = "F13"
+"led[2]" = "E13"
+"led[3]" = "H15"
+
+[uart]
+uart_txd_in = "V12"
+uart_rxd_out = "R12"
+
+[dfx]
+example_region = "SLICE_X12Y50:SLICE_X15Y99"

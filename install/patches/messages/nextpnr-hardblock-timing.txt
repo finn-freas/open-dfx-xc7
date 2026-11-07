@@ -1,0 +1,12 @@
+xilinx: time DSP48E1, ICAPE2 and RAMB36E1 pins (-o hardblock-timing)
+
+The chipdb has no cell timing for DSP48E1 and ICAPE2, so every path into
+or out of them was untimed, and the RAMB36E1 arcs name CLKARDCLK/
+CLKBWRCLK, which a packed RAMB36E1 does not have (it has the L/U
+halves), so its read and address/data setup paths were untimed too.
+
+gen/hardblock_timing.py turns prjxray-db's DSP_L.sdf and
+CFG_CENTER_MID.sdf into hardblock_timing.inc.  With -o hardblock-timing,
+a DSP48E1 gets the SDF rows whose parameter condition it meets, ICAPE2
+its arcs, and a RAMB36E1 arc whose clock is missing moves to the L (or
+U) half.  The chipdb is not changed.  Off by default.

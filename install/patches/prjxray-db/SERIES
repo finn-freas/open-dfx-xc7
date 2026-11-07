@@ -1,0 +1,5 @@
+artix7 prjxray-db-diff-term.segbits
+artix7 prjxray-db-fifo.segbits
+artix7 prjxray-db-cfg-in-use.segbits
+artix7 prjxray-db-monitor-bot.ppips
+artix7 prjxray-db-xadc-init.segbits

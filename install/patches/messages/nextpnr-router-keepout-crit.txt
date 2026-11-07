@@ -1,0 +1,6 @@
+router2: --router2-region-keep-out-crit C
+
+With --router2-region-keep-out, an arc that would be kept out of the
+regions but whose criticality is at least C in router2's first timing
+analysis may cross them.  Decided once, so the rule an arc routes under
+does not change between iterations.  Without the option nothing changes.

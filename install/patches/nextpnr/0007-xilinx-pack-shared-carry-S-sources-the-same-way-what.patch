@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: pack shared carry S sources the same way whatever
+ else is in the netlist
+
+When a LUT drives the S inputs of several carry chains, the first chain
+packed takes it into its carry site and the others get a copy
+("<lut>$S_DUP<n>").  Both the choice and the copy's number depended on
+the whole netlist: the chains were taken in cell-table order, which
+erasing and creating cells reshuffles, and <n> came from the global
+counter.  In a partial-reconfiguration flow the same static logic is
+packed again with another module, and -o preplaced / -o prerouted find
+its cells and nets by name, so a module with carry chains of its own
+made the static logic pack differently (a sink path wire reserved for
+both the LUT's net and its copy's).  Number the copies per source, and
+with pblocks take the chains in name order.  Without pblocks the order
+is unchanged; the copies' names are the only difference there.
+---
+ himbaechel/uarch/xilinx/pack_carry.cc | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/pack_carry.cc b/himbaechel/uarch/xilinx/pack_carry.cc
+index e116b5d3..e2a5e09d 100644
+--- a/himbaechel/uarch/xilinx/pack_carry.cc
++++ b/himbaechel/uarch/xilinx/pack_carry.cc
+@@ -111,6 +111,10 @@ void XC7Packer::pack_carries()
+ {
+     log_info("Packing carries..\n");
+     split_carry4s();
++
++
++
++    dict<IdString, int> s_dups_of;
+     std::vector<CellInfo *> root_muxcys;
+     // Find MUXCYs
+     for (auto &cell : ctx->cells) {
+@@ -122,6 +126,16 @@ void XC7Packer::pack_carries()
+             root_muxcys.push_back(ci);
+         }
+     }
++
++
++
++
++
++
++    const bool chains_go_in_name_order = !uarch->pblocks.empty();
++    if (chains_go_in_name_order)
++        std::sort(root_muxcys.begin(), root_muxcys.end(),
++                  [&](const CellInfo *a, const CellInfo *b) { return a->name.str(ctx) < b->name.str(ctx); });
+ 
+     // Create chains from root MUXCYs
+     pool<IdString> processed_muxcys;
+@@ -340,9 +354,10 @@ void XC7Packer::pack_carries()
+                     unique_lut_inputs = shared_inputs;
+                     ++moved;
+                 } else if (duplicate_fits) {
+-                    CellInfo *dup = ctx->createCell(ctx->idf("%s$S_DUP%d", s_dup_source->name.c_str(ctx), ++autoidx),
++                    const int k = ++s_dups_of[s_dup_source->name];
++                    CellInfo *dup = ctx->createCell(ctx->idf("%s$S_DUP%d", s_dup_source->name.c_str(ctx), k),
+                                                     s_dup_source->type);
+-                    NetInfo *dup_out = ctx->createNet(ctx->idf("%s$S_DUP%d", c4_s->name.c_str(ctx), ++autoidx));
++                    NetInfo *dup_out = ctx->createNet(ctx->idf("%s$S_DUP%d", c4_s->name.c_str(ctx), k));
+                     for (int j = 0; j < 5; j++) {
+                         IdString ip = ctx->idf("I%d", j);
+                         const bool source_has_input = s_dup_source->ports.count(ip);

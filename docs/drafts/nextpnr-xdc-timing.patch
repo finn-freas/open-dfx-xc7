@@ -1,0 +1,1461 @@
+diff --git a/common/kernel/nextpnr_types.h b/common/kernel/nextpnr_types.h
+index 5ee030b1..1281ad31 100644
+--- a/common/kernel/nextpnr_types.h
++++ b/common/kernel/nextpnr_types.h
+@@ -374,6 +374,16 @@ struct ClockConstraint
+     DelayPair high;
+     DelayPair low;
+     DelayPair period;
++
++
++
++
++    IdString name;
++    IdString master;
++    delay_t offset = 0;
++
++
++    pool<IdString> false_path_to;
+ };
+ 
+ struct ClockFmax
+@@ -494,6 +504,9 @@ struct TimingResult
+ 
+     // Min delay violations, only hold time for now
+     std::vector<CriticalPath> min_delay_violations;
++
++
++    dict<ClockPair, delay_t> xclock_requirements;
+ };
+ 
+ // Represents the contents of a non-leaf cell in a design
+diff --git a/common/kernel/timing.cc b/common/kernel/timing.cc
+index e1e9f17d..e68011ac 100644
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -23,14 +23,78 @@
+ #include <algorithm>
+ #include <boost/range/adaptor/reversed.hpp>
+ #include <cerrno>
++#include <cmath>
+ #include <deque>
+ #include <limits>
+ #include <map>
++#include <numeric>
+ #include <utility>
+ #include "util.h"
+ 
+ NEXTPNR_NAMESPACE_BEGIN
+ 
++
++static const ClockConstraint *clock_constraint(const Context *ctx, IdString clock)
++{
++    if (clock == IdString() || !ctx->nets.count(clock))
++        return nullptr;
++    return ctx->nets.at(clock)->clkconstr.get();
++}
++
++
++
++static bool is_false_clock_pair(const Context *ctx, IdString launch, IdString capture)
++{
++    const ClockConstraint *lc = clock_constraint(ctx, launch), *cc = clock_constraint(ctx, capture);
++    return lc != nullptr && cc != nullptr && cc->name != IdString() && lc->false_path_to.count(cc->name);
++}
++
++
++static bool is_false_path_cell(const Context *ctx, IdString cell, bool as_endpoint)
++{
++    if (!ctx->cells.count(cell))
++        return false;
++    const auto &attrs = ctx->cells.at(cell)->attrs;
++    return attrs.count(ctx->id(as_endpoint ? "NEXTPNR_FALSE_PATH_TO" : "NEXTPNR_FALSE_PATH_FROM"));
++}
++
++
++
++static bool clock_setup_relationship(const Context *ctx, IdString launch, ClockEdge launch_edge, IdString capture,
++                                     ClockEdge capture_edge, delay_t &relationship)
++{
++    const ClockConstraint *lc = clock_constraint(ctx, launch), *cc = clock_constraint(ctx, capture);
++    if (lc == nullptr || cc == nullptr || launch == capture || is_false_clock_pair(ctx, launch, capture))
++        return false;
++    IdString lroot = lc->master != IdString() ? lc->master : lc->name;
++    IdString croot = cc->master != IdString() ? cc->master : cc->name;
++    if (lroot == IdString() || lroot != croot)
++        return false;
++
++
++    int64_t lp = std::llround(ctx->getDelayNS(lc->period.minDelay()) * 1000.0);
++    int64_t cp = std::llround(ctx->getDelayNS(cc->period.minDelay()) * 1000.0);
++    if (lp <= 0 || cp <= 0)
++        return false;
++    auto first_edge = [&](const ClockConstraint *c, ClockEdge edge) {
++        int64_t t = std::llround(ctx->getDelayNS(c->offset) * 1000.0);
++        if (edge == FALLING_EDGE)
++            t += std::llround(ctx->getDelayNS(c->high.minDelay()) * 1000.0);
++        return t;
++    };
++    auto floor_div = [](int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
++    int64_t l0 = first_edge(lc, launch_edge), c0 = first_edge(cc, capture_edge);
++    int64_t span = lp / std::gcd(lp, cp) * cp;
++    int64_t best = std::numeric_limits<int64_t>::max();
++    for (int64_t k = 0; k < 1000 && k * lp < span; k++) {
++        int64_t launch_at = l0 + k * lp;
++        int64_t next_capture = c0 + (floor_div(launch_at - c0, cp) + 1) * cp;
++        best = std::min(best, next_capture - launch_at);
++    }
++    relationship = ctx->getDelayFromNS(best / 1000.0);
++    return true;
++}
++
+ TimingAnalyser::TimingAnalyser(Context *ctx) : ctx(ctx)
+ {
+     // An architecture that models its clock trees asks every analyser -- the
+@@ -258,6 +322,8 @@ void TimingAnalyser::setup_port_domains()
+                     for (auto &fanin : pd.cell_arcs) {
+                         domain_id_t dom;
+                         // registered outputs are startpoints
++                        if (fanin.type == CellArc::CLK_TO_Q && is_false_path_cell(ctx, port.cell, false))
++                            continue;
+                         if (fanin.type == CellArc::CLK_TO_Q)
+                             dom = domain_id(port.cell, fanin.other_port, fanin.edge);
+                         else if (fanin.type == CellArc::STARTPOINT)
+@@ -298,6 +364,8 @@ void TimingAnalyser::setup_port_domains()
+                     for (auto &fanout : pd.cell_arcs) {
+                         domain_id_t dom;
+                         // registered inputs are endpoints
++                        if (fanout.type == CellArc::SETUP && is_false_path_cell(ctx, port.cell, true))
++                            continue;
+                         if (fanout.type == CellArc::SETUP)
+                             dom = domain_id(port.cell, fanout.other_port, fanout.edge);
+                         else if (fanout.type == CellArc::ENDPOINT)
+@@ -329,6 +397,10 @@ void TimingAnalyser::setup_port_domains()
+     for (auto &dp : domain_pairs) {
+         auto &launch_data = domains.at(dp.key.launch);
+         auto &capture_data = domains.at(dp.key.capture);
++        delay_t relationship;
++        if (clock_setup_relationship(ctx, launch_data.key.clock, launch_data.key.edge, capture_data.key.clock,
++                                     capture_data.key.edge, relationship))
++            dp.period = DelayPair(relationship);
+         if (launch_data.key.clock != capture_data.key.clock)
+             continue;
+         IdString clk = launch_data.key.clock;
+@@ -838,6 +910,8 @@ void TimingAnalyser::compute_criticality()
+             // Do not set criticality for asynchronous paths
+             if (domains.at(dp.key.launch).key.is_async() || domains.at(dp.key.capture).key.is_async())
+                 continue;
++            if (is_false_clock_pair(ctx, domains.at(dp.key.launch).key.clock, domains.at(dp.key.capture).key.clock))
++                continue;
+ 
+             float crit =
+                     1.0f - (float(pdp.second.setup_slack) - float(dp.worst_setup_slack)) / float(-dp.worst_setup_slack);
+@@ -1193,12 +1267,22 @@ void TimingAnalyser::build_crit_path_reports()
+ 
+         if (launch.clock == capture.clock && !launch.is_async())
+             continue;
++        if (is_false_clock_pair(ctx, launch.clock, capture.clock))
++            continue;
+ 
+         auto worst_endpoint = get_worst_eps(i, 1);
+         if (worst_endpoint.empty())
+             continue;
+ 
+         xclock_reports.emplace_back(build_critical_path_report(i, worst_endpoint.at(0), true));
++        delay_t relationship;
++        if (clock_setup_relationship(ctx, launch.clock, launch.edge, capture.clock, capture.edge, relationship)) {
++
++            int mcp = setup_multicycle(ctx, worst_endpoint.at(0).cell, capture.clock);
++            relationship += clock_constraint(ctx, capture.clock)->period.minDelay() * (mcp - 1);
++            xclock_reports.back().max_delay = relationship;
++            result.xclock_requirements[xclock_reports.back().clock_pair] = relationship;
++        }
+     }
+ 
+     auto cmp_crit_path = [&](const CriticalPath &ra, const CriticalPath &rb) {
+@@ -1289,6 +1373,8 @@ std::vector<CriticalPath> TimingAnalyser::get_min_delay_violations()
+                 if (launch_id == async_clock_id || (launch_id != capture_id && !related_clocks)) {
+                     continue;
+                 }
++                if (is_false_clock_pair(ctx, launch_clock, capture_clock))
++                    continue;
+ 
+                 delay_t clock_to_clock = 0;
+                 if (related_clocks) {
+diff --git a/common/kernel/timing_log.cc b/common/kernel/timing_log.cc
+index 8e6a3f3c..09ea2b56 100644
+--- a/common/kernel/timing_log.cc
++++ b/common/kernel/timing_log.cc
+@@ -322,6 +322,33 @@ static void log_fmax(Context *ctx, TimingResult &result, bool warn_on_failure)
+         log_break();
+     }
+ 
++
++
++    bool reported_requirement = false;
++    for (auto &report : result.xclock_paths) {
++        if (!result.xclock_requirements.count(report.clock_pair) || xclock_delays.count(report.clock_pair))
++            continue;
++        delay_t path_delay = 0;
++        for (const auto &segment : report.segments)
++            path_delay += segment.delay;
++        delay_t requirement = result.xclock_requirements.at(report.clock_pair);
++        bool passed = path_delay <= requirement;
++        auto ev_a = clock_event_name(ctx, report.clock_pair.start, max_width_xca);
++        auto ev_b = clock_event_name(ctx, report.clock_pair.end, max_width_xcb);
++        std::string msg = stringf("Max delay for %s -> %s: %.02f ns (%s at requirement %.02f ns, slack %.02f ns)\n",
++                                  ev_a.c_str(), ev_b.c_str(), ctx->getDelayNS(path_delay), passed ? "PASS" : "FAIL",
++                                  ctx->getDelayNS(requirement), ctx->getDelayNS(requirement - path_delay));
++        if (!warn_on_failure || passed)
++            log_info("%s", msg.c_str());
++        else if (allow_fail || bool_or_default(ctx->settings, ctx->id("timing/ignoreRelClk"), false))
++            log_warning("%s", msg.c_str());
++        else
++            log_nonfatal_error("%s", msg.c_str());
++        reported_requirement = true;
++    }
++    if (reported_requirement)
++        log_break();
++
+     // Report clock delays for xpaths
+     if (!xclock_delays.empty()) {
+         for (auto &pair : xclock_delays) {
+diff --git a/himbaechel/uarch/xilinx/pack.cc b/himbaechel/uarch/xilinx/pack.cc
+index 53795065..6faa126f 100644
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -1552,6 +1552,7 @@ void XilinxImpl::pack()
+     packer.pack_clocking();
+     packer.pack_gt();
+     packer.generate_constraints();
++    apply_xdc_clock_exceptions();
+     packer.pack_muxfs();
+     packer.pack_carries();
+     packer.pack_srls();
+diff --git a/himbaechel/uarch/xilinx/pack_clocking.cc b/himbaechel/uarch/xilinx/pack_clocking.cc
+index ec3e9545..bb081213 100644
+--- a/himbaechel/uarch/xilinx/pack_clocking.cc
++++ b/himbaechel/uarch/xilinx/pack_clocking.cc
+@@ -800,12 +800,17 @@ void XilinxPacker::generate_constraints()
+         return constr;
+     };
+ 
++
++    auto primary_of = [](const ClockConstraint &c) { return c.master != IdString() ? c.master : c.name; };
++
+     auto set_constraint = [&](CellInfo *ci, IdString port, std::unique_ptr<ClockConstraint> constr) {
+         if (!ci->ports.count(port))
+             return;
+         NetInfo *to = ci->ports.at(port).net;
+         if (to == nullptr)
+             return;
++        if (constr->name == IdString())
++            constr->name = to->name;
+         if (to->clkconstr != nullptr) {
+             if (!equals_epsilon_constr(*to->clkconstr, *constr) && user_constrained.count(to->name))
+                 log_warning("    Overriding derived constraint of %.1f MHz on net %s with user-specified constraint of "
+@@ -836,6 +841,17 @@ void XilinxPacker::generate_constraints()
+             return;
+         }
+         to->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint());
++        const bool is_the_same_clock = ratio == 1.0;
++        if (is_the_same_clock) {
++
++            to->clkconstr->name = from->clkconstr->name;
++            to->clkconstr->master = from->clkconstr->master;
++            to->clkconstr->false_path_to = from->clkconstr->false_path_to;
++        } else {
++            to->clkconstr->name = to->name;
++            to->clkconstr->master = primary_of(*from->clkconstr);
++        }
++        to->clkconstr->offset = from->clkconstr->offset;
+         to->clkconstr->low = DelayPair(ctx->getDelayFromNS(ctx->getDelayNS(from->clkconstr->low.min_delay) / ratio));
+         to->clkconstr->high = DelayPair(ctx->getDelayFromNS(ctx->getDelayNS(from->clkconstr->high.min_delay) / ratio));
+         to->clkconstr->period =
+@@ -933,6 +949,16 @@ void XilinxPacker::generate_constraints()
+                 double vco_period = period_in_div / feedback_div;
+                 double vco_freq = MHz(vco_period);
+                 log_info("    Derived VCO frequency %.1f MHz for PLL '%s'\n", vco_freq, ci->name.c_str(ctx));
++
++
++                const ClockConstraint &clkin = *ci->getPort(id_CLKIN1)->clkconstr;
++                auto pll_clock = [&](double period, IdString phase_param) {
++                    auto constr = simple_clk_contraint(period);
++                    constr->master = primary_of(clkin);
++                    double phase = phase_param == IdString() ? 0.0 : float_or_default(ci, phase_param, 0.0);
++                    constr->offset = clkin.offset + delay_t(period * phase / 360.0);
++                    return constr;
++                };
+ 
+                 for (int i = 0; i <= 6; i++) {
+                     auto port = ctx->idf("CLKOUT%d", i);
+@@ -940,13 +966,14 @@ void XilinxPacker::generate_constraints()
+                         continue;
+                     set_constraint(
+                             ci, port,
+-                            simple_clk_contraint(
+-                                    vco_period *
+-                                    float_or_default(
+-                                            ci,
+-                                            ctx->idf("CLKOUT%d_DIVIDE%s", i,
+-                                                     (ci->type == id_MMCME2_ADV_MMCME2_ADV && i == 0) ? "_F" : ""),
+-                                            1)));
++                            pll_clock(vco_period *
++                                              float_or_default(ci,
++                                                               ctx->idf("CLKOUT%d_DIVIDE%s", i,
++                                                                        (ci->type == id_MMCME2_ADV_MMCME2_ADV && i == 0)
++                                                                                ? "_F"
++                                                                                : ""),
++                                                               1),
++                                      ctx->idf("CLKOUT%d_PHASE", i)));
+                 }
+                 // The MMCM's secondary (inverted) outputs CLKOUT0B..3B run at
+                 // their primary output's rate.
+@@ -955,19 +982,17 @@ void XilinxPacker::generate_constraints()
+                         auto port = ctx->idf("CLKOUT%dB", i);
+                         if (!ci->getPort(port))
+                             continue;
+-                        set_constraint(ci, port,
+-                                       simple_clk_contraint(vco_period *
+-                                                            float_or_default(
+-                                                                    ci,
+-                                                                    ctx->idf("CLKOUT%d_DIVIDE%s", i,
+-                                                                             (i == 0) ? "_F" : ""),
+-                                                                    1)));
++                        double period = vco_period *
++                                        float_or_default(ci, ctx->idf("CLKOUT%d_DIVIDE%s", i, (i == 0) ? "_F" : ""), 1);
++                        auto constr = pll_clock(period, ctx->idf("CLKOUT%d_PHASE", i));
++                        constr->offset += delay_t(period / 2);
++                        set_constraint(ci, port, std::move(constr));
+                     }
+                 }
+                 // CLKFBOUT (and CLKFBOUTB on the MMCM) run at the VCO rate.
+-                set_constraint(ci, ctx->id("CLKFBOUT"), simple_clk_contraint(vco_period));
++                set_constraint(ci, ctx->id("CLKFBOUT"), pll_clock(vco_period, IdString()));
+                 if (ci->type == id_MMCME2_ADV_MMCME2_ADV)
+-                    set_constraint(ci, ctx->id("CLKFBOUTB"), simple_clk_contraint(vco_period));
++                    set_constraint(ci, ctx->id("CLKFBOUTB"), pll_clock(vco_period, IdString()));
+             }
+             // IBUFDS_GTE2 is the reference-clock buffer of a GTP/GTX pad.
+             // A create_clock on that pad constrains the net on I (or IB);
+diff --git a/himbaechel/uarch/xilinx/xdc.cc b/himbaechel/uarch/xilinx/xdc.cc
+index c8c0aa78..759a8e6f 100644
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -36,6 +36,32 @@
+ 
+ NEXTPNR_NAMESPACE_BEGIN
+ 
++
++static bool glob_match(const std::string &name, const std::string &pat)
++{
++    size_t n = 0, p = 0, star = std::string::npos, mark = 0;
++    while (n < name.size()) {
++        bool pattern_remaining = p < pat.size();
++        bool pattern_char_matches = pattern_remaining && (pat[p] == name[n] || pat[p] == '?');
++        bool pattern_at_star = pattern_remaining && pat[p] == '*';
++        bool can_backtrack_to_star = star != std::string::npos;
++        if (pattern_char_matches) {
++            ++n;
++            ++p;
++        } else if (pattern_at_star) {
++            star = p++;
++            mark = n;
++        } else if (can_backtrack_to_star) {
++            p = star + 1;
++            n = ++mark;
++        } else
++            return false;
++    }
++    while (p < pat.size() && pat[p] == '*')
++        ++p;
++    return p == pat.size();
++}
++
+ void XilinxImpl::parse_xdc(const std::string &filename)
+ {
+     auto in = open_ifstream_and_log_error(filename, "XDC file");
+@@ -273,12 +299,296 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+         return &found->second;
+     };
+ 
++
++    auto tcl_words = [](const std::string &str) {
++        std::vector<std::string> words;
++        std::string word;
++        int depth = 0;
++        bool quoted = false;
++        for (char c : str) {
++            if (c == '"' && depth == 0)
++                quoted = !quoted;
++            else if (c == '{' && !quoted)
++                depth++;
++            else if (c == '}' && !quoted)
++                depth--;
++            const bool separates_words = std::isspace(c) && depth == 0 && !quoted;
++            if (!separates_words)
++                word += c;
++            else if (!word.empty()) {
++                words.push_back(word);
++                word.clear();
++            }
++        }
++        if (!word.empty())
++            words.push_back(word);
++        return words;
++    };
++
++
++
++
++
++
++    std::vector<std::pair<std::string, CellInfo *>> cell_names;
++    auto vivado_reg_name = [](std::string net) {
++        size_t bit = net.size() > 0 && net.back() == ']' ? net.rfind('[') : std::string::npos;
++        std::string reg = bit == std::string::npos ? net + "_reg" : net.substr(0, bit) + "_reg" + net.substr(bit);
++        std::replace(reg.begin(), reg.end(), '.', '/');
++        return reg;
++    };
++    auto build_cell_names = [&]() {
++        if (!cell_names.empty())
++            return;
++        dict<IdString, std::vector<IdString>> net_names;
++        for (auto &alias : ctx->net_aliases)
++            net_names[alias.second].push_back(alias.first);
++        for (auto &cell : ctx->cells) {
++            CellInfo *ci = cell.second.get();
++            const bool is_constant_driver = ci->type.in(id_GND, id_VCC);
++            if (is_constant_driver)
++                continue;
++            std::string name = cell.first.str(ctx);
++            cell_names.emplace_back(name, ci);
++            std::string slashed = name;
++            std::replace(slashed.begin(), slashed.end(), '.', '/');
++            if (slashed != name)
++                cell_names.emplace_back(slashed, ci);
++            const bool is_a_register = ci->type.in(id_FDRE, id_FDSE, id_FDCE, id_FDPE, id_LDCE, id_LDPE);
++            NetInfo *q = is_a_register ? ci->getPort(id_Q) : nullptr;
++            if (q == nullptr)
++                continue;
++            pool<std::string> regs;
++            std::vector<IdString> names = net_names.count(q->name) ? net_names.at(q->name) : std::vector<IdString>{};
++            names.push_back(q->name);
++            for (IdString n : names) {
++                const std::string &s = n.str(ctx);
++                const bool is_a_user_name = !s.empty() && s.front() != '$';
++                if (is_a_user_name && regs.insert(vivado_reg_name(s)).second)
++                    cell_names.emplace_back(vivado_reg_name(s), ci);
++            }
++        }
++    };
++
++
++    auto match_cells = [&](const std::string &pattern, const bool is_exact, const bool hier,
++                           std::vector<CellInfo *> &cells) {
++        build_cell_names();
++        const bool is_glob = !is_exact && pattern.find_first_of("*?") != std::string::npos;
++        const bool any_level = hier && pattern.find('/') == std::string::npos;
++        pool<IdString> seen;
++        for (auto &entry : cell_names) {
++            const std::string &name = entry.first;
++            size_t slash = name.rfind('/');
++            std::string leaf = slash == std::string::npos ? name : name.substr(slash + 1);
++            bool hit = is_glob ? glob_match(name, pattern) : name == pattern;
++            if (!hit && any_level)
++                hit = is_glob ? glob_match(leaf, pattern) : leaf == pattern;
++            if (!hit && !is_glob && !debus_zero(pattern).empty())
++                hit = name == debus_zero(pattern);
++            if (hit && seen.insert(entry.second->name).second)
++                cells.push_back(entry.second);
++        }
++    };
++
++
++
++    struct XdcQuery
++    {
++        std::string kind;
++        std::vector<std::string> names;
++        std::vector<std::pair<std::string, bool>> filters;
++        bool hier = false, include_generated = false, supported = true;
++    };
++    auto parse_query = [&](const std::string &sel, const char *what) {
++        XdcQuery q;
++        const bool is_command = sel.size() >= 2 && sel.front() == '[' && sel.back() == ']';
++        std::vector<std::string> words = tcl_words(is_command ? sel.substr(1, sel.size() - 2) : strip_quotes(sel));
++        int cursor = 0;
++        q.kind = "get_cells";
++        if (is_command) {
++            q.kind = words.empty() ? std::string() : words.front();
++            cursor = 1;
++        }
++        const bool is_known_kind = q.kind == "get_cells" || q.kind == "get_ports" || q.kind == "get_pins" ||
++                                   q.kind == "get_nets" || q.kind == "get_clocks";
++        if (!is_known_kind) {
++            log_warning("%s: unsupported query '%s', the command is NOT applied (on line %d)\n", what, sel.c_str(),
++                        lineno);
++            q.supported = false;
++            return q;
++        }
++        for (; cursor < int(words.size()); cursor++) {
++            const std::string &w = words.at(cursor);
++            if (w == "-hier" || w == "-hierarchical") {
++                q.hier = true;
++                continue;
++            }
++            if (w == "-quiet")
++                continue;
++            if (w == "-include_generated_clocks") {
++                q.include_generated = true;
++                continue;
++            }
++            const bool is_filter = w == "-filter" && cursor + 1 < int(words.size());
++            if (is_filter) {
++                std::vector<std::string> expr = tcl_words(strip_quotes(words.at(++cursor)));
++                const bool is_name_filter =
++                        expr.size() == 3 && expr.at(0) == "NAME" && (expr.at(1) == "=~" || expr.at(1) == "==");
++                if (!is_name_filter) {
++                    log_warning("%s: unsupported -filter '%s', only NAME =~ <glob> or NAME == <name>; the "
++                                "command is NOT applied (on line %d)\n",
++                                what, words.at(cursor).c_str(), lineno);
++                    q.supported = false;
++                    return q;
++                }
++                q.filters.emplace_back(strip_quotes(expr.at(2)), expr.at(1) == "==");
++                continue;
++            }
++            if (!w.empty() && w.front() == '-') {
++                log_warning("%s: unsupported %s option '%s', the command is NOT applied (on line %d)\n", what,
++                            q.kind.c_str(), w.c_str(), lineno);
++                q.supported = false;
++                return q;
++            }
++            for (const std::string &name : tcl_words(strip_quotes(w)))
++                q.names.push_back(strip_quotes(name));
++        }
++        return q;
++    };
++
++
++    auto query_cells = [&](const XdcQuery &q) {
++        std::vector<CellInfo *> named, filtered, cells;
++        for (const std::string &name : q.names)
++            match_cells(name, false, q.hier, named);
++        for (const auto &f : q.filters)
++            match_cells(f.first, f.second, q.hier, filtered);
++        if (!q.names.empty() && !q.filters.empty()) {
++            pool<IdString> passes_filter;
++            for (CellInfo *cell : filtered)
++                passes_filter.insert(cell->name);
++            for (CellInfo *cell : named)
++                if (passes_filter.count(cell->name))
++                    cells.push_back(cell);
++        } else {
++            cells = named;
++            cells.insert(cells.end(), filtered.begin(), filtered.end());
++        }
++        return cells;
++    };
++
++    auto query_ports = [&](const XdcQuery &q) {
++        std::vector<IdString> found;
++        pool<IdString> seen;
++        std::vector<std::pair<std::string, bool>> patterns = q.filters;
++        for (const std::string &name : q.names)
++            patterns.emplace_back(name, false);
++        for (const auto &pat : patterns) {
++            const bool is_glob = !pat.second && pat.first.find_first_of("*?") != std::string::npos;
++            if (!is_glob) {
++                IdString id = ctx->id(pat.first);
++                if (!ctx->ports.count(id) && !debus_zero(pat.first).empty())
++                    id = ctx->id(debus_zero(pat.first));
++                if (ctx->ports.count(id) && seen.insert(id).second)
++                    found.push_back(id);
++                continue;
++            }
++            for (auto &port : ctx->ports)
++                if (glob_match(port.first.str(ctx), pat.first) && seen.insert(port.first).second)
++                    found.push_back(port.first);
++        }
++        return found;
++    };
++
++    auto query_pins = [&](const XdcQuery &q) {
++        std::vector<std::pair<CellInfo *, IdString>> pins;
++        std::vector<std::pair<std::string, bool>> patterns = q.filters;
++        for (const std::string &name : q.names)
++            patterns.emplace_back(name, false);
++        for (const auto &pat : patterns) {
++            size_t slash = pat.first.rfind('/');
++            if (slash == std::string::npos)
++                continue;
++            std::string pin = pat.first.substr(slash + 1);
++            std::vector<CellInfo *> cells;
++            match_cells(pat.first.substr(0, slash), pat.second, q.hier, cells);
++            for (CellInfo *ci : cells)
++                for (auto &port : ci->ports)
++                    if (pat.second ? port.first.str(ctx) == pin : glob_match(port.first.str(ctx), pin))
++                        pins.emplace_back(ci, port.first);
++        }
++        return pins;
++    };
++
++    auto query_nets = [&](const XdcQuery &q) {
++        std::vector<NetInfo *> nets;
++        pool<IdString> seen;
++        auto add = [&](NetInfo *ni) {
++            if (ni != nullptr && seen.insert(ni->name).second)
++                nets.push_back(ni);
++        };
++        if (q.kind == "get_ports") {
++            for (IdString port : query_ports(q))
++                add(ctx->ports.at(port).net);
++        } else if (q.kind == "get_pins") {
++            for (auto &pin : query_pins(q))
++                add(pin.first->getPort(pin.second));
++        } else {
++            for (const std::string &name : q.names) {
++                std::string dotted = name;
++                std::replace(dotted.begin(), dotted.end(), '/', '.');
++                const bool is_glob = name.find_first_of("*?") != std::string::npos;
++                if (!is_glob) {
++                    for (const std::string &n : {name, dotted, debus_zero(name)})
++                        if (!n.empty() && ctx->getNetByAlias(ctx->id(n)) != nullptr) {
++                            add(ctx->getNetByAlias(ctx->id(n)));
++                            break;
++                        }
++                    continue;
++                }
++                for (auto &alias : ctx->net_aliases)
++                    if (glob_match(alias.first.str(ctx), name) || glob_match(alias.first.str(ctx), dotted))
++                        add(ctx->nets.at(alias.second).get());
++            }
++        }
++        return nets;
++    };
++
++    auto query_clocks = [&](const XdcQuery &q) {
++        std::vector<XdcClockPattern> clocks;
++        for (const std::string &name : q.names)
++            clocks.push_back(XdcClockPattern{name, q.include_generated});
++        for (const auto &f : q.filters)
++            clocks.push_back(XdcClockPattern{f.first, q.include_generated});
++        return clocks;
++    };
++
++    auto query_endpoint_cells = [&](const XdcQuery &q) {
++        std::vector<CellInfo *> cells;
++        if (q.kind == "get_cells")
++            cells = query_cells(q);
++        else if (q.kind == "get_pins")
++            for (auto &pin : query_pins(q))
++                cells.push_back(pin.first);
++        return cells;
++    };
++
+     while (std::getline(in, line)) {
+         ++lineno;
+         // Trim comments, from # until end of the line
+         size_t cstart = line.find('#');
+         if (cstart != std::string::npos)
+             line = line.substr(0, cstart);
++
++        size_t last = line.find_last_not_of(" \t\r");
++        const bool continues = last != std::string::npos && line.at(last) == '\\';
++        if (continues) {
++            linebuf += line.substr(0, last) + " ";
++            continue;
++        }
++        line = linebuf + line;
++        linebuf.clear();
+         if (isempty(line))
+             continue;
+ 
+@@ -313,7 +623,22 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 continue;
+             }
+             if (arguments.at(3).size() > 2 && arguments.at(3) == "[current_design]") {
+-                log_warning("[current_design] isn't supported, ignoring (on line %d)\n", lineno);
++
++                for (const auto &pair : arg_pairs) {
++                    const bool is_check_only = pair.first == "CFGBVS" || pair.first == "CONFIG_VOLTAGE";
++                    const bool is_bitstream_setting =
++                            pair.first.compare(0, 10, "BITSTREAM.") == 0 || pair.first == "CONFIG_MODE";
++                    if (is_check_only)
++                        log_info("[current_design] %s: Vivado checks the I/O banks against it, and it sets no "
++                                 "configuration bits; nothing to do (on line %d)\n",
++                                 pair.first.c_str(), lineno);
++                    else if (is_bitstream_setting)
++                        log_warning("[current_design] %s %s is NOT applied: the bitstream is written with "
++                                    "xc7frames2bit's defaults (on line %d)\n",
++                                    pair.first.c_str(), pair.second.c_str(), lineno);
++                    else
++                        log_warning("[current_design] %s is NOT applied (on line %d)\n", pair.first.c_str(), lineno);
++                }
+                 continue;
+             }
+             const bool targets_a_pblock = arguments.at(3).compare(0, 12, "[get_pblocks") == 0;
+@@ -339,41 +664,131 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 }
+                 goto nextline;
+             }
+-            // All remaining arguments are supposed to designate cells
++
++
+             std::vector<CellInfo *> dest;
++            int unapplied_targets = 0;
+             for (int cursor = 3; cursor < int(arguments.size()); cursor++) {
+-                std::vector<CellInfo *> dest_loc = get_cells(arguments.at(cursor), false);
+-                // misses are reported (verbose-only) inside get_cells now
+-                dest.insert(dest.end(), dest_loc.begin(), dest_loc.end());
++                const std::string &target = arguments.at(cursor);
++                XdcQuery q = parse_query(target, "set_property");
++                if (!q.supported)
++                    continue;
++                if (q.kind == "get_ports") {
++                    std::vector<IdString> ports = query_ports(q);
++                    for (IdString port : ports)
++                        if (ctx->cells.count(port))
++                            dest.push_back(ctx->cells.at(port).get());
++                    const bool names_a_glob = target.find_first_of("*?") != std::string::npos;
++                    if (ports.empty() && names_a_glob)
++                        log_warning("set_property: %s matches no port, so it is NOT applied (on line %d)\n",
++                                    target.c_str(), lineno);
++                    else if (ports.empty()) {
++
++
++
++
++                        missing_targets++;
++                        if (ctx->verbose)
++                            log_info("get_ports: no port %s (on line %d) - this target is ignored\n", target.c_str(),
++                                     lineno);
++                    }
++                } else if (q.kind == "get_cells") {
++                    std::vector<CellInfo *> cells = query_cells(q);
++                    if (cells.empty())
++                        log_warning("set_property: %s matches no cell, so it is NOT applied (on line %d)\n",
++                                    target.c_str(), lineno);
++                    dest.insert(dest.end(), cells.begin(), cells.end());
++                } else if (q.kind == "get_nets") {
++                    unapplied_targets += int(query_nets(q).size());
++                } else if (q.kind == "get_pins") {
++                    unapplied_targets += int(query_pins(q).size());
++                } else {
++                    log_warning("set_property: %s is NOT applied to %s (on line %d)\n", arguments.at(1).c_str(),
++                                q.kind.c_str(), lineno);
++                }
+             }
+-            for (auto c : dest) {
+-                for (const auto &pair : arg_pairs) {
+-                    IdString id_prop = ctx->id(pair.first);
++
++
++            const pool<std::string> applied = {"PACKAGE_PIN", "LOC", "BEL", "IOSTANDARD", "DRIVE",
++                                               "SLEW", "PULLTYPE", "IN_TERM"};
++            const dict<std::string, std::string> why_not_applied = {
++                    {"DIFF_TERM", "nothing writes the differential termination, so the input is left unterminated"},
++                    {"IOB", "registers are not moved into the I/O logic; the flip-flop stays in a slice"},
++                    {"ASYNC_REG", "synchronizer flip-flops are not kept together, and yosys may already have "
++                                  "made a shift register (SRL) of the chain; (* keep *) on the registers stops that"},
++                    {"KEEP", "synthesis is over when the XDC is read; put it in the RTL for yosys"},
++                    {"DONT_TOUCH", "synthesis is over when the XDC is read; put it in the RTL for yosys"},
++                    {"KEEP_HIERARCHY", "the netlist is already flat when the XDC is read"},
++                    {"MARK_DEBUG", "no debug core is inserted"},
++                    {"CLOCK_DEDICATED_ROUTE", "the router finds a clock route without checking for a dedicated one"},
++                    {"IODELAY_GROUP", "IDELAYCTRL instances are not grouped by it"},
++                    {"OFFCHIP_TERM", "only Vivado's I/O reports use it"},
++            };
++            for (const auto &pair : arg_pairs) {
++                std::string prop = pair.first, value = pair.second;
++
++                const bool is_pull_flag = prop == "PULLUP" || prop == "PULLDOWN" || prop == "KEEPER";
++                const bool value_is_true = value == "TRUE" || value == "true" || value == "1";
++                if (is_pull_flag && !value_is_true)
++                    continue;
++                if (is_pull_flag) {
++                    value = prop;
++                    prop = "PULLTYPE";
++                }
++
++
++                const bool is_a_site_bel = prop == "BEL" && value.find('/') == std::string::npos;
++                if (is_a_site_bel) {
++                    prop = "NEXTPNR_SITE_BEL";
++                    value = value.substr(value.rfind('.') == std::string::npos ? 0 : value.rfind('.') + 1);
++                }
++                const bool is_applied = applied.count(prop) || prop.compare(0, 8, "NEXTPNR_") == 0;
++                const int targets = int(dest.size()) + unapplied_targets;
++                if ((!is_applied || unapplied_targets > 0) && targets > 0) {
++                    auto reason = why_not_applied.find(prop);
++                    log_warning("set_property %s on %d object(s) is NOT applied: %s (on line %d)\n", prop.c_str(),
++                                is_applied ? unapplied_targets : targets,
++                                reason != why_not_applied.end() ? reason->second.c_str()
++                                : is_applied ? "a net or pin does not carry it"
++                                             : "nothing in place and route reads it",
++                                lineno);
++                }
++                for (auto c : dest) {
++                    IdString id_prop = ctx->id(prop);
+                     if (ctx->debug)
+-                        log_info("applying property '%s' = '%s' to cell '%s' (on line %d)\n", pair.first.c_str(),
+-                                 pair.second.c_str(), c->name.c_str(ctx), lineno);
+-                    if (c->attrs.find(id_prop) != c->attrs.end()) {
+-                        log_nonfatal_error("found multiple properties '%s' for cell '%s' (on line %d)\n",
+-                                           pair.first.c_str(), c->name.c_str(ctx), lineno);
+-                        num_errors++;
+-                    }
+-                    c->attrs[id_prop] = std::string(pair.second);
+-                    if (pair.first == "PACKAGE_PIN")
+-                        c->attrs[id_LOC] = std::string(pair.second);
++                        log_info("applying property '%s' = '%s' to cell '%s' (on line %d)\n", prop.c_str(),
++                                 value.c_str(), c->name.c_str(ctx), lineno);
++                    auto found = c->attrs.find(id_prop);
++                    const bool replaces_a_value =
++                            found != c->attrs.end() && (!found->second.is_string || found->second.as_string() != value);
++                    if (replaces_a_value)
++                        log_warning("set_property %s: '%s' replaces the earlier value on cell '%s'; the later one "
++                                    "wins, as in Vivado (on line %d)\n",
++                                    prop.c_str(), value.c_str(), c->name.c_str(ctx), lineno);
++                    c->attrs[id_prop] = value;
++                    if (prop == "PACKAGE_PIN")
++                        c->attrs[id_LOC] = value;
+                 }
+             }
+         } else if (cmd == "create_clock") {
+             double period = 0;
+             bool got_period = false;
++            std::string clock_name;
++            std::vector<double> waveform;
+             int cursor = 1;
+             for (cursor = 1; cursor < int(arguments.size()); cursor++) {
+                 std::string opt = arguments.at(cursor);
++                const bool has_value = cursor + 1 < int(arguments.size());
+                 if (opt == "-add") {
+-                    log_warning("ignoring unsupported XDC option '%s' (on line %d)\n", opt.c_str(), lineno);
+-                } else if (opt == "-name" || opt == "-waveform") {
+-                    log_warning("ignoring unsupported XDC option '%s' (on line %d)\n", opt.c_str(), lineno);
+-                    cursor++;
+-                } else if (opt == "-period") {
++                    log_warning("create_clock -add: a second clock on a net is not supported, the clock replaces "
++                                "none (on line %d)\n",
++                                lineno);
++                } else if (opt == "-name" && has_value) {
++                    clock_name = strip_quotes(arguments.at(++cursor));
++                } else if (opt == "-waveform" && has_value) {
++                    for (const std::string &edge : tcl_words(strip_quotes(arguments.at(++cursor))))
++                        waveform.push_back(std::stod(edge));
++                } else if (opt == "-period" && has_value) {
+                     cursor++;
+                     period = std::stod(arguments.at(cursor));
+                     got_period = true;
+@@ -385,21 +800,42 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 num_errors++;
+                 goto nextline;
+             }
++            const bool has_a_usable_waveform = waveform.size() == 2 && waveform.at(1) > waveform.at(0) &&
++                                               waveform.at(1) - waveform.at(0) < period;
++            if (!waveform.empty() && !has_a_usable_waveform) {
++                log_nonfatal_error("create_clock -waveform takes {<rise> <fall>} within the period (on line %d)\n",
++                                   lineno);
++                num_errors++;
++                goto nextline;
++            }
+             // All remaining arguments are supposed to designate ports/nets
+             std::vector<NetInfo *> dest;
+             if (cursor >= int(arguments.size())) {
+                 // virtual clock (no target ports/nets): not supported; skip it
+                 // instead of silently constraining nothing
+-                log_warning("ignoring virtual clock (unsupported, on line %d)\n", lineno);
++                log_warning("create_clock %s: a virtual clock is NOT supported, and so neither are I/O delays "
++                            "against it (on line %d)\n",
++                            clock_name.c_str(), lineno);
+                 goto nextline;
+             }
+             for (; cursor < (int)arguments.size(); cursor++) {
+-                std::vector<NetInfo *> dest_loc = get_nets(arguments.at(cursor));
++                const std::string &target = arguments.at(cursor);
++                const bool is_a_plain_query = target.compare(0, 10, "[get_ports") == 0 ||
++                                              target.compare(0, 9, "[get_nets") == 0;
++                const bool names_a_glob = target.find_first_of("*?{") != std::string::npos;
++                std::vector<NetInfo *> dest_loc;
++                if (is_a_plain_query && !names_a_glob)
++                    dest_loc = get_nets(target);
++                else {
++                    XdcQuery q = parse_query(target, "create_clock");
++                    if (q.supported)
++                        dest_loc = query_nets(q);
++                }
+                 if (dest_loc.empty())
+                     log_warning("create_clock: target %s matched nothing, so the %.3f ns constraint "
+                                 "was NOT applied (on line %d). The clock domain keeps the default "
+                                 "target and will be reported as meeting timing at that default.\n",
+-                                arguments.at(cursor).c_str(), period, lineno);
++                                target.c_str(), period, lineno);
+                 dest.insert(dest.end(), dest_loc.begin(), dest_loc.end());
+             }
+             for (auto n : dest) {
+@@ -412,146 +848,269 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 }
+                 n->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint);
+                 n->clkconstr->period = DelayPair(ctx->getDelayFromNS(period));
+-                n->clkconstr->high = DelayPair(ctx->getDelayFromNS(period / 2));
+-                n->clkconstr->low = DelayPair(ctx->getDelayFromNS(period / 2));
++                if (has_a_usable_waveform) {
++                    double high = waveform.at(1) - waveform.at(0);
++                    n->clkconstr->high = DelayPair(ctx->getDelayFromNS(high));
++                    n->clkconstr->low = DelayPair(ctx->getDelayFromNS(period - high));
++                    n->clkconstr->offset = ctx->getDelayFromNS(waveform.at(0));
++                } else {
++                    n->clkconstr->high = DelayPair(ctx->getDelayFromNS(period / 2));
++                    n->clkconstr->low = DelayPair(ctx->getDelayFromNS(period / 2));
++                }
++
++                n->clkconstr->name = ctx->id(clock_name.empty() ? dest.front()->name.str(ctx) : clock_name);
+             }
++        } else if (cmd == "create_generated_clock") {
++
++
++
++            std::string clock_name, source;
++            double divide_by = 1, multiply_by = 1, duty_cycle = 50;
++            bool invert = false;
++            std::vector<int> edges;
++            std::vector<std::string> targets;
++            for (int c = 1; c < int(arguments.size()); c++) {
++                const std::string &a = arguments.at(c);
++                const bool has_value = c + 1 < int(arguments.size());
++                if (a == "-name" && has_value)
++                    clock_name = strip_quotes(arguments.at(++c));
++                else if (a == "-source" && has_value)
++                    source = arguments.at(++c);
++                else if (a == "-divide_by" && has_value)
++                    divide_by = std::stod(arguments.at(++c));
++                else if (a == "-multiply_by" && has_value)
++                    multiply_by = std::stod(arguments.at(++c));
++                else if (a == "-duty_cycle" && has_value)
++                    duty_cycle = std::stod(arguments.at(++c));
++                else if (a == "-invert")
++                    invert = true;
++                else if (a == "-combinational" || a == "-add")
++                    continue;
++                else if (a == "-master_clock" && has_value)
++                    ++c;
++                else if (a == "-edges" && has_value) {
++                    for (const std::string &e : tcl_words(strip_quotes(arguments.at(++c))))
++                        edges.push_back(std::stoi(e));
++                } else if (!a.empty() && a.front() == '-') {
++                    log_warning("create_generated_clock: unsupported option '%s', the clock is NOT created (on line "
++                                "%d)\n",
++                                a.c_str(), lineno);
++                    goto nextline;
++                } else
++                    targets.push_back(a);
++            }
++            const bool has_three_edges =
++                    edges.size() == 3 && edges.at(0) >= 1 && edges.at(0) < edges.at(1) && edges.at(1) < edges.at(2);
++            const bool is_complete = !source.empty() && !targets.empty() && divide_by > 0 && multiply_by > 0 &&
++                                     duty_cycle > 0 && duty_cycle < 100 && (edges.empty() || has_three_edges);
++            if (!is_complete) {
++                log_warning("create_generated_clock needs -source, a target and a valid ratio or three -edges; the "
++                            "clock is NOT created (on line %d)\n",
++                            lineno);
++                goto nextline;
++            }
++            XdcQuery source_query = parse_query(source, "create_generated_clock");
++            std::vector<NetInfo *> sources = source_query.supported ? query_nets(source_query) : std::vector<NetInfo *>{};
++            const ClockConstraint *master = sources.size() == 1 ? sources.front()->clkconstr.get() : nullptr;
++            if (master == nullptr) {
++                log_warning("create_generated_clock: the source %s is not one net with a clock (create_clock comes "
++                            "first), so the clock is NOT created (on line %d)\n",
++                            source.c_str(), lineno);
++                goto nextline;
++            }
++            double master_period = ctx->getDelayNS(master->period.minDelay());
++            double period = master_period * divide_by / multiply_by;
++            double high = period * duty_cycle / 100.0;
++            double offset = ctx->getDelayNS(master->offset);
++            if (has_three_edges) {
++                period = (edges.at(2) - edges.at(0)) * master_period / 2;
++                high = (edges.at(1) - edges.at(0)) * master_period / 2;
++                offset += (edges.at(0) - 1) * master_period / 2;
++            }
++            if (invert)
++                offset += high;
++            for (const std::string &target : targets) {
++                XdcQuery q = parse_query(target, "create_generated_clock");
++                std::vector<NetInfo *> nets = q.supported ? query_nets(q) : std::vector<NetInfo *>{};
++                if (nets.empty())
++                    log_warning("create_generated_clock: target %s matched nothing, so the clock is NOT created "
++                                "(on line %d)\n",
++                                target.c_str(), lineno);
++                for (NetInfo *n : nets) {
++                    if (n->clkconstr != nullptr)
++                        log_warning("create_generated_clock replaces the clock on net '%s' (on line %d)\n",
++                                    n->name.c_str(ctx), lineno);
++                    auto constr = std::make_unique<ClockConstraint>();
++                    constr->period = DelayPair(ctx->getDelayFromNS(period));
++                    constr->high = DelayPair(ctx->getDelayFromNS(high));
++                    constr->low = DelayPair(ctx->getDelayFromNS(period - high));
++                    constr->offset = ctx->getDelayFromNS(offset);
++                    constr->name = ctx->id(clock_name.empty() ? n->name.str(ctx) : clock_name);
++                    constr->master = master->master != IdString() ? master->master : master->name;
++                    log_info("create_generated_clock: clock '%s' of %.3f ns on net '%s', from clock '%s' (on line "
++                             "%d)\n",
++                             constr->name.c_str(ctx), period, n->name.c_str(ctx), constr->master.c_str(ctx), lineno);
++                    n->clkconstr = std::move(constr);
++                }
++            }
++        } else if (cmd == "set_clock_groups") {
++
++
++            XdcClockException ex;
++            ex.is_groups = true;
++            ex.lineno = lineno;
++            bool has_a_kind = false;
++            for (int c = 1; c < int(arguments.size()); c++) {
++                const std::string &a = arguments.at(c);
++                const bool has_value = c + 1 < int(arguments.size());
++                if (a == "-asynchronous" || a == "-logically_exclusive" || a == "-physically_exclusive")
++                    has_a_kind = true;
++                else if (a == "-name" && has_value)
++                    ++c;
++                else if (a == "-group" && has_value) {
++                    const std::string &g = arguments.at(++c);
++                    const bool is_command = !g.empty() && g.front() == '[';
++                    std::vector<XdcClockPattern> group;
++                    if (!is_command) {
++                        for (const std::string &name : tcl_words(strip_quotes(g)))
++                            group.push_back(XdcClockPattern{strip_quotes(name), false});
++                    } else {
++                        for (const std::string &sub : split_to_args(g, true)) {
++                            XdcQuery q = parse_query(sub, "set_clock_groups");
++                            if (!q.supported)
++                                goto nextline;
++                            if (q.kind != "get_clocks") {
++                                log_warning("set_clock_groups -group takes clocks, not %s; NOT applied (on line %d)\n",
++                                            q.kind.c_str(), lineno);
++                                goto nextline;
++                            }
++                            for (auto &p : query_clocks(q))
++                                group.push_back(p);
++                        }
++                    }
++                    ex.groups.push_back(group);
++                } else {
++                    log_warning("set_clock_groups: unsupported argument '%s', NOT applied (on line %d)\n", a.c_str(),
++                                lineno);
++                    goto nextline;
++                }
++            }
++            if (!has_a_kind || ex.groups.empty()) {
++                log_warning("set_clock_groups needs -asynchronous or -*_exclusive and a -group; NOT applied (on line "
++                            "%d)\n",
++                            lineno);
++                goto nextline;
++            }
++            xdc_clock_exceptions.push_back(ex);
++        } else if (cmd == "set_false_path") {
++
++
++            std::string from, to;
++            bool hold_only = false, setup_only = false;
++            for (int c = 1; c < int(arguments.size()); c++) {
++                const std::string &a = arguments.at(c);
++                const bool has_value = c + 1 < int(arguments.size());
++                if (a == "-from" && has_value)
++                    from = arguments.at(++c);
++                else if (a == "-to" && has_value)
++                    to = arguments.at(++c);
++                else if (a == "-setup")
++                    setup_only = true;
++                else if (a == "-hold")
++                    hold_only = true;
++                else if (a == "-reset_path")
++                    continue;
++                else {
++                    log_warning("set_false_path: unsupported argument '%s' (only -from, -to, -setup), NOT applied (on "
++                                "line %d)\n",
++                                a.c_str(), lineno);
++                    goto nextline;
++                }
++            }
++            if (hold_only && !setup_only) {
++                log_warning("set_false_path -hold is NOT applied: hold checks are not relaxed alone (on line %d)\n",
++                            lineno);
++                goto nextline;
++            }
++            if (from.empty() && to.empty()) {
++                log_warning("set_false_path without -from or -to is NOT applied (on line %d)\n", lineno);
++                goto nextline;
++            }
++            XdcQuery fq, tq;
++            fq.kind = tq.kind = "";
++            if (!from.empty())
++                fq = parse_query(from, "set_false_path");
++            if (!to.empty())
++                tq = parse_query(to, "set_false_path");
++            if (!fq.supported || !tq.supported)
++                goto nextline;
++            auto is_clocks = [](const XdcQuery &q) { return q.kind.empty() || q.kind == "get_clocks"; };
++            auto is_cells = [](const XdcQuery &q) { return q.kind == "get_cells" || q.kind == "get_pins"; };
++            if (is_clocks(fq) && is_clocks(tq)) {
++                XdcClockException ex;
++                ex.lineno = lineno;
++                ex.from = query_clocks(fq);
++                ex.to = query_clocks(tq);
++                xdc_clock_exceptions.push_back(ex);
++                goto nextline;
++            }
++            const bool touches_only_ports = (fq.kind.empty() || fq.kind == "get_ports") &&
++                                            (tq.kind.empty() || tq.kind == "get_ports");
++            if (touches_only_ports) {
++                log_info("set_false_path: paths to and from ports are not timed here, so this changes nothing (on "
++                         "line %d)\n",
++                         lineno);
++                goto nextline;
++            }
++            const bool one_side_cells = (is_cells(fq) && tq.kind.empty()) || (fq.kind.empty() && is_cells(tq));
++            if (!one_side_cells) {
++                log_warning("set_false_path -from %s -to %s is NOT applied: only clocks to clocks, or cells on one "
++                            "side alone, are taken (on line %d)\n",
++                            from.c_str(), to.c_str(), lineno);
++                goto nextline;
++            }
++            const bool is_to = !tq.kind.empty();
++            std::vector<CellInfo *> cells = query_endpoint_cells(is_to ? tq : fq);
++            IdString tag = ctx->id(is_to ? "NEXTPNR_FALSE_PATH_TO" : "NEXTPNR_FALSE_PATH_FROM");
++            for (CellInfo *ci : cells)
++                ci->attrs[tag] = std::string("1");
++            if (cells.empty())
++                log_warning("set_false_path: %s matches no cell, so it is NOT applied (on line %d)\n",
++                            (is_to ? to : from).c_str(), lineno);
++            else
++                log_info("set_false_path: no path %s %d cell(s) is timed (on line %d)\n", is_to ? "to" : "from",
++                         int(cells.size()), lineno);
++        } else if (cmd == "set_max_delay" || cmd == "set_min_delay") {
++            log_warning("%s is NOT applied: the path is timed as if it were not there (against the clock "
++                        "relationship, or not at all between unrelated clocks) (on line %d)\n",
++                        cmd.c_str(), lineno);
++        } else if (cmd == "set_input_delay" || cmd == "set_output_delay") {
++            log_warning("%s is NOT applied: paths to and from ports are not timed (on line %d)\n", cmd.c_str(),
++                        lineno);
++        } else if (cmd == "set_clock_uncertainty" || cmd == "set_clock_latency" || cmd == "set_input_jitter" ||
++                   cmd == "set_system_jitter") {
++            log_warning("%s is NOT applied: the timing analysis does not model it, so slack is reported without it "
++                        "(on line %d)\n",
++                        cmd.c_str(), lineno);
++        } else if (cmd == "set_case_analysis" || cmd == "set_disable_timing") {
++            log_warning("%s is NOT applied: every timing arc stays timed (on line %d)\n", cmd.c_str(), lineno);
+         } else if (cmd == "set_multicycle_path") {
+             // set_multicycle_path [-setup|-hold] [-end] <N> -to <sel>: the -to cells carry N (NEXTPNR_MCP_SETUP)
+             // for the timing analysis. <sel> is a list of cell names, or [get_cells ...] with names or
+             // -filter {NAME =~ <glob>} or {NAME == <name>}. get_pins and get_nets are not taken: the tag relaxes
+             // every input of a cell, and Vivado does not apply a net in -to.
+             //  (Port of nextpnr-xilinx 813bb715.)
+-            auto glob_match = [](const std::string &name, const std::string &pat) {
+-                // simple '*' wildcard match
+-                size_t n = 0, p = 0, star = std::string::npos, mark = 0;
+-                while (n < name.size()) {
+-                    bool pattern_remaining = p < pat.size();
+-                    bool pattern_char_matches = pattern_remaining && (pat[p] == name[n] || pat[p] == '?');
+-                    bool pattern_at_star = pattern_remaining && pat[p] == '*';
+-                    bool can_backtrack_to_star = star != std::string::npos;
+-                    if (pattern_char_matches) {
+-                        ++n;
+-                        ++p;
+-                    } else if (pattern_at_star) {
+-                        star = p++;
+-                        mark = n;
+-                    } else if (can_backtrack_to_star) {
+-                        p = star + 1;
+-                        n = ++mark;
+-                    } else
+-                        return false;
+-                }
+-                while (p < pat.size() && pat[p] == '*')
+-                    ++p;
+-                return p == pat.size();
+-            };
+-            // The cells a name or glob selects; an exact name (NAME ==) is never a glob
+-            auto add_matches = [&](const std::string &pattern, const bool is_exact, std::vector<CellInfo *> &cells) {
+-                const bool is_glob = !is_exact && pattern.find_first_of("*?") != std::string::npos;
+-                if (!is_glob) {
+-                    IdString name = ctx->id(pattern);
+-                    if (!ctx->cells.count(name) && !debus_zero(pattern).empty())
+-                        name = ctx->id(debus_zero(pattern));
+-                    if (ctx->cells.count(name))
+-                        cells.push_back(ctx->cells.at(name).get());
+-                    return;
+-                }
+-                for (auto &cell : ctx->cells) {
+-                    // the JSON frontend's constant drivers, e.g. "g[0].q.CE$const$VCC$12", are not paths
+-                    const bool is_constant_driver = cell.second->type.in(id_GND, id_VCC);
+-                    if (!is_constant_driver && glob_match(cell.first.str(ctx), pattern))
+-                        cells.push_back(cell.second.get());
+-                }
+-            };
+-            // Tcl words: {...} and "..." group, and brackets stay in a name such as g[3].q
+-            auto tcl_words = [](const std::string &str) {
+-                std::vector<std::string> words;
+-                std::string word;
+-                int depth = 0;
+-                bool quoted = false;
+-                for (char c : str) {
+-                    if (c == '"' && depth == 0)
+-                        quoted = !quoted;
+-                    else if (c == '{' && !quoted)
+-                        depth++;
+-                    else if (c == '}' && !quoted)
+-                        depth--;
+-                    const bool separates_words = std::isspace(c) && depth == 0 && !quoted;
+-                    if (!separates_words)
+-                        word += c;
+-                    else if (!word.empty()) {
+-                        words.push_back(word);
+-                        word.clear();
+-                    }
+-                }
+-                if (!word.empty())
+-                    words.push_back(word);
+-                return words;
+-            };
+             // The cells of a -to selector; false, with a warning, for a form this reader does not take
+             auto select_cells = [&](const std::string &sel, std::vector<CellInfo *> &cells) {
+-                const bool is_command = sel.size() >= 2 && sel.front() == '[' && sel.back() == ']';
+-                std::vector<std::string> words =
+-                        tcl_words(is_command ? sel.substr(1, sel.size() - 2) : strip_quotes(sel));
+-                std::string kind = "get_cells";
+-                int cursor = 0;
+-                if (is_command) {
+-                    kind = words.empty() ? std::string() : words.front();
+-                    const bool is_supported_command = kind == "get_cells";
+-                    if (!is_supported_command) {
+-                        log_warning("ignoring set_multicycle_path with unsupported selector '%s' (on line %d)\n",
+-                                    sel.c_str(), lineno);
+-                        return false;
+-                    }
+-                    cursor = 1;
+-                }
+-                // -filter narrows the named objects, as in Vivado; without names it selects from all of them
+-                std::vector<CellInfo *> named, filtered;
+-                bool has_names = false, has_filter = false;
+-                for (; cursor < int(words.size()); cursor++) {
+-                    const std::string &w = words.at(cursor);
+-                    const bool names_are_flat = w == "-hier" || w == "-hierarchical" || w == "-quiet";
+-                    if (names_are_flat)
+-                        continue;
+-                    const bool is_filter = w == "-filter" && cursor + 1 < int(words.size());
+-                    if (is_filter) {
+-                        // only NAME =~ <glob> and NAME == <name>
+-                        std::vector<std::string> expr = tcl_words(strip_quotes(words.at(++cursor)));
+-                        const bool is_name_filter =
+-                                expr.size() == 3 && expr.at(0) == "NAME" && (expr.at(1) == "=~" || expr.at(1) == "==");
+-                        if (!is_name_filter) {
+-                            log_warning("ignoring set_multicycle_path with unsupported -filter '%s', only "
+-                                        "NAME =~ <glob> or NAME == <name> (on line %d)\n",
+-                                        words.at(cursor).c_str(), lineno);
+-                            return false;
+-                        }
+-                        // NAME == compares the whole name, as in Vivado: a '*' there is not a wildcard
+-                        const bool is_exact = expr.at(1) == "==";
+-                        add_matches(strip_quotes(expr.at(2)), is_exact, filtered);
+-                        has_filter = true;
+-                        continue;
+-                    }
+-                    const bool is_other_option = w.front() == '-';
+-                    if (is_other_option) {
+-                        log_warning("ignoring set_multicycle_path with unsupported %s option '%s' (on line %d)\n",
+-                                    kind.c_str(), w.c_str(), lineno);
+-                        return false;
+-                    }
+-                    for (const std::string &name : tcl_words(strip_quotes(w)))
+-                        add_matches(name, false, named);
+-                    has_names = true;
+-                }
+-                if (has_names && has_filter) {
+-                    pool<IdString> passes_filter;
+-                    for (CellInfo *cell : filtered)
+-                        passes_filter.insert(cell->name);
+-                    for (CellInfo *cell : named)
+-                        if (passes_filter.count(cell->name))
+-                            cells.push_back(cell);
+-                } else {
+-                    cells.insert(cells.end(), named.begin(), named.end());
+-                    cells.insert(cells.end(), filtered.begin(), filtered.end());
++                XdcQuery q = parse_query(sel, "set_multicycle_path");
++                if (!q.supported)
++                    return false;
++                if (q.kind != "get_cells") {
++                    log_warning("ignoring set_multicycle_path with unsupported selector '%s' (on line %d)\n",
++                                sel.c_str(), lineno);
++                    return false;
+                 }
++                cells = query_cells(q);
+                 return true;
+             };
+             int cycles = 0;
+@@ -778,7 +1337,7 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             log_info("resize_pblock: pblock '%s' has %d bel(s) (on line %d)\n", pb->region.c_str(ctx),
+                      int(pb_region->bels.size()), lineno);
+         } else {
+-            log_warning("ignoring unsupported XDC command '%s' (on line %d)\n", cmd.c_str(), lineno);
++            log_warning("unsupported XDC command '%s' is NOT applied (on line %d)\n", cmd.c_str(), lineno);
+         }
+ 
+     nextline:; // Phony statement to have something legal after the label
+@@ -1028,4 +1587,85 @@ void XilinxImpl::add_pblock_routing_tiles(Region *pb_region)
+                     pb_region->name.c_str(ctx), unpaired);
+ }
+ 
++
++
++
++
++void XilinxImpl::apply_xdc_clock_exceptions()
++{
++    if (xdc_clock_exceptions.empty())
++        return;
++    dict<IdString, IdString> clock_primary;
++    for (auto &net : ctx->nets) {
++        const ClockConstraint *cc = net.second->clkconstr.get();
++        if (cc != nullptr && cc->name != IdString())
++            clock_primary[cc->name] = cc->master;
++    }
++    auto resolve = [&](const std::vector<XdcClockPattern> &patterns, int lineno) {
++        pool<IdString> clocks;
++        for (const auto &pat : patterns) {
++            std::string dotted = pat.pattern;
++            std::replace(dotted.begin(), dotted.end(), '/', '.');
++            bool matched = false;
++            for (auto &clk : clock_primary) {
++                const std::string &name = clk.first.str(ctx);
++                bool hit = glob_match(name, pat.pattern) || glob_match(name, dotted);
++                const bool is_generated = clk.second != IdString();
++                if (!hit && pat.include_generated && is_generated)
++                    hit = glob_match(clk.second.str(ctx), pat.pattern);
++                if (hit) {
++                    clocks.insert(clk.first);
++                    matched = true;
++                }
++            }
++            if (!matched)
++                log_warning("clock '%s' (on line %d) is none of this design's clocks, so the exception is NOT "
++                            "applied to it\n",
++                            pat.pattern.c_str(), lineno);
++        }
++        return clocks;
++    };
++    pool<IdString> all_clocks;
++    for (auto &clk : clock_primary)
++        all_clocks.insert(clk.first);
++    dict<IdString, pool<IdString>> false_path_to;
++    for (const auto &ex : xdc_clock_exceptions) {
++        std::vector<pool<IdString>> sides;
++        if (ex.is_groups) {
++            for (const auto &group : ex.groups)
++                sides.push_back(resolve(group, ex.lineno));
++            if (sides.size() == 1) {
++                pool<IdString> others;
++                for (IdString clk : all_clocks)
++                    if (!sides.front().count(clk))
++                        others.insert(clk);
++                sides.push_back(others);
++            }
++        } else {
++            sides.push_back(ex.from.empty() ? all_clocks : resolve(ex.from, ex.lineno));
++            sides.push_back(ex.to.empty() ? all_clocks : resolve(ex.to, ex.lineno));
++        }
++        for (int i = 0; i < int(sides.size()); i++)
++            for (int j = 0; j < int(sides.size()); j++) {
++                const bool is_a_direction = ex.is_groups ? i != j : (i == 0 && j == 1);
++                if (!is_a_direction)
++                    continue;
++                for (IdString launch : sides.at(i))
++                    for (IdString capture : sides.at(j))
++                        if (launch != capture)
++                            false_path_to[launch].insert(capture);
++            }
++    }
++    for (auto &net : ctx->nets) {
++        ClockConstraint *cc = net.second->clkconstr.get();
++        if (cc != nullptr && false_path_to.count(cc->name))
++            for (IdString capture : false_path_to.at(cc->name))
++                cc->false_path_to.insert(capture);
++    }
++    for (auto &entry : false_path_to)
++        for (IdString capture : entry.second)
++            log_info("    no path from clock '%s' to clock '%s' is timed (set_false_path or set_clock_groups)\n",
++                     entry.first.c_str(ctx), capture.c_str(ctx));
++}
++
+ NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index c9cd40e5..b61180ef 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -592,6 +592,7 @@ if (cell.second->type.in(id_BUFR, id_BUFR_BUFR)) {
+ void XilinxImpl::apply_loc_constraints(const pool<IdString> &only_types)
+ {
+     dict<std::pair<IdString, IdString>, BelId> by_site_and_type;
++    dict<std::pair<IdString, IdString>, BelId> by_site_and_bel_name;
+     dict<IdString, int> site_seen;
+     for (BelId bel : ctx->getBels()) {
+         // Not every bel sits in a site the tile enumerates -- routing bels and
+@@ -605,6 +606,7 @@ void XilinxImpl::apply_loc_constraints(const pool<IdString> &only_types)
+         IdString site = get_site_name(si);
+         site_seen[site]++;
+         by_site_and_type.emplace(std::make_pair(site, ctx->getBelType(bel)), bel);
++        by_site_and_bel_name.emplace(std::make_pair(site, bel_name_in_site(bel)), bel);
+     }
+ 
+     // Which cell wants which bel, worked out before anything moves.  Packing
+@@ -645,7 +647,20 @@ void XilinxImpl::apply_loc_constraints(const pool<IdString> &only_types)
+         if (found == by_site_and_type.end())
+             log_error("cell '%s' of type '%s' is constrained to site '%s', which has no bel of that type\n",
+                       ctx->nameOf(ci), ci->type.c_str(ctx), site.c_str(ctx));
+-        wanted.emplace_back(ci, found->second);
++        BelId bel = found->second;
++
++        auto site_bel = ci->attrs.find(ctx->id("NEXTPNR_SITE_BEL"));
++        if (site_bel != ci->attrs.end()) {
++            auto named = by_site_and_bel_name.find(std::make_pair(site, ctx->id(site_bel->second.as_string())));
++            const bool names_a_bel_for_the_cell =
++                    named != by_site_and_bel_name.end() && ctx->isValidBelForCellType(ci->type, named->second);
++            if (!names_a_bel_for_the_cell)
++                log_error("cell '%s' of type '%s' is constrained to bel '%s' of site '%s', which has no such bel "
++                          "for it\n",
++                          ctx->nameOf(ci), ci->type.c_str(ctx), site_bel->second.as_string().c_str(), site.c_str(ctx));
++            bel = named->second;
++        }
++        wanted.emplace_back(ci, bel);
+     }
+ 
+     for (auto &w : wanted) {
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 3a3b2fbe..faee5cb0 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -196,6 +196,21 @@ struct XilinxImpl : HimbaechelAPI
+     dict<std::string, IdString> pblock_prepack_cells;
+     dict<BelId, const Region *> exclusive_pblock_bels; // bel -> the EXCLUDE_PLACEMENT pblock it belongs to
+     void apply_pblocks_after_packing();
++
++    struct XdcClockPattern
++    {
++        std::string pattern;
++        bool include_generated = false;
++    };
++    struct XdcClockException
++    {
++        bool is_groups = false;
++        std::vector<std::vector<XdcClockPattern>> groups;
++        std::vector<XdcClockPattern> from, to;
++        int lineno = 0;
++    };
++    std::vector<XdcClockException> xdc_clock_exceptions;
++    void apply_xdc_clock_exceptions();
+     void add_pblock_routing_tiles(Region *pb_region);
+     void pack() override;
+     void apply_loc_constraints(const pool<IdString> &only_types = {});

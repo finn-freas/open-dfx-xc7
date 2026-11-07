@@ -1,0 +1,9 @@
+xilinx: gen: --cell-timing FILE for measured LUT and FF timing
+
+For artix7 the generator writes stub cell timings (LUT 0.100-0.150 ns,
+FF clock-to-Q 0.30-0.35 ns, setup 0.10 ns), smaller than Vivado's.
+--cell-timing takes a JSON of [fast, slow] pairs in ps for the LUT
+A1..A6 -> O6/O5 arcs, FF clock-to-Q, D setup and CE setup, and adds a
+SLICE_FF_BYPASS site-pip class on the AX..DX input of the FF muxes.
+Hold values are left alone.  Without the option the chipdb is
+unchanged.

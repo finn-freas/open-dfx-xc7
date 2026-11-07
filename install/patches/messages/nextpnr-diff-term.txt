@@ -1,0 +1,7 @@
+xilinx: write DIFF_TERM for an LVDS_25 input
+
+On an HR-bank LVDS_25 input-only P half with DIFF_TERM TRUE (parameter
+or XDC), write IOB_Y0.LVDS_25.IN_ONLY_DIFF_TERM instead of the IN_ONLY
+feature.  DIFF_TERM on another standard or bank is an error instead of
+being dropped, and the XDC property is applied.  Needs the prjxray-db
+feature IN_ONLY_DIFF_TERM.

@@ -1,0 +1,6 @@
+xilinx: disconnect constant-tied ISERDESE2 dedicated pins
+
+SHIFTIN1/2, OFB, DDLY, OCLK, OCLKB and CLKDIVP have no route from the
+fabric constant nets, so an ISERDESE2 that ties one of them to a
+constant failed to route.  Disconnect these pins when they are driven by
+the packer's GND or VCC net.

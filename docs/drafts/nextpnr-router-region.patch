@@ -1,0 +1,582 @@
+From e62fafd1d5be6f1138f3d74f67ab30e0990b7275 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 01:09:59 -0500
+Subject: [PATCH] router2: hold the routes inside a region to it
+
+A Region has carried constr_wires/constr_pips, a wires pool and piplocs
+since the kernel grew regions, but no router read them.  router2 now
+does: an arc whose driver and sink cells are both in a region with
+constr_pips (or constr_wires) may only use the pips at its piplocs (and
+the wires in its pool).  The check sits in route_arc's forward and
+backward expansion next to the reserved-wire check, so it holds in the
+bounding-box search and in the unbounded retry alike; an arc that has no
+route inside its region fails with an error naming the region instead of
+leaving it.  Seeds from the net's existing routing are only taken when
+their route back to the source stays inside, routing already present that
+breaks the rule is ripped up unless it is locked, and locked routing that
+breaks it is reported.
+
+Arcs that cross a region's edge are not held.  With
+region_contain_constants (default on) a constant net's arcs are held to
+their sink's region.  --router2-region-keep-out keeps every other arc out
+of a region that is neither its driver's nor its sink's; locked routing
+is left alone.  Off by default.
+
+xilinx: a pblock with EXCLUDE_PLACEMENT, or with CONTAIN_ROUTING true,
+now holds its routing: its piplocs are the tiles of its sites and, beside
+each, the interface and INT_L/INT_R tiles that serve it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/kernel/command.cc         |   5 +
+ common/route/router2.cc          | 262 ++++++++++++++++++++++++++++++-
+ common/route/router2.h           |   9 ++
+ himbaechel/uarch/xilinx/xdc.cc   |  85 +++++++++-
+ himbaechel/uarch/xilinx/xilinx.h |  10 +-
+ 5 files changed, 362 insertions(+), 9 deletions(-)
+
+diff --git a/common/kernel/command.cc b/common/kernel/command.cc
+index bfe42490..1f23b661 100644
+--- a/common/kernel/command.cc
++++ b/common/kernel/command.cc
+@@ -428,6 +428,9 @@ po::options_description CommandHandler::getGeneralOptions()
+                           "non-improving smoothing rounds to tolerate before stopping (default 0)");
+     general.add_options()("router2-slack-order",
+                           "order the router queue by worst absolute slack rather than by criticality");
++    general.add_options()("router2-region-keep-out",
++                          "keep arcs that are not held to a routing region out of it, unless the region holds "
++                          "their driver or sink (locked routing is left alone)");
+ 
+     general.add_options()("report", po::value<std::string>(),
+                           "write timing and utilization report in JSON format to file");
+@@ -595,6 +598,8 @@ void CommandHandler::setupContext(Context *ctx)
+         ctx->settings[ctx->id("router2/smoothStagnant")] = vm["router2-smooth-stagnant"].as<int>();
+     if (vm.count("router2-slack-order"))
+         ctx->settings[ctx->id("router2/slackOrder")] = true;
++    if (vm.count("router2-region-keep-out"))
++        ctx->settings[ctx->id("router2/regionKeepOut")] = true;
+ 
+     if (vm.count("static-dump-density"))
+         ctx->settings[ctx->id("static/dump_density")] = true;
+diff --git a/common/route/router2.cc b/common/route/router2.cc
+index f39ad3a5..ea4abd4d 100644
+--- a/common/route/router2.cc
++++ b/common/route/router2.cc
+@@ -62,6 +62,11 @@ struct Router2
+         WireId sink_wire;
+         BoundingBox bb;
+         bool routed = false, pre_routed = false;
++
++
++
++        int contain_region = -1;
++        int driver_region = -1, sink_region = -1;
+     };
+ 
+     // As we allow overlap at first; the nextpnr bind functions can't be used
+@@ -112,6 +117,8 @@ struct Router2
+         int reserved_net = -1;
+         // The notional location of the wire, to guarantee thread safety
+         int16_t x = 0, y = 0;
++
++        int16_t route_region = -1;
+         // Visit data
+         PipId pip_fwd, pip_bwd;
+         bool visited_fwd = false, visited_bwd = false;
+@@ -143,6 +150,109 @@ struct Router2
+     bool timing_driven, timing_driven_ripup;
+     TimingAnalyser tmg;
+ 
++
++
++
++
++
++
++
++
++
++    std::vector<const Region *> route_regions;
++    dict<std::pair<int, int>, int> route_region_by_tile;
++
++    void setup_route_regions()
++    {
++        for (auto &region_pair : ctx->region) {
++            const Region *region = region_pair.second.get();
++            if (!region->constr_pips && !region->constr_wires)
++                continue;
++            int idx = int(route_regions.size());
++            NPNR_ASSERT(idx < std::numeric_limits<int16_t>::max());
++            route_regions.push_back(region);
++            if (!region->constr_pips)
++                continue;
++            for (Loc l : region->piplocs) {
++                auto ins = route_region_by_tile.emplace(std::make_pair(l.x, l.y), idx);
++                if (!ins.second && ins.first->second != idx)
++                    log_error("Routing regions '%s' and '%s' share the pips of tile (%d, %d); a net cannot be held "
++                              "to both\n",
++                              ctx->nameOf(route_regions.at(ins.first->second)->name), ctx->nameOf(region->name),
++                              l.x, l.y);
++            }
++        }
++    }
++
++
++    void setup_route_region_wires()
++    {
++        for (int idx = 0; idx < int(route_regions.size()); idx++) {
++            const Region *region = route_regions.at(idx);
++            if (!region->constr_wires)
++                continue;
++            for (WireId w : region->wires) {
++                auto &wd = wire_data(w);
++                if (wd.route_region != -1 && wd.route_region != idx)
++                    log_error("Routing regions '%s' and '%s' share wire '%s'; a net cannot be held to both\n",
++                              ctx->nameOf(route_regions.at(wd.route_region)->name), ctx->nameOf(region->name),
++                              ctx->nameOfWire(w));
++                wd.route_region = int16_t(idx);
++            }
++        }
++    }
++
++    int route_region_of(const CellInfo *cell) const
++    {
++        if (cell == nullptr || cell->region == nullptr)
++            return -1;
++        for (int idx = 0; idx < int(route_regions.size()); idx++)
++            if (route_regions.at(idx) == cell->region)
++                return idx;
++        return -1;
++    }
++
++
++
++    bool hop_is_in_region(int r, PipId pip, const PerWireData &wd) const
++    {
++        const Region *region = route_regions.at(r);
++        if (region->constr_pips) {
++            Loc l = ctx->getPipLocation(pip);
++            auto fnd = route_region_by_tile.find(std::make_pair(l.x, l.y));
++            if (fnd == route_region_by_tile.end() || fnd->second != r)
++                return false;
++        }
++        if (region->constr_wires && wd.route_region != r)
++            return false;
++        return true;
++    }
++
++
++    int hop_region(PipId pip, const PerWireData &wd) const
++    {
++        if (!route_region_by_tile.empty()) {
++            Loc l = ctx->getPipLocation(pip);
++            auto fnd = route_region_by_tile.find(std::make_pair(l.x, l.y));
++            if (fnd != route_region_by_tile.end())
++                return fnd->second;
++        }
++        return wd.route_region;
++    }
++
++    bool hop_allowed_for_arc(const PerArcData &ad, PipId pip, const PerWireData &wd) const
++    {
++        if (route_regions.empty())
++            return true;
++        if (ad.contain_region != -1)
++            return hop_is_in_region(ad.contain_region, pip, wd);
++        if (cfg.region_keep_out) {
++            int r = hop_region(pip, wd);
++            return r == -1 || r == ad.driver_region || r == ad.sink_region;
++        }
++        return true;
++    }
++
+     void setup_nets()
+     {
+         // Populate per-net and per-arc structures at start of routing
+@@ -186,6 +296,17 @@ struct Router2
+                     nets.at(i).arcs.at(usr.index.idx()).emplace_back();
+                     auto &ad = nets.at(i).arcs.at(usr.index.idx()).back();
+                     ad.sink_wire = dst_wire;
++
++
++
++                    ad.driver_region = route_region_of(ni->driver.cell);
++                    ad.sink_region = route_region_of(usr.value.cell);
++                    const bool arc_ends_in_one_region =
++                            ad.sink_region != -1 &&
++                            (ad.sink_region == ad.driver_region ||
++                             (ni->constant_value != IdString() && cfg.region_contain_constants));
++                    if (arc_ends_in_one_region)
++                        ad.contain_region = ad.sink_region;
+                     // Set bounding box for this arc
+                     ad.bb = ctx->getRouteBoundingBox(src_wire, dst_wire);
+                     // Expand net bounding box to include this arc
+@@ -597,6 +718,107 @@ struct Router2
+         }
+     }
+ 
++
++
++
++    template <typename Tf> bool any_hop_of_arc(NetInfo *net, store_index<PortRef> usr, size_t phys_pin, Tf visit)
++    {
++        auto &nd = nets.at(net->udata);
++        auto &ad = nd.arcs.at(usr.idx()).at(phys_pin);
++        WireId cursor = ad.sink_wire;
++        while (cursor != nd.src_wire && nd.wires.count(cursor)) {
++            if (net->constant_value != IdString() && ctx->getWireConstantValue(cursor) == net->constant_value)
++                break;
++            PipId pip = nd.wires.at(cursor).first;
++            if (pip == PipId())
++                break;
++            if (visit(pip, cursor))
++                return true;
++            cursor = ctx->getPipSrcWire(pip);
++        }
++        return false;
++    }
++
++
++    bool route_to_wire_is_in_region(const PerNetData &nd, WireId wire, int r)
++    {
++        WireId cursor = wire;
++        while (cursor != nd.src_wire) {
++            auto fnd = nd.wires.find(cursor);
++            if (fnd == nd.wires.end() || fnd->second.first == PipId())
++                break;
++            PipId pip = fnd->second.first;
++            if (!hop_is_in_region(r, pip, wire_data(cursor)))
++                return false;
++            cursor = ctx->getPipSrcWire(pip);
++        }
++        return true;
++    }
++
++
++
++    bool arc_route_breaks_region(NetInfo *net, store_index<PortRef> usr, size_t phys_pin)
++    {
++        if (route_regions.empty())
++            return false;
++        auto &ad = nets.at(net->udata).arcs.at(usr.idx()).at(phys_pin);
++        const bool arc_has_region_rules = ad.contain_region != -1 || cfg.region_keep_out;
++        if (!arc_has_region_rules)
++            return false;
++        return any_hop_of_arc(net, usr, phys_pin,
++                              [&](PipId pip, WireId dst) { return !hop_allowed_for_arc(ad, pip, wire_data(dst)); });
++    }
++
++
++
++    bool arc_route_is_locked(NetInfo *net, store_index<PortRef> usr, size_t phys_pin)
++    {
++        return any_hop_of_arc(net, usr, phys_pin, [&](PipId, WireId dst) {
++            auto fnd = net->wires.find(dst);
++            return fnd != net->wires.end() && fnd->second.strength > STRENGTH_STRONG;
++        });
++    }
++
++
++
++
++    void check_region_routing()
++    {
++        if (route_regions.empty())
++            return;
++        int held = 0, crossing = 0, locked_breaking = 0;
++        for (auto net : nets_by_udata) {
++            auto &nd = nets.at(net->udata);
++            for (auto usr : net->users.enumerate()) {
++                for (size_t j = 0; j < nd.arcs.at(usr.index.idx()).size(); j++) {
++                    auto &ad = nd.arcs.at(usr.index.idx()).at(j);
++                    if (ad.contain_region != -1)
++                        ++held;
++                    else if (ad.driver_region != ad.sink_region)
++                        ++crossing;
++
++
++                    const bool arc_is_locked_outside_its_region = ad.contain_region != -1 && ad.pre_routed &&
++                                                                  arc_route_breaks_region(net, usr.index, j) &&
++                                                                  arc_route_is_locked(net, usr.index, j);
++                    if (arc_is_locked_outside_its_region) {
++                        if (locked_breaking < 10)
++                            log_warning("Arc %d.%d of net '%s' is locked to a route that breaks its routing region; "
++                                        "it is left as it is\n",
++                                        usr.index.idx(), int(j), ctx->nameOf(net));
++                        ++locked_breaking;
++                    }
++                }
++            }
++        }
++        log_info("Routing regions: %d region(s); %d arc(s) held inside one, %d arc(s) cross a region edge and are "
++                 "not held%s\n",
++                 int(route_regions.size()), held, crossing,
++                 cfg.region_keep_out ? "; other arcs are kept out of the regions" : "");
++        if (locked_breaking > 0)
++            log_warning("%d locked arc(s) break their routing region\n", locked_breaking);
++    }
++
+     // Returns true if a wire contains no sink port
+     bool is_wire_unusable(WireId wire, const NetInfo *net, const pool<WireId> &sink_wires, int iter_count = 0)
+     {
+@@ -918,6 +1140,12 @@ struct Router2
+                     if (fnd == t.wire_by_loc.end())
+                         continue;
+                     for (WireId wire : fnd->second) {
++
++
++
++
++                        if (ad.contain_region != -1 && !route_to_wire_is_in_region(nd, wire, ad.contain_region))
++                            continue;
+                         ROUTE_LOG_DBG("   seeding with %s\n", ctx->nameOfWire(wire));
+                         seed_queue_fwd(wire);
+                     }
+@@ -993,6 +1221,10 @@ struct Router2
+                         // Reserved for another net
+                         if (nwd.reserved_net != -1 && nwd.reserved_net != net->udata)
+                             continue;
++
++
++                        if (!hop_allowed_for_arc(ad, dh, nwd))
++                            continue;
+                         // Don't allow the same wire to be bound to the same net with a different driving pip
+                         auto fnd_wire = nd.wires.find(next);
+                         if (fnd_wire != nd.wires.end() && fnd_wire->second.first != dh)
+@@ -1070,6 +1302,9 @@ struct Router2
+                         // Reserved for another net
+                         if (nwd.reserved_net != -1 && nwd.reserved_net != net->udata)
+                             continue;
++
++                        if (!hop_allowed_for_arc(ad, uh, nwd))
++                            continue;
+                         // Don't allow the same resource to be bound to the same net with a different value
+                         auto resource_key = ctx->getResourceKeyForPip(uh);
+                         if (resource_key != GroupId()) {
+@@ -1213,8 +1448,14 @@ struct Router2
+             auto &ad = nd.arcs.at(usr.index.idx());
+             for (size_t j = 0; j < ad.size(); j++) {
+                 // Ripup failed arcs to start with
+-                // Check if arc is already legally routed
+-                if (!failed_slack && check_arc_routing(net, usr.index, j)) {
++
++
++
++                const bool arc_is_routed_already = !failed_slack && check_arc_routing(net, usr.index, j);
++                const bool arc_route_must_move = arc_is_routed_already &&
++                                                 arc_route_breaks_region(net, usr.index, j) &&
++                                                 !arc_route_is_locked(net, usr.index, j);
++                if (arc_is_routed_already && !arc_route_must_move) {
+                     update_wire_by_loc(t, net, usr.index, j, true);
+                     continue;
+                 }
+@@ -1258,6 +1499,16 @@ struct Router2
+                                 log("\n");
+                             }
+                         }
++                        const auto &failed_arc = nd.arcs.at(a.first.idx()).at(a.second);
++                        if (failed_arc.contain_region != -1)
++                            log_error("Failed to route arc %d.%d of net '%s', from %s to %s, inside routing region "
++                                      "'%s': both of its ends are in the region, so it may not leave it, and the "
++                                      "region has no route between them that is not reserved or locked for "
++                                      "another net.\n",
++                                      a.first.idx(), int(a.second), ctx->nameOf(net),
++                                      ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
++                                      ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(a.first), a.second)),
++                                      ctx->nameOf(route_regions.at(failed_arc.contain_region)->name));
+                         log_error("Failed to route arc %d.%d of net '%s', from %s to %s.\n", a.first.idx(),
+                                   int(a.second), ctx->nameOf(net), ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
+                                   ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(a.first), a.second)));
+@@ -2276,8 +2527,11 @@ struct Router2
+         log_info("Setting up routing resources...\n");
+         auto rstart = std::chrono::high_resolution_clock::now();
+         setup_resources();
++        setup_route_regions();
+         setup_nets();
+         setup_wires();
++        setup_route_region_wires();
++        check_region_routing();
+         find_all_reserved_wires();
+         partition_nets();
+         curr_cong_weight = cfg.init_curr_cong_weight;
+@@ -2462,6 +2716,10 @@ Router2Cfg::Router2Cfg(Context *ctx)
+     // sizing every slack net's box at the fabric edge would incur.
+     bb_budget = ctx->setting<bool>("router2/bbBudget", false);
+     bb_budget_max = ctx->setting<int>("router2/bbBudgetMax", 60);
++
++
++    region_contain_constants = ctx->setting<bool>("router2/regionContainConstants", true);
++    region_keep_out = ctx->setting<bool>("router2/regionKeepOut", false);
+     ipin_cost_adder = ctx->setting<float>("router2/ipinCostAdder", 0.0f);
+     bias_cost_factor = ctx->setting<float>("router2/biasCostFactor", 0.25f);
+     if (ctx->settings.count(ctx->id("router2/alt-weights"))) {
+diff --git a/common/route/router2.h b/common/route/router2.h
+index f39d738b..b2f33c5c 100644
+--- a/common/route/router2.h
++++ b/common/route/router2.h
+@@ -82,6 +82,15 @@ struct Router2Cfg
+     bool bb_budget;
+     int bb_budget_max;
+ 
++
++
++
++
++
++
++    bool region_contain_constants;
++    bool region_keep_out;
++
+     // Print additional performance profiling information
+     bool perf_profile = false;
+ 
+diff --git a/himbaechel/uarch/xilinx/xdc.cc b/himbaechel/uarch/xilinx/xdc.cc
+index aec30adf..c8c0aa78 100644
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -318,16 +318,21 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             }
+             const bool targets_a_pblock = arguments.at(3).compare(0, 12, "[get_pblocks") == 0;
+             if (targets_a_pblock) {
+-                // Of the pblock properties only EXCLUDE_PLACEMENT changes placement here;
+-                // the DFX ones (RESET_AFTER_RECONFIG, SNAPPING_MODE) are for the bitstream.
++
++
++
+                 XdcPblock *pb = get_pblock(arguments.at(3));
+                 if (pb == nullptr)
+                     goto nextline;
+                 for (const auto &pair : arg_pairs) {
++                    const bool value_is_true = pair.second == "true" || pair.second == "TRUE" || pair.second == "1";
+                     const bool is_exclude_placement = pair.first == "EXCLUDE_PLACEMENT";
++                    const bool is_contain_routing = pair.first == "CONTAIN_ROUTING";
+                     if (is_exclude_placement) {
+-                        const bool value_is_true = pair.second == "true" || pair.second == "TRUE" || pair.second == "1";
+                         pb->exclusive = value_is_true;
++                    } else if (is_contain_routing) {
++                        pb->contain_routing = value_is_true;
++                        pb->contain_routing_was_set = true;
+                     } else
+                         log_warning("ignoring unsupported pblock property '%s' (on line %d)\n", pair.first.c_str(),
+                                     lineno);
+@@ -925,8 +930,13 @@ void XilinxImpl::apply_pblocks_after_packing()
+                             pb.first.c_str(ctx), members);
+             continue;
+         }
+-        log_info("pblock '%s': %d cell(s) on %d bel(s)%s\n", pb.first.c_str(ctx), members, int(r->bels.size()),
+-                 pb.second.exclusive ? ", exclusive" : "");
++        const bool pblock_contains_its_routing =
++                pb.second.contain_routing_was_set ? pb.second.contain_routing : pb.second.exclusive;
++        if (pblock_contains_its_routing)
++            add_pblock_routing_tiles(r);
++        log_info("pblock '%s': %d cell(s) on %d bel(s)%s%s\n", pb.first.c_str(ctx), members, int(r->bels.size()),
++                 pb.second.exclusive ? ", exclusive" : "",
++                 r->constr_pips ? stringf(", routing held to %d tile(s)", int(r->piplocs.size())).c_str() : "");
+         if (!pb.second.exclusive)
+             continue;
+         for (BelId bel : r->bels) {
+@@ -953,4 +963,69 @@ void XilinxImpl::apply_pblocks_after_packing()
+                  inherited);
+ }
+ 
++
++
++
++
++
++
++
++
++
++
++
++void XilinxImpl::add_pblock_routing_tiles(Region *pb_region)
++{
++    auto tile_type_of = [&](int tile) { return IdString(chip_tile_info(ctx->chip_info, tile).type_name).str(ctx); };
++    auto ends_with = [](const std::string &s, const char *suffix) {
++        const std::string sfx(suffix);
++        return s.size() >= sfx.size() && s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0;
++    };
++    pool<int> site_tiles;
++    for (BelId bel : pb_region->bels)
++        site_tiles.insert(bel.tile);
++    int unpaired = 0;
++    for (int tile : site_tiles) {
++        int x, y;
++        tile_xy(ctx->chip_info, tile, x, y);
++        pb_region->piplocs.insert(Loc(x, y, 0));
++        const std::string type = tile_type_of(tile);
++        const bool interconnect_is_to_the_right = ends_with(type, "_L");
++        const bool interconnect_is_to_the_left = ends_with(type, "_R");
++        if (!interconnect_is_to_the_right && !interconnect_is_to_the_left) {
++            unpaired++;
++            continue;
++        }
++        const int step = interconnect_is_to_the_right ? 1 : -1;
++        const bool site_tile_is_five_rows_tall = type.compare(0, 4, "BRAM") == 0 || type.compare(0, 3, "DSP") == 0;
++        const int rows = site_tile_is_five_rows_tall ? 5 : 1;
++        int rows_with_interconnect = 0;
++        for (int dy = 0; dy < rows; dy++) {
++            for (int dx = step; std::abs(dx) <= 3; dx += step) {
++                const int nx = x + dx, ny = y - dy;
++                const bool off_the_grid = nx < 0 || ny < 0 || nx >= ctx->getGridDimX() || ny >= ctx->getGridDimY();
++                if (off_the_grid)
++                    break;
++                const std::string ntype = tile_type_of(tile_by_xy(ctx->chip_info, nx, ny));
++                const bool is_interconnect = ntype == "INT_L" || ntype == "INT_R";
++                const bool is_interface = ntype.find("INT_INTERFACE") != std::string::npos;
++                if (!is_interconnect && !is_interface)
++                    break;
++                pb_region->piplocs.insert(Loc(nx, ny, 0));
++                if (is_interconnect) {
++                    rows_with_interconnect++;
++                    break;
++                }
++            }
++        }
++        if (rows_with_interconnect < rows)
++            unpaired++;
++    }
++    pb_region->constr_pips = !pb_region->piplocs.empty();
++    if (unpaired > 0)
++        log_warning("pblock '%s': %d site tile(s) have no interconnect tile found beside them; routes inside the "
++                    "pblock can use only the pips of those tiles themselves\n",
++                    pb_region->name.c_str(ctx), unpaired);
++}
++
+ NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index c896f233..3a3b2fbe 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -178,12 +178,17 @@ struct XilinxImpl : HimbaechelAPI
+     // Flow management
+     void parse_xdc(const std::string &filename);
+     // XDC pblocks (create_pblock, add_cells_to_pblock, resize_pblock).  Each is
+-    // a placement Region of the same name: it bounds where its cells go, and
+-    // the router is free to cross it.
++
++
++
+     struct XdcPblock
+     {
+         IdString region;
+         bool exclusive = false; // EXCLUDE_PLACEMENT: no other cell may use the pblock's bels
++
++
++        bool contain_routing = false;
++        bool contain_routing_was_set = false;
+     };
+     dict<IdString, XdcPblock> pblocks;
+     // Each of the netlist's own cells -> its pblock (empty for none), recorded
+@@ -191,6 +196,7 @@ struct XilinxImpl : HimbaechelAPI
+     dict<std::string, IdString> pblock_prepack_cells;
+     dict<BelId, const Region *> exclusive_pblock_bels; // bel -> the EXCLUDE_PLACEMENT pblock it belongs to
+     void apply_pblocks_after_packing();
++    void add_pblock_routing_tiles(Region *pb_region);
+     void pack() override;
+     void apply_loc_constraints(const pool<IdString> &only_types = {});
+     void prePlace() override;
+-- 
+2.53.0
+

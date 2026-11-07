@@ -1,0 +1,27 @@
+[board]
+name = "Digilent Cmod A7-35T"
+part = "xc7a35tcpg236-1"
+openfpgaloader_board = "cmoda7_35t"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Cmod-A7-Master.xdc ('for the CmodA7 rev. B', github.com/Digilent/digilent-xdc master c8644a9f, sha256 56568df3...4eaf, read 2026-11-06); part from Digilent vivado-boards master d8d43ed9 new/board_files/cmod_a7-35t/B.0/board.xml (sha256 0f8ead5f...aabb)"
+notes = "The board has two single LEDs (led[0] A17, led[1] C16) and one RGB LED. led[2] and led[3] of the preset are the RGB LED's blue (led0_b, B17) and green (led0_g, B16) pins from Digilent's file. Clock: the 12 MHz sysclk (L17)."
+
+[clock]
+port = "clk"
+pin = "L17"
+period_ns = 83.333
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "A17"
+"led[1]" = "C16"
+"led[2]" = "B17"
+"led[3]" = "B16"
+
+[uart]
+uart_txd_in = "J17"
+uart_rxd_out = "J18"
+
+[dfx]
+example_region = "SLICE_X12Y100:SLICE_X15Y149"

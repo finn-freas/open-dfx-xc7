@@ -1,0 +1,27 @@
+[board]
+name = "Digilent Cmod S7-25"
+part = "xc7s25csga225-1"
+openfpgaloader_board = "cmod_s7"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Cmod-S7-25-Master.xdc ('for the Cmod S7-25 Rev. B', github.com/Digilent/digilent-xdc master c8644a9f, sha256 212ad020...56aa, read 2026-11-06); part from Digilent vivado-boards master d8d43ed9 new/board_files/cmod-s7-25/B.0/board.xml (sha256 2af49026...5490)"
+notes = "Clock: the 12 MHz gclk (M9). UART: Digilent's port uart_rx (K15, Sch=uart_txd_in) is the FPGA input, uart_tx (L12, Sch=uart_rxd_out) the output."
+
+[clock]
+port = "clk"
+pin = "M9"
+period_ns = 83.333
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "E2"
+"led[1]" = "K1"
+"led[2]" = "J1"
+"led[3]" = "E1"
+
+[uart]
+uart_txd_in = "K15"
+uart_rxd_out = "L12"
+
+[dfx]
+example_region = "SLICE_X12Y50:SLICE_X15Y99"

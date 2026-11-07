@@ -1,0 +1,16 @@
+xilinx, timing: ASYNC_REG, I/O delays, IOB, path exceptions, uncertainty
+
+- ASYNC_REG flip-flop chains are clustered in one slice.
+- set_input_delay/set_output_delay time the port paths, with the clock
+  delay from its pad and pad/BUFGCTRL delays the chipdb lacks.
+- IOB TRUE moves a register into the ILOGIC IFF or OLOGIC OUTFF.
+- set_false_path/set_multicycle_path -from/-through/-to,
+  set_max_delay [-datapath_only] and set_min_delay are applied as tagged
+  clock domains, with Vivado's precedence.
+- Hold is checked between related clocks; set_clock_uncertainty and
+  input/system jitter enter the requirement.
+- Vivado's rule_gclkio_bufg clock-placement check (Place 30-574);
+  CLOCK_DEDICATED_ROUTE FALSE turns it into a warning.
+
+A design without these constraints has no tagged domain and no
+ASYNC_REG/IOB cells, and is placed and routed as before.

@@ -1,0 +1,11 @@
+[project]
+name = "vhdl_mixed"
+top = "vhdl_mixed"
+board = "arty-a7-35t"
+sources = ["src/crc_pkg.vhd", "src/vhdl_mixed.vhd", "src/prbs32.v"]
+constraints = ["constraints/vhdl_mixed.xdc"]
+vhdl_std = "08"
+seed = 1
+
+[clocks]
+clk = 10.0

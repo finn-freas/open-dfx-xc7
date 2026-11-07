@@ -1,0 +1,10 @@
+[project]
+name = "blinky_b3"
+top = "blinky_b3"
+board = "basys3"
+sources = ["src/blinky_b3.v"]
+constraints = ["constraints/blinky_b3.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

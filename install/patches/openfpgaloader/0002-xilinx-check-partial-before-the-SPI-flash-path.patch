@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: check --partial before the SPI flash path
+
+The guard that refuses --partial outside an SRAM load of a 7-series
+device sat in the non-SPI branch of Xilinx::program(), so -f --partial
+went on into program_spi(), which loads the SPI-over-JTAG bridge (a full
+bitstream) through program_mem() and would have done so without
+JPROGRAM.  Check before the mode branch, and free the secondary
+bitstream on that error too.
+---
+ src/xilinx.cpp | 21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/src/xilinx.cpp b/src/xilinx.cpp
+index 5b166ef..dbd6cab 100644
+--- a/src/xilinx.cpp
++++ b/src/xilinx.cpp
+@@ -707,6 +707,18 @@ void Xilinx::program(unsigned int offset, bool unprotect_flash)
+ 			secondary_bit->displayHeader();
+ 	}
+ 
++	if (_partial && (_mode != Device::MEM_MODE ||
++			(_fpga_family != ARTIX_FAMILY &&
++			_fpga_family != SPARTAN7_FAMILY &&
++			_fpga_family != KINTEX_FAMILY &&
++			_fpga_family != ZYNQ_FAMILY))) {
++		delete bit;
++		if (secondary_bit)
++			delete secondary_bit;
++		throw std::runtime_error("Error: --partial is only supported "
++			"for SRAM load of Xilinx 7-series devices");
++	}
++
+ 	if (_fpga_family == XCF_FAMILY) {
+ 		xcf_program(bit);
+ 		delete bit;
+@@ -728,15 +740,6 @@ void Xilinx::program(unsigned int offset, bool unprotect_flash)
+ 			}
+ 		}
+ 	} else {
+-		if (_partial && (_mode != Device::MEM_MODE ||
+-				(_fpga_family != ARTIX_FAMILY &&
+-				_fpga_family != SPARTAN7_FAMILY &&
+-				_fpga_family != KINTEX_FAMILY &&
+-				_fpga_family != ZYNQ_FAMILY))) {
+-			delete bit;
+-			throw std::runtime_error("Error: --partial is only supported "
+-				"for SRAM load of Xilinx 7-series devices");
+-		}
+ 		if (_fpga_family == SPARTAN3_FAMILY)
+ 			xc3s_flow_program(bit);
+ 		else

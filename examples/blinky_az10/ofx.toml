@@ -1,0 +1,10 @@
+[project]
+name = "blinky_az10"
+top = "blinky_az10"
+board = "arty-z7-10"
+sources = ["src/blinky_az10.v"]
+constraints = ["constraints/blinky_az10.xdc"]
+seed = 1
+
+[clocks]
+clk = 8.0

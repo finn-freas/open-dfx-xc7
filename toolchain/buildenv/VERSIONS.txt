@@ -1,0 +1,40 @@
+# Build environment for open-dfx-xc7 (created 2026-11-05). Everything lives under toolchain/buildenv.
+# Recreate exactly: bin/micromamba create -p ./env --file env-explicit.txt (see docs/buildenv.md)
+
+micromamba 2.9.0 (mamba-org/micromamba-releases tag 2.9.0-0, asset micromamba-linux-64)
+micromamba sha256 366cd9cd8be14df1ab8ed50352a82111082a36686b2d389fdb79a92c3fafb3e3
+
+# Requested specs (channel conda-forge only, --override-channels):
+#   python=3.12 cmake ninja make pkg-config boost-cpp=1.81 eigen=3.4.0 libftdi libusb zlib hidapi gcc_linux-64=14 gxx_linux-64=14
+
+# Resolved versions of the requested packages (micromamba list):
+binutils_impl_linux-64 2.46.1 default_hfdba357_103 conda-forge
+boost-cpp 1.81.0 he19a28c_1 conda-forge
+cmake 4.4.3 hff7ac6b_0 conda-forge
+eigen 3.4.0 h54a6638_2 conda-forge
+gcc_impl_linux-64 14.4.0 h4b2a866_7 conda-forge
+gcc_linux-64 14.4.0 hc469d41_2 conda-forge
+gxx_impl_linux-64 14.4.0 hc436dd5_7 conda-forge
+gxx_linux-64 14.4.0 h0047a55_2 conda-forge
+hidapi 0.15.0 py312hb15d61c_2 conda-forge
+libftdi 1.5 h5888daf_1 conda-forge
+libgcc 16.2.0 ha9f2e26_7 conda-forge
+libstdcxx 16.2.0 h934c35e_7 conda-forge
+libusb 1.0.30 h0d1bbbc_1 conda-forge
+libzlib 1.3.2 h25fd6f3_3 conda-forge
+make 4.4.1 h1114479_4 conda-forge
+ninja 1.13.2 h171cf75_1 conda-forge
+pkg-config 0.29.2 h1114479_1013 conda-forge
+python 3.12.15 h5f976f7_1_cpython conda-forge
+sysroot_linux-64 2.39 hc4b9eeb_6 conda-forge
+zlib 1.3.2 h25fd6f3_3 conda-forge
+
+# Full pinned list with md5: env-explicit.txt (68 packages)
+
+# Sources built with this environment
+nextpnr stock      openXC7/nextpnr ce3f7c18c6b589b9645ccf156aaa198c0fcd8fc4 (worktree build/src/nextpnr-stock)
+nextpnr pblock     branch pblock-xdc-build at 5a62e6e8b32382ece9c46933a42dd0d359067648 (= pblock-xdc)
+nextpnr router     branch router-region-build at e62fafd1d5be6f1138f3d74f67ab30e0990b7275 (= router-region)
+openFPGALoader     trabucayre/openFPGALoader v1.2.0 = befbab4f646207dbaf1daf8b144dd980ad283dd5 (worktree build/src/ofl-stock)
+openFPGALoader     branch partial-load-build at 35364c89d18b648dbf68f77747aa8b7e3cdfeae8 (= partial-load)
+chipdb             reused: toolchain/openxc7/share/nextpnr/himbaechel/xilinx/chipdb-xc7a50t.bin, sha256 ee4ff400cfbeddd1eab0e19914b5cffeeec513bdecb4156f932208659bd59b21, chipdb-id ab1a6f7760a5fdc2

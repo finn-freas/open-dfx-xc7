@@ -1,0 +1,1 @@
+{"clk": "clk", "slice_by": 32, "inputs": [["valid", 1], ["funct", 10], ["rs1", 32], ["rs2", 32]], "outputs": [["rd", 32], ["ready", 1]]}

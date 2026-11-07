@@ -1,0 +1,26 @@
+[board]
+name = "Digilent Arty A7-100T"
+part = "xc7a100tcsg324-1"
+openfpgaloader_board = "arty_a7_100t"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Arty-A7-100-Master.xdc (github.com/Digilent/digilent-xdc, master, sha256 5c0c8430...835f, read 2026-11-06; 'for the Arty A7-100 Rev. D and Rev. E')"
+
+[clock]
+port = "clk"
+pin = "E3"
+period_ns = 10.0
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "H5"
+"led[1]" = "J5"
+"led[2]" = "T9"
+"led[3]" = "T10"
+
+[uart]
+uart_txd_in = "A9"
+uart_rxd_out = "D10"
+
+[dfx]
+example_region = "SLICE_X12Y100:SLICE_X15Y149"

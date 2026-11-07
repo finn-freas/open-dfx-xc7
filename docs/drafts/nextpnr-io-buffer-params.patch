@@ -1,0 +1,32 @@
+diff --git a/himbaechel/uarch/xilinx/pack_io.cc b/himbaechel/uarch/xilinx/pack_io.cc
+index d4d24def..bdfa7663 100644
+--- a/himbaechel/uarch/xilinx/pack_io.cc
++++ b/himbaechel/uarch/xilinx/pack_io.cc
+@@ -457,6 +457,27 @@ void XC7Packer::pack_io()
+             log_error("FIXME: unconstrained IO not supported (pad %s)\n", ctx->nameOf(pad));
+         }
+     }
++
++
++
++
++
++    for (auto &iob : pad_and_buf) {
++        CellInfo *pad = iob.first;
++        CellInfo *buf = iob.second.cell;
++        for (auto &param : buf->params) {
++            const IdString key = param.first;
++            const bool is_io_property =
++                    key.in(id_IOSTANDARD, id_DRIVE, id_SLEW) || key.str(ctx) == "DIFF_TERM";
++            if (!is_io_property || pad->attrs.count(key))
++                continue;
++            const bool is_default_standard =
++                    key == id_IOSTANDARD && param.second.is_string && param.second.as_string() == "DEFAULT";
++            if (is_default_standard)
++                continue;
++            pad->attrs[key] = param.second;
++        }
++    }
+     // Decompose macro IO primitives to smaller primitives that map logically to the actual IO Bels
+     for (auto &iob : pad_and_buf) {
+         auto pad_cell = iob.first;

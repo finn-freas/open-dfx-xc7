@@ -1,0 +1,450 @@
+diff --git a/common/kernel/command.cc b/common/kernel/command.cc
+index 1f23b661..848ec838 100644
+--- a/common/kernel/command.cc
++++ b/common/kernel/command.cc
+@@ -435,6 +435,9 @@ po::options_description CommandHandler::getGeneralOptions()
+     general.add_options()("report", po::value<std::string>(),
+                           "write timing and utilization report in JSON format to file");
+     general.add_options()("detailed-timing-report", "Append detailed net timing data to the JSON report");
++    general.add_options()("report-paths", po::value<int>(),
++                          "Append the setup and hold checks of every timing endpoint, and the N worst setup "
++                          "and hold paths of each clock pair, to the JSON report");
+ 
+     general.add_options()("placed-svg", po::value<std::string>(), "write render of placement to SVG file");
+     general.add_options()("routed-svg", po::value<std::string>(), "write render of routing to SVG file");
+@@ -632,6 +635,10 @@ void CommandHandler::setupContext(Context *ctx)
+     if (vm.count("detailed-timing-report")) {
+         ctx->detailed_timing_report = true;
+     }
++
++    if (vm.count("report-paths")) {
++        ctx->timing_report_paths = vm["report-paths"].as<int>();
++    }
+ }
+ 
+ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
+diff --git a/common/kernel/context.h b/common/kernel/context.h
+index 473d9b21..21b91d2a 100644
+--- a/common/kernel/context.h
++++ b/common/kernel/context.h
+@@ -38,6 +38,8 @@ struct Context : Arch, DeterministicRNG
+     bool disable_critical_path_source_print = false;
+     // True when detailed per-net timing is to be stored / reported
+     bool detailed_timing_report = false;
++
++    int timing_report_paths = 0;
+ 
+     Context(ArchArgs args) : Arch(args) { BaseCtx::as_ctx = this; }
+ 
+diff --git a/common/kernel/nextpnr_types.h b/common/kernel/nextpnr_types.h
+index 8349998a..88620cc4 100644
+--- a/common/kernel/nextpnr_types.h
++++ b/common/kernel/nextpnr_types.h
+@@ -562,6 +562,36 @@ struct TimingResult
+         DelayPair clock_latency{0};
+     };
+     std::vector<ConstrainedPath> constrained_paths;
++
++
++    struct EndpointCheck
++    {
++        ClockPair clock_pair;
++        std::pair<IdString, IdString> cell_port;
++
++        std::string untimed;
++
++        std::string exception;
++        bool has_setup = false, has_hold = false;
++        delay_t setup_requirement = 0, setup_slack = 0;
++        delay_t hold_requirement = 0, hold_slack = 0;
++        DelayPair arrival{0};
++    };
++    std::vector<EndpointCheck> endpoint_checks;
++
++
++    struct ReportedPath
++    {
++        bool is_hold = false;
++        delay_t requirement = 0, slack = 0;
++        std::string exception;
++        std::pair<IdString, IdString> endpoint;
++        CriticalPath path;
++    };
++    std::vector<ReportedPath> reported_paths;
++
++
++    std::vector<IdString> clock_nets;
+ };
+ 
+ // Represents the contents of a non-leaf cell in a design
+diff --git a/common/kernel/report.cc b/common/kernel/report.cc
+index 4c1ef9f0..701573b1 100644
+--- a/common/kernel/report.cc
++++ b/common/kernel/report.cc
+@@ -70,46 +70,48 @@ static std::vector<std::string> net_sources(const NetInfo *net, const Context *c
+     return source_entries;
+ }
+ 
+-static Json::array json_report_critical_paths(const Context *ctx)
++static Json::array json_report_path_segments(const Context *ctx, const CriticalPath &report)
+ {
++    Json::array pathJson;
+ 
+-    auto report_critical_path = [ctx](const CriticalPath &report) {
+-        Json::array pathJson;
++    for (const auto &segment : report.segments) {
+ 
+-        for (const auto &segment : report.segments) {
++        const auto &driver = ctx->cells.at(segment.from.first);
++        const auto &sink = ctx->cells.at(segment.to.first);
+ 
+-            const auto &driver = ctx->cells.at(segment.from.first);
+-            const auto &sink = ctx->cells.at(segment.to.first);
++        auto fromLoc = ctx->getBelLocation(driver->bel);
++        auto toLoc = ctx->getBelLocation(sink->bel);
+ 
+-            auto fromLoc = ctx->getBelLocation(driver->bel);
+-            auto toLoc = ctx->getBelLocation(sink->bel);
++        auto fromJson = Json::object({{"cell", segment.from.first.c_str(ctx)},
++                                      {"port", segment.from.second.c_str(ctx)},
++                                      {"loc", Json::array({fromLoc.x, fromLoc.y})}});
+ 
+-            auto fromJson = Json::object({{"cell", segment.from.first.c_str(ctx)},
+-                                          {"port", segment.from.second.c_str(ctx)},
+-                                          {"loc", Json::array({fromLoc.x, fromLoc.y})}});
++        auto toJson = Json::object({{"cell", segment.to.first.c_str(ctx)},
++                                    {"port", segment.to.second.c_str(ctx)},
++                                    {"loc", Json::array({toLoc.x, toLoc.y})}});
+ 
+-            auto toJson = Json::object({{"cell", segment.to.first.c_str(ctx)},
+-                                        {"port", segment.to.second.c_str(ctx)},
+-                                        {"loc", Json::array({toLoc.x, toLoc.y})}});
++        auto segmentJson = Json::object({
++                {"delay", ctx->getDelayNS(segment.delay)},
++                {"from", fromJson},
++                {"to", toJson},
++        });
+ 
+-            auto segmentJson = Json::object({
+-                    {"delay", ctx->getDelayNS(segment.delay)},
+-                    {"from", fromJson},
+-                    {"to", toJson},
+-            });
++        segmentJson["type"] = CriticalPath::Segment::type_to_str(segment.type);
++        if (segment.type == CriticalPath::Segment::Type::ROUTING) {
++            segmentJson["net"] = segment.net.c_str(ctx);
++            const NetInfo *net = ctx->nets.at(segment.net).get();
++            segmentJson["sources"] = net_sources(net, ctx);
++        }
+ 
+-            segmentJson["type"] = CriticalPath::Segment::type_to_str(segment.type);
+-            if (segment.type == CriticalPath::Segment::Type::ROUTING) {
+-                segmentJson["net"] = segment.net.c_str(ctx);
+-                const NetInfo *net = ctx->nets.at(segment.net).get();
+-                segmentJson["sources"] = net_sources(net, ctx);
+-            }
++        pathJson.push_back(segmentJson);
++    }
+ 
+-            pathJson.push_back(segmentJson);
+-        }
++    return pathJson;
++}
+ 
+-        return pathJson;
+-    };
++static Json::array json_report_critical_paths(const Context *ctx)
++{
++    auto report_critical_path = [ctx](const CriticalPath &report) { return json_report_path_segments(ctx, report); };
+ 
+     auto critPathsJson = Json::array();
+ 
+@@ -131,6 +133,76 @@ static Json::array json_report_critical_paths(const Context *ctx)
+     return critPathsJson;
+ }
+ 
++static Json json_delay_pair(const Context *ctx, delay_t requirement, delay_t slack)
++{
++    return Json::array({ctx->getDelayNS(requirement), ctx->getDelayNS(slack)});
++}
++
++static Json::array json_report_endpoints(const Context *ctx)
++{
++    Json::array endpointsJson;
++    for (const auto &check : ctx->timing_result.endpoint_checks) {
++        const CellInfo *cell = ctx->cells.at(check.cell_port.first).get();
++        auto endpointJson = Json::object({{"cell", check.cell_port.first.c_str(ctx)},
++                                          {"port", check.cell_port.second.c_str(ctx)},
++                                          {"type", cell->type.c_str(ctx)},
++                                          {"from", clock_event_name(ctx, check.clock_pair.start)},
++                                          {"to", clock_event_name(ctx, check.clock_pair.end)},
++                                          {"arrival", Json::array({ctx->getDelayNS(check.arrival.minDelay()),
++                                                                   ctx->getDelayNS(check.arrival.maxDelay())})}});
++        if (!check.untimed.empty())
++            endpointJson["untimed"] = check.untimed;
++        if (!check.exception.empty())
++            endpointJson["exception"] = check.exception;
++        if (check.has_setup)
++            endpointJson["setup"] = json_delay_pair(ctx, check.setup_requirement, check.setup_slack);
++        if (check.has_hold)
++            endpointJson["hold"] = json_delay_pair(ctx, check.hold_requirement, check.hold_slack);
++        endpointsJson.push_back(endpointJson);
++    }
++    return endpointsJson;
++}
++
++static Json::array json_report_paths(const Context *ctx)
++{
++    Json::array pathsJson;
++    for (const auto &path : ctx->timing_result.reported_paths) {
++        auto pathJson = Json::object({{"from", clock_event_name(ctx, path.path.clock_pair.start)},
++                                      {"to", clock_event_name(ctx, path.path.clock_pair.end)},
++                                      {"check", path.is_hold ? "hold" : "setup"},
++                                      {"endpoint", Json::object({{"cell", path.endpoint.first.c_str(ctx)},
++                                                                 {"port", path.endpoint.second.c_str(ctx)}})},
++                                      {"requirement", ctx->getDelayNS(path.requirement)},
++                                      {"slack", ctx->getDelayNS(path.slack)},
++                                      {"path", json_report_path_segments(ctx, path.path)}});
++        if (!path.exception.empty())
++            pathJson["exception"] = path.exception;
++        pathsJson.push_back(pathJson);
++    }
++    return pathsJson;
++}
++
++static Json::array json_report_clocks(const Context *ctx)
++{
++    Json::array clocksJson;
++    for (IdString clock : ctx->timing_result.clock_nets) {
++        auto clockJson = Json::object({{"net", clock.c_str(ctx)}});
++        const NetInfo *net = ctx->nets.count(clock) ? ctx->nets.at(clock).get() : nullptr;
++        if (net != nullptr && net->clkconstr) {
++            const ClockConstraint &cc = *net->clkconstr;
++            clockJson["period"] = ctx->getDelayNS(cc.period.minDelay());
++            clockJson["high"] = ctx->getDelayNS(cc.high.minDelay());
++            clockJson["offset"] = ctx->getDelayNS(cc.offset);
++            if (cc.name != IdString())
++                clockJson["name"] = cc.name.c_str(ctx);
++            if (cc.master != IdString())
++                clockJson["master"] = cc.master.c_str(ctx);
++        }
++        clocksJson.push_back(clockJson);
++    }
++    return clocksJson;
++}
++
+ static Json::array json_report_detailed_net_timings(const Context *ctx)
+ {
+     auto detailedNetTimingsJson = Json::array();
+@@ -266,6 +338,12 @@ void Context::writeJsonReport(std::ostream &out) const
+         jsonRoot["detailed_net_timings"] = json_report_detailed_net_timings(this);
+     }
+ 
++    if (timing_report_paths > 0) {
++        jsonRoot["clocks"] = json_report_clocks(this);
++        jsonRoot["endpoints"] = json_report_endpoints(this);
++        jsonRoot["paths"] = json_report_paths(this);
++    }
++
+     out << Json(jsonRoot).dump() << std::endl;
+ }
+ 
+diff --git a/common/kernel/timing.cc b/common/kernel/timing.cc
+index 17e48833..9d95dda1 100644
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -1862,6 +1862,170 @@ void TimingAnalyser::build_constrained_path_reports()
+     }
+ }
+ 
++void TimingAnalyser::build_endpoint_reports(int paths_per_pair)
++{
++    auto &checks = result.endpoint_checks;
++    checks.clear();
++    result.reported_paths.clear();
++    result.clock_nets.clear();
++    for (auto &dom : domains)
++        if (!dom.key.is_async() &&
++            std::find(result.clock_nets.begin(), result.clock_nets.end(), dom.key.clock) == result.clock_nets.end())
++            result.clock_nets.push_back(dom.key.clock);
++
++    struct Candidate
++    {
++        delay_t slack, requirement;
++        domain_id_t pair;
++        CellPortKey endpoint;
++        std::string exception;
++    };
++    dict<ClockPair, std::vector<Candidate>> setup_candidates, hold_candidates;
++    dict<domain_id_t, bool> related;
++
++    for (domain_id_t capture_id = 0; capture_id < domain_id_t(domains.size()); ++capture_id) {
++        const ClockDomainKey &capture = domains.at(capture_id).key;
++        for (auto &ep : domains.at(capture_id).endpoints) {
++            auto &pd = ports.at(ep.first);
++            auto req = pd.required.find(capture_id);
++            if (req == pd.required.end())
++                continue;
++            int clk_count = 0;
++            const bool register_end =
++                    ctx->getPortTimingClass(cell_info(ep.first), ep.first.port, clk_count) == TMG_REGISTER_INPUT;
++            if (pd.arrival.empty()) {
++
++                const NetInfo *net = port_info(ep.first).net;
++                const bool constant = net == nullptr || net->driver.cell == nullptr ||
++                                      net->constant_value != IdString() || net->name.str(ctx).rfind("$PACKER_", 0) == 0;
++                if (!constant) {
++                    TimingResult::EndpointCheck check;
++                    check.clock_pair.start.clock = IdString();
++                    check.clock_pair.start.edge = RISING_EDGE;
++                    check.clock_pair.end.clock = capture.clock;
++                    check.clock_pair.end.edge = capture.edge;
++                    check.cell_port = std::make_pair(ep.first.cell, ep.first.port);
++                    check.untimed = capture.is_async() ? "no clock" : "no launch clock";
++                    checks.push_back(check);
++                }
++            }
++            for (auto &arr : pd.arrival) {
++                const domain_id_t launch_id = arr.first;
++                const ClockDomainKey &launch = domains.at(launch_id).key;
++                auto found_pair = pair_to_id.find(ClockDomainPairKey(launch_id, capture_id));
++                if (found_pair == pair_to_id.end())
++                    continue;
++                const domain_id_t pair_id = found_pair->second;
++                auto pdp = pd.domain_pairs.find(pair_id);
++                if (pdp == pd.domain_pairs.end())
++                    continue;
++                const PerDomainPair &dp = domain_pairs.at(pair_id);
++
++                TimingResult::EndpointCheck check;
++                check.clock_pair.start.clock = launch.clock;
++                check.clock_pair.start.edge = launch.edge;
++                check.clock_pair.end.clock = capture.clock;
++                check.clock_pair.end.edge = capture.edge;
++                check.cell_port = std::make_pair(ep.first.cell, ep.first.port);
++                check.arrival = arr.second.value;
++                const TimingException *setup_ex =
++                        dp.setup_exception >= 0 ? &ctx->timing_exceptions.at(dp.setup_exception) : nullptr;
++                if (setup_ex != nullptr)
++                    check.exception = setup_ex->name;
++
++                if (launch.is_async() && capture.is_async())
++                    check.untimed = "no clock";
++                else if (launch.is_async())
++                    check.untimed = "no launch clock";
++                else if (capture.is_async())
++                    check.untimed = "no capture clock";
++                else if (is_false_clock_pair(ctx, launch.clock, capture.clock))
++                    check.untimed = "false path between the clocks";
++                else if (setup_ex != nullptr && setup_ex->kind == TimingException::FALSE_PATH)
++                    check.untimed = "false path";
++                else if (launch.clock != capture.clock && setup_ex == nullptr) {
++                    auto rel = related.find(pair_id);
++                    if (rel == related.end()) {
++                        delay_t relationship;
++                        rel = related
++                                      .emplace(pair_id, clock_setup_relationship(ctx, launch.clock, launch.edge,
++                                                                                 capture.clock, capture.edge,
++                                                                                 relationship))
++                                      .first;
++                    }
++                    if (!rel->second)
++                        check.untimed = "unrelated clocks";
++                }
++
++                if (check.untimed.empty()) {
++                    check.has_setup = true;
++                    check.setup_requirement = dp.period.minDelay();
++                    int mcp = setup_multicycle(ctx, ep.first.cell, capture.clock);
++                    if (mcp > 1)
++                        check.setup_requirement += ctx->nets.at(capture.clock)->clkconstr->period.minDelay() * (mcp - 1);
++                    check.setup_slack = dp.period.minDelay() + pdp->second.setup_slack;
++                    setup_candidates[check.clock_pair].push_back(
++                            Candidate{check.setup_slack, check.setup_requirement, pair_id, ep.first, check.exception});
++                }
++
++                auto clocks = std::make_pair(launch.clock, capture.clock);
++                const bool related_clocks = clock_delays.count(clocks) > 0;
++                const bool one_clock = launch.clock == capture.clock && launch.edge == capture.edge;
++                const bool hold_endpoint = register_end || io_ends.count(ep.first);
++                bool has_hold = !setup_only && hold_endpoint && !launch.is_async() && !capture.is_async() &&
++                                (one_clock || related_clocks || dp.has_hold_relationship) &&
++                                !is_false_clock_pair(ctx, launch.clock, capture.clock);
++                delay_t hold_requirement = dp.hold_relationship;
++                std::string hold_exception;
++                if (has_hold && dp.hold_exception >= 0) {
++                    const TimingException &ex = ctx->timing_exceptions.at(dp.hold_exception);
++                    has_hold = ex.kind == TimingException::MIN_DELAY;
++                    hold_requirement = ex.value;
++                    hold_exception = ex.name;
++                } else {
++                    hold_requirement += clock_uncertainty(ctx, launch.clock, capture.clock, false);
++                }
++                if (has_hold) {
++                    delay_t clock_to_clock = related_clocks ? clock_delays.at(clocks) : 0;
++                    check.has_hold = true;
++                    check.hold_requirement = hold_requirement;
++                    check.hold_slack = arr.second.value.minDelay() - req->second.value.maxDelay() + clock_to_clock -
++                                       hold_requirement;
++                    hold_candidates[check.clock_pair].push_back(
++                            Candidate{check.hold_slack, check.hold_requirement, pair_id, ep.first, hold_exception});
++                }
++                checks.push_back(check);
++            }
++        }
++    }
++
++    auto add_worst = [&](dict<ClockPair, std::vector<Candidate>> &candidates, bool is_hold) {
++        for (auto &group : candidates) {
++            auto &list = group.second;
++            std::stable_sort(list.begin(), list.end(),
++                             [](const Candidate &a, const Candidate &b) { return a.slack < b.slack; });
++            int taken = 0;
++            for (auto &c : list) {
++                if (taken >= paths_per_pair)
++                    break;
++                if (walk_crit_path(c.pair, c.endpoint, !is_hold).empty())
++                    continue;
++                TimingResult::ReportedPath path;
++                path.is_hold = is_hold;
++                path.slack = c.slack;
++                path.exception = c.exception;
++                path.endpoint = std::make_pair(c.endpoint.cell, c.endpoint.port);
++                path.path = build_critical_path_report(c.pair, c.endpoint, !is_hold);
++                path.requirement = c.requirement;
++                result.reported_paths.push_back(path);
++                taken++;
++            }
++        }
++    };
++    add_worst(setup_candidates, false);
++    add_worst(hold_candidates, true);
++}
++
+ // set_input_delay and set_output_delay, as the XDC reader leaves them on the port's cell:
+ // NEXTPNR_INPUT_DELAY / NEXTPNR_OUTPUT_DELAY = "<clock> <0 rising | 1 falling> <min ns> <max ns>"
+ void TimingAnalyser::setup_io_delays()
+@@ -2030,6 +2194,8 @@ void timing_analysis(Context *ctx, bool print_slack_histogram, bool print_fmax,
+     tmg.setup_only = false;
+     tmg.with_clock_skew = true;
+     tmg.setup(ctx->detailed_timing_report, print_slack_histogram, print_path || print_fmax);
++    if (update_results && ctx->timing_report_paths > 0)
++        tmg.build_endpoint_reports(ctx->timing_report_paths);
+ 
+     auto &result = tmg.get_timing_result();
+     ctx->log_timing_results(result, print_slack_histogram, print_fmax, print_path, warn_on_failure);
+diff --git a/common/kernel/timing.h b/common/kernel/timing.h
+index ca36e815..e8b24f7b 100644
+--- a/common/kernel/timing.h
++++ b/common/kernel/timing.h
+@@ -107,6 +107,10 @@ struct TimingAnalyser
+ 
+     TimingResult &get_timing_result() { return result; }
+ 
++
++
++    void build_endpoint_reports(int paths_per_pair);
++
+     // Enable analysis of clock skew between FFs.
+     bool with_clock_skew = false;
+ 

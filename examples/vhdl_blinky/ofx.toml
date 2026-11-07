@@ -1,0 +1,11 @@
+[project]
+name = "vhdl_blinky"
+top = "vhdl_blinky"
+board = "arty-a7-35t"
+sources = ["src/vhdl_blinky.vhd"]
+constraints = ["constraints/vhdl_blinky.xdc"]
+vhdl_std = "08"
+seed = 1
+
+[clocks]
+clk = 10.0

@@ -1,0 +1,70 @@
+diff --git a/himbaechel/uarch/xilinx/xdc.cc b/himbaechel/uarch/xilinx/xdc.cc
+index c8c0aa78..f25962c8 100644
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -989,6 +989,7 @@ void XilinxImpl::add_pblock_routing_tiles(Region *pb_region)
+         int x, y;
+         tile_xy(ctx->chip_info, tile, x, y);
+         pb_region->piplocs.insert(Loc(x, y, 0));
++        pblock_site_tiles[tile] = pb_region;
+         const std::string type = tile_type_of(tile);
+         const bool interconnect_is_to_the_right = ends_with(type, "_L");
+         const bool interconnect_is_to_the_left = ends_with(type, "_R");
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index c9cd40e5..c15c50bd 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -382,6 +382,33 @@ void XilinxImpl::update_bram_bel(BelId bel, CellInfo *cell)
+     tts.bts->cells[z] = cell;
+ }
+ 
++
++
++
++
++
++
++
++bool XilinxImpl::is_routethru_closed_to_net(PipId pip, const NetInfo *net) const
++{
++    if (pblock_site_tiles.empty())
++        return false;
++    const auto &pip_data = chip_pip_info(ctx->chip_info, pip);
++    if (pip_data.flags != PIP_LUT_ROUTETHRU)
++        return false;
++    auto owner = pblock_site_tiles.find(pip.tile);
++    if (owner == pblock_site_tiles.end())
++        return false;
++    const bool driver_is_a_member =
++            net != nullptr && net->driver.cell != nullptr && net->driver.cell->region == owner->second;
++    if (!driver_is_a_member)
++        return true;
++    for (auto &usr : net->users)
++        if (usr.cell == nullptr || usr.cell->region != owner->second)
++            return true;
++    return false;
++}
++
+ bool XilinxImpl::is_pip_unavail(PipId pip) const
+ {
+     const auto &pip_data = chip_pip_info(ctx->chip_info, pip);
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 3a3b2fbe..acc9b1c9 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -173,7 +173,14 @@ struct XilinxImpl : HimbaechelAPI
+     mutable bool design_has_bufr = false;
+     mutable bool design_has_bufr_valid = false;
+     bool checkPipAvail(PipId pip) const override { return !is_pip_unavail(pip); }
+-    bool checkPipAvailForNet(PipId pip, const NetInfo *net) const override { return !is_pip_unavail(pip); }
++    bool checkPipAvailForNet(PipId pip, const NetInfo *net) const override
++    {
++        return !is_pip_unavail(pip) && !is_routethru_closed_to_net(pip, net);
++    }
++
++
++    dict<int, const Region *> pblock_site_tiles;
++    bool is_routethru_closed_to_net(PipId pip, const NetInfo *net) const;
+ 
+     // Flow management
+     void parse_xdc(const std::string &filename);

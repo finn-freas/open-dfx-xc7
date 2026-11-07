@@ -1,0 +1,8 @@
+xilinx: place a DSP48E1 cascade along the chipdb wires (-o dsp-cascade-place)
+
+walk_dsp gives each cascaded DSP a fixed offset of 5 rows per DSP tile,
+but the step is 6 rows across an HCLK or BRKH row, so a PCOUT -> PCIN
+chain longer than one clock region had no legal placement.  The RAMB36
+cascade walk is made generic (cascade_next) and a DSP48E1 cluster
+follows the PCOUT0 -> PCIN0 wires when -o dsp-cascade-place is given.
+Off by default.

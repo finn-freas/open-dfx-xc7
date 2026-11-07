@@ -1,0 +1,22 @@
+[board]
+name = "Digilent Cora Z7-07S (programmable logic only)"
+part = "xc7z007sclg400-1"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Cora-Z7-07S-Master.xdc ('for the Cora Z7-07S Rev. B', github.com/Digilent/digilent-xdc master c8644a9f, sha256 7d689e02...6eb5, read 2026-11-06); part from Digilent vivado-boards master d8d43ed9 new/board_files/cora-z7-07s/B.0/board.xml (sha256 590e9735...6247)"
+notes = "PL pins only (see zybo-z7-10). The board has two RGB LEDs and no single LEDs: led[0..3] of the preset are led0_b L15, led0_g G17, led0_r N15 and led1_b G14 from Digilent's file. No openFPGALoader board name exists for the Cora Z7 (openFPGALoader --list-boards), so ofx program needs --board or a cable. xc7z007s is the xc7z010 die (prjxray-db zynq7 mapping)."
+
+[clock]
+port = "clk"
+pin = "H16"
+period_ns = 8.0
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "L15"
+"led[1]" = "G17"
+"led[2]" = "N15"
+"led[3]" = "G14"
+
+[dfx]
+example_region = "SLICE_X28Y50:SLICE_X31Y99"

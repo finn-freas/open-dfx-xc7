@@ -1,0 +1,19 @@
+xilinx, timing: read the XDC timing commands Vivado designs use
+
+XDC reader: object queries take {a b c} lists, globs, -hier, -filter on
+NAME, -quiet and -include_generated_clocks; Vivado register names
+(cnt_reg[3], u_a/q_reg) resolve to the flip-flop that drives the net; a
+backslash continues a line; set_property takes nets and pins (with a
+warning), PULLUP/PULLDOWN/KEEPER TRUE, a site-local BEL and a repeated
+value; create_clock takes -name and -waveform; create_generated_clock,
+set_clock_groups and set_false_path between clocks or on cells of one
+side are applied after packing.  Every command or property that is
+accepted but not applied gets a "NOT applied" warning.
+
+Timer: a clock constraint knows its name, its primary clock and its
+first edge, so clocks of one primary (MMCM/PLL outputs, generated
+clocks, BUFR dividers) are checked against their edge relationship
+instead of only being listed as cross-domain.  Clock pairs in a false
+path get no criticality and no report.  Criticality of other paths is
+unchanged, so a design without the new commands places and routes as
+before.

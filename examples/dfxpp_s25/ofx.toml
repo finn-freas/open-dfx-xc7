@@ -1,0 +1,24 @@
+[project]
+name = "dfxpp_s25"
+top = "dfxpp_s25"
+board = "arty-s7-25"
+sources = ["src/dfxpp_s25.v"]
+constraints = ["constraints/dfxpp_s25.xdc"]
+seed = 1
+
+[clocks]
+clk = 83.333
+
+[dfx]
+partpins = "auto"
+rar = false
+compress = false
+decoupler = false
+
+[[dfx.partition]]
+name = "rp0"
+inst = "u_rm"
+region = "SLICE_X12Y50:SLICE_X15Y99"
+ports = "rm/ports.json"
+register = ["ready"]
+rms = { xor = "rm/rm_core_xor.v", andn = "rm/rm_core_andn.v" }

@@ -1,0 +1,12 @@
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -1867,7 +1867,8 @@
+ 
+             write_bit("ODDR_TDDR.IN_USE");
+             write_bit("OQUSED");
+-            write_bit("OSERDES.DATA_RATE_OQ.DDR");
++            const bool is_a_register = ci->attrs.count(ctx->id("X_IOB_SDR")) > 0;
++            write_bit(is_a_register ? "OSERDES.DATA_RATE_OQ.SDR" : "OSERDES.DATA_RATE_OQ.DDR");
+             const BelId tff_bel = uarch->get_site_bel(site_key, ctx->id("TFF"));
+             const bool tristate_is_an_oddr = tff_bel != BelId() && ctx->getBoundBelCell(tff_bel) != nullptr;
+             if (!tristate_is_an_oddr)

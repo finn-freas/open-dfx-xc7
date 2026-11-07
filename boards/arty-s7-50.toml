@@ -1,0 +1,27 @@
+[board]
+name = "Digilent Arty S7-50"
+part = "xc7s50csga324-1"
+openfpgaloader_board = "arty_s7_50"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Arty-S7-50-Master.xdc ('for the Arty S7-50 Rev. E', github.com/Digilent/digilent-xdc master c8644a9f, sha256 26d47216...3ab5, read 2026-11-06); part from Digilent vivado-boards new/board_files/arty-s7-50/B.0/board.xml (sha256 e015e152...b97a)"
+notes = "The clock is the 12 MHz CLK12MHZ input (F14, LVCMOS33). The 100 MHz CLK100MHZ (R2) is in bank 34 with IOSTANDARD SSTL135 (the DDR3 bank) and is not used by this preset."
+
+[clock]
+port = "clk"
+pin = "F14"
+period_ns = 83.333
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "E18"
+"led[1]" = "F13"
+"led[2]" = "E13"
+"led[3]" = "H15"
+
+[uart]
+uart_txd_in = "V12"
+uart_rxd_out = "R12"
+
+[dfx]
+example_region = "SLICE_X12Y100:SLICE_X15Y149"

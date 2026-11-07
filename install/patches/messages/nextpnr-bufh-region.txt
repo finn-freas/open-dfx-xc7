@@ -1,0 +1,5 @@
+xilinx: keep BUFHCE loads in its clock region and route it on clock wires
+
+BUFHCE joins BUFIO/BUFR in the pass that constrains a regional buffer's
+sinks to the region its clock reaches, and its output is routed by
+route_clocks.

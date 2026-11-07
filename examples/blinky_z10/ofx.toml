@@ -1,0 +1,10 @@
+[project]
+name = "blinky_z10"
+top = "blinky_z10"
+board = "zybo-z7-10"
+sources = ["src/blinky_z10.v"]
+constraints = ["constraints/blinky_z10.xdc"]
+seed = 1
+
+[clocks]
+clk = 8.0

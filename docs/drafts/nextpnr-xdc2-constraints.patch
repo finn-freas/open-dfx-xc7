@@ -1,0 +1,2109 @@
+diff --git a/common/kernel/basectx.h b/common/kernel/basectx.h
+index 3f021e82..b393de50 100644
+--- a/common/kernel/basectx.h
++++ b/common/kernel/basectx.h
+@@ -87,6 +87,9 @@ struct BaseCtx
+     // Fmax data post timing analysis
+     TimingResult timing_result;
+ 
++
++    std::vector<TimingException> timing_exceptions;
++
+     Context *as_ctx = nullptr;
+ 
+     // Has the frontend loaded a design?
+diff --git a/common/kernel/nextpnr_types.h b/common/kernel/nextpnr_types.h
+index 1281ad31..8349998a 100644
+--- a/common/kernel/nextpnr_types.h
++++ b/common/kernel/nextpnr_types.h
+@@ -384,6 +384,38 @@ struct ClockConstraint
+     // Names of the capture clocks to which no path from this clock is timed
+     // (a false path, or an asynchronous or exclusive clock group)
+     pool<IdString> false_path_to;
++
++
++    delay_t setup_uncertainty = 0;
++    delay_t hold_uncertainty = 0;
++
++    delay_t input_jitter = 0;
++};
++
++
++
++
++
++
++struct TimingException
++{
++    enum Kind
++    {
++        FALSE_PATH,
++        MAX_DELAY,
++        MIN_DELAY,
++        MULTICYCLE
++    } kind = FALSE_PATH;
++
++    int setup_cycles = 1;
++
++    delay_t value = 0;
++
++    bool datapath_only = false;
++    pool<IdString> from_cells, to_cells, from_clocks, to_clocks;
++    pool<std::pair<IdString, IdString>> through;
++
++    std::string name;
+ };
+ 
+ struct ClockFmax
+@@ -424,7 +456,10 @@ struct CriticalPath
+             LOGIC,      // Combinational logic delay
+             ROUTING,    // Routing delay
+             SETUP,      // Setup time in sink
+-            HOLD        // Hold time in sink
++            HOLD,
++            INPUT_DELAY,
++            OUTPUT_DELAY,
++            CLK_LATENCY
+         };
+ 
+         [[maybe_unused]] static const std::string type_to_str(Type typ)
+@@ -446,6 +481,12 @@ struct CriticalPath
+                 return "setup";
+             case Type::HOLD:
+                 return "hold";
++            case Type::INPUT_DELAY:
++                return "in-delay";
++            case Type::OUTPUT_DELAY:
++                return "out-delay";
++            case Type::CLK_LATENCY:
++                return "clk-latency";
+             default:
+                 NPNR_ASSERT_FALSE("Impossible Segment::Type");
+             }
+@@ -507,6 +548,20 @@ struct TimingResult
+ 
+     // Setup requirement of each cross-domain path between clocks of one primary
+     dict<ClockPair, delay_t> xclock_requirements;
++
++
++    struct ConstrainedPath
++    {
++        std::string what;
++        ClockPair clock_pair;
++        delay_t requirement = 0;
++        delay_t delay = 0;
++        bool is_hold = false;
++        IdString endpoint;
++
++        DelayPair clock_latency{0};
++    };
++    std::vector<ConstrainedPath> constrained_paths;
+ };
+ 
+ // Represents the contents of a non-leaf cell in a design
+diff --git a/common/kernel/timing.cc b/common/kernel/timing.cc
+index e68011ac..17e48833 100644
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -28,6 +28,7 @@
+ #include <limits>
+ #include <map>
+ #include <numeric>
++#include <sstream>
+ #include <utility>
+ #include "util.h"
+ 
+@@ -95,6 +96,60 @@ static bool clock_setup_relationship(const Context *ctx, IdString launch, ClockE
+     return true;
+ }
+ 
++
++
++static bool clock_hold_relationship(const Context *ctx, IdString launch, ClockEdge launch_edge, IdString capture,
++                                    ClockEdge capture_edge, delay_t &relationship)
++{
++    const ClockConstraint *lc = clock_constraint(ctx, launch), *cc = clock_constraint(ctx, capture);
++    if (lc == nullptr || cc == nullptr || launch == capture || is_false_clock_pair(ctx, launch, capture))
++        return false;
++    IdString lroot = lc->master != IdString() ? lc->master : lc->name;
++    IdString croot = cc->master != IdString() ? cc->master : cc->name;
++    if (lroot == IdString() || lroot != croot)
++        return false;
++    int64_t lp = std::llround(ctx->getDelayNS(lc->period.minDelay()) * 1000.0);
++    int64_t cp = std::llround(ctx->getDelayNS(cc->period.minDelay()) * 1000.0);
++    if (lp <= 0 || cp <= 0)
++        return false;
++    auto first_edge = [&](const ClockConstraint *c, ClockEdge edge) {
++        int64_t t = std::llround(ctx->getDelayNS(c->offset) * 1000.0);
++        if (edge == FALLING_EDGE)
++            t += std::llround(ctx->getDelayNS(c->high.minDelay()) * 1000.0);
++        return t;
++    };
++    auto floor_div = [](int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
++    int64_t l0 = first_edge(lc, launch_edge), c0 = first_edge(cc, capture_edge);
++    int64_t span = lp / std::gcd(lp, cp) * cp;
++    int64_t worst = std::numeric_limits<int64_t>::lowest();
++    for (int64_t k = 0; k < 1000 && k * lp < span; k++) {
++        int64_t launch_at = l0 + k * lp;
++        int64_t setup_capture = c0 + (floor_div(launch_at - c0, cp) + 1) * cp;
++        worst = std::max(worst, std::max(setup_capture - cp - launch_at, setup_capture - (launch_at + lp)));
++    }
++    relationship = ctx->getDelayFromNS(worst / 1000.0);
++    return true;
++}
++
++
++
++
++static delay_t clock_uncertainty(const Context *ctx, IdString launch, IdString capture, bool setup)
++{
++    const ClockConstraint *lc = clock_constraint(ctx, launch), *cc = clock_constraint(ctx, capture);
++    delay_t uncertainty = cc == nullptr ? 0 : (setup ? cc->setup_uncertainty : cc->hold_uncertainty);
++    auto sj = ctx->settings.find(ctx->id("timing/systemJitter"));
++    if (sj != ctx->settings.end() && cc != nullptr) {
++        double system = std::strtod(sj->second.as_string().c_str(), nullptr);
++        double ijl = lc == nullptr ? 0.0 : ctx->getDelayNS(lc->input_jitter);
++        double ijc = ctx->getDelayNS(cc->input_jitter);
++        double tsj2 = 2.0 * system * system;
++        double tij2 = ijl * ijl + ijc * ijc;
++        uncertainty += ctx->getDelayFromNS(std::sqrt(tsj2 + tij2) / 2.0);
++    }
++    return uncertainty;
++}
++
+ TimingAnalyser::TimingAnalyser(Context *ctx) : ctx(ctx)
+ {
+     // An architecture that models its clock trees asks every analyser -- the
+@@ -310,6 +365,8 @@ void TimingAnalyser::setup_port_domains()
+         d.startpoints.clear();
+         d.endpoints.clear();
+     }
++    setup_exceptions();
++    setup_io_delays();
+     bool first_iter = true;
+     do {
+         // Go forward through the topological order (domains from the PoV of arrival time)
+@@ -324,9 +381,14 @@ void TimingAnalyser::setup_port_domains()
+                         // registered outputs are startpoints
+                         if (fanin.type == CellArc::CLK_TO_Q && is_false_path_cell(ctx, port.cell, false))
+                             continue;
+-                        if (fanin.type == CellArc::CLK_TO_Q)
++                        if (fanin.type == CellArc::CLK_TO_Q) {
+                             dom = domain_id(port.cell, fanin.other_port, fanin.edge);
+-                        else if (fanin.type == CellArc::STARTPOINT)
++                            auto from = exception_from_cell.find(port.cell);
++                            if (from != exception_from_cell.end()) {
++                                const bool full = ctx->timing_exceptions.at(from->second).through.empty();
++                                dom = tagged_domain(dom, 2 * from->second + (full ? 1 : 0));
++                            }
++                        } else if (fanin.type == CellArc::STARTPOINT)
+                             dom = async_clock_id;
+                         else
+                             continue;
+@@ -366,9 +428,12 @@ void TimingAnalyser::setup_port_domains()
+                         // registered inputs are endpoints
+                         if (fanout.type == CellArc::SETUP && is_false_path_cell(ctx, port.cell, true))
+                             continue;
+-                        if (fanout.type == CellArc::SETUP)
++                        if (fanout.type == CellArc::SETUP) {
+                             dom = domain_id(port.cell, fanout.other_port, fanout.edge);
+-                        else if (fanout.type == CellArc::ENDPOINT)
++                            auto to = exception_to_cell.find(port.cell);
++                            if (to != exception_to_cell.end())
++                                dom = tagged_domain(dom, -(to->second + 2));
++                        } else if (fanout.type == CellArc::ENDPOINT)
+                             dom = async_clock_id;
+                         else
+                             continue;
+@@ -415,6 +480,7 @@ void TimingAnalyser::setup_port_domains()
+             period /= 2;
+         dp.period = DelayPair(period);
+     }
++    assign_pair_exceptions();
+ }
+ 
+ void TimingAnalyser::identify_related_domains()
+@@ -642,6 +708,7 @@ void TimingAnalyser::set_required_time(CellPortKey target, domain_id_t domain, D
+ 
+ void TimingAnalyser::walk_forward()
+ {
++    update_io_clock_latency();
+     // Assign initial arrival time to domain startpoints
+     for (domain_id_t dom_id = 0; dom_id < domain_id_t(domains.size()); ++dom_id) {
+         auto &dom = domains.at(dom_id);
+@@ -649,6 +716,14 @@ void TimingAnalyser::walk_forward()
+             auto &pd = ports.at(sp.first);
+             DelayPair init_arrival(0);
+             CellPortKey clock_key;
++            auto io = io_starts.find(sp.first);
++            if (io != io_starts.end() && sp.second == IdString()) {
++
++
++                DelayPair latency = io_clock_latency.at(io->second.domain);
++                init_arrival = DelayPair(io->second.delay.min_delay + io->second.buffer.min_delay - latency.max_delay,
++                                         io->second.delay.max_delay + io->second.buffer.max_delay - latency.min_delay);
++            }
+             if (sp.second != IdString()) {
+                 // clocked startpoints have a clock-to-out time
+                 for (auto &fanin : pd.cell_arcs) {
+@@ -678,7 +753,8 @@ void TimingAnalyser::walk_forward()
+                         CellPortKey usr_key(usr);
+                         auto &usr_pd = ports.at(usr_key);
+                         auto next_arr = arr.second.value + usr_pd.route_delay;
+-                        set_arrival_time(usr_key, arr.first, next_arr, arr.second.path_length, p);
++                        set_arrival_time(usr_key, through_domain(usr_key, arr.first, false), next_arr,
++                                         arr.second.path_length, p);
+                     }
+             } else if (pd.type == PORT_IN) {
+                 // Input port; propagate delay through cell, adding combinational delay
+@@ -687,7 +763,8 @@ void TimingAnalyser::walk_forward()
+                         continue;
+ 
+                     auto next_arr = arr.second.value + fanout.value.delayPair();
+-                    set_arrival_time(CellPortKey(p.cell, fanout.other_port), arr.first, next_arr,
++                    CellPortKey out_key(p.cell, fanout.other_port);
++                    set_arrival_time(out_key, through_domain(out_key, arr.first, false), next_arr,
+                                      arr.second.path_length + 1, p);
+                 }
+             }
+@@ -757,6 +834,15 @@ void TimingAnalyser::walk_backward()
+                 }
+                 clock_key = CellPortKey(ep.first.cell, ep.second);
+             }
++            auto io = io_ends.find(ep.first);
++            if (io != io_ends.end() && ep.second == IdString()) {
++
++
++                DelayPair latency = io_clock_latency.at(io->second.domain);
++                init_required = DelayPair(
++                        -(io->second.delay.max_delay + io->second.buffer.max_delay + latency.max_delay),
++                        -(io->second.delay.min_delay + io->second.buffer.min_delay + latency.min_delay));
++            }
+             // set_multicycle_path -setup N: N-1 more periods to reach the capture edge.
+             // Hold is not moved (Vivado's -setup N -hold N-1).
+             int mcp = setup_multicycle(ctx, ep.first.cell, dom.key.clock);
+@@ -852,6 +938,12 @@ dict<domain_id_t, delay_t> TimingAnalyser::max_delay_by_domain_pairs()
+                     delay = (delay + period * (mcp - 1)) * h / (h + 2 * (mcp - 1));
+                 }
+ 
++                const bool is_datapath_only =
++                        domain_pairs.at(dp).setup_exception >= 0 &&
++                        ctx->timing_exceptions.at(domain_pairs.at(dp).setup_exception).datapath_only;
++                if (!launch.key.is_async() && !capture.key.is_async() && !is_datapath_only)
++                    delay += clock_uncertainty(ctx, launch.key.clock, capture.key.clock, true);
++
+                 if (!domain_delay.count(dp) || domain_delay.at(dp) < delay) {
+                     domain_delay[dp] = delay;
+                 }
+@@ -873,16 +965,8 @@ void TimingAnalyser::compute_slack()
+         for (auto &pdp : pd.domain_pairs) {
+             auto &dp = domain_pairs.at(pdp.first);
+ 
+-            // Get clock names
+-            const auto &launch_clock = domains.at(dp.key.launch).key.clock;
+-            const auto &capture_clock = domains.at(dp.key.capture).key.clock;
+-
+             // Get clock-to-clock delay if any
+-            delay_t clock_to_clock = 0;
+-            auto clocks = std::make_pair(launch_clock, capture_clock);
+-            if (clock_delays.count(clocks)) {
+-                clock_to_clock = clock_delays.at(clocks);
+-            }
++            delay_t clock_to_clock = clock_to_clock_delay(pdp.first);
+ 
+             auto &arr = pd.arrival.at(dp.key.launch);
+             auto &req = pd.required.at(dp.key.capture);
+@@ -890,7 +974,12 @@ void TimingAnalyser::compute_slack()
+             if (!setup_only)
+                 pdp.second.hold_slack = arr.value.minDelay() - req.value.maxDelay() + clock_to_clock;
+             pdp.second.max_path_length = arr.path_length + req.path_length;
+-            if (dp.key.launch == dp.key.capture)
++            const auto &lkey = domains.at(dp.key.launch).key, &ckey = domains.at(dp.key.capture).key;
++            const bool one_clock = !lkey.is_async() && lkey.clock == ckey.clock && lkey.edge == ckey.edge;
++            const bool timed_exception =
++                    dp.setup_exception >= 0 &&
++                    ctx->timing_exceptions.at(dp.setup_exception).kind != TimingException::FALSE_PATH;
++            if (dp.key.launch == dp.key.capture || (one_clock && dp.setup_exception < 0) || timed_exception)
+                 pd.worst_setup_slack = std::min(pd.worst_setup_slack, dp.period.minDelay() + pdp.second.setup_slack);
+             dp.worst_setup_slack = std::min(dp.worst_setup_slack, pdp.second.setup_slack);
+             if (!setup_only) {
+@@ -912,9 +1001,17 @@ void TimingAnalyser::compute_criticality()
+                 continue;
+             if (is_false_clock_pair(ctx, domains.at(dp.key.launch).key.clock, domains.at(dp.key.capture).key.clock))
+                 continue;
++            if (dp.setup_exception >= 0 &&
++                ctx->timing_exceptions.at(dp.setup_exception).kind == TimingException::FALSE_PATH)
++                continue;
+ 
+             float crit =
+                     1.0f - (float(pdp.second.setup_slack) - float(dp.worst_setup_slack)) / float(-dp.worst_setup_slack);
++
++            if (dp.setup_exception >= 0) {
++                float requirement = float(dp.period.minDelay());
++                crit = requirement > 0 ? float(-pdp.second.setup_slack) / requirement : 1.0f;
++            }
+             crit = std::min(crit, 1.0f);
+             crit = std::max(crit, 0.0f);
+             pdp.second.criticality = crit;
+@@ -1003,9 +1100,13 @@ std::vector<PortRef> TimingAnalyser::walk_crit_path(domain_id_t domain_pair, Cel
+         // We store the reversed critical path as all input ports that lead to
+         // the timing startpoint.
+         auto is_input = portClass != TMG_CLOCK_INPUT && portClass != TMG_IGNORE && port.type == PortType::PORT_IN;
++        is_input = is_input || (port.type == PortType::PORT_IN && io_ends.count(cursor));
+ 
+         if (is_input)
+             crit_path_rev.emplace_back(PortRef{cell, port.name});
++
++        if (io_starts.count(cursor))
++            break;
+ 
+         if (!ports.at(cursor).arrival.count(dp.key.launch))
+             break;
+@@ -1143,6 +1244,24 @@ CriticalPath TimingAnalyser::build_critical_path_report(domain_id_t domain_pair,
+         }
+     }
+ 
++    auto io_start = io_starts.find(CellPortKey(sp_cell->name, sp_port.name));
++    if (io_start != io_starts.end()) {
++        const IoDelay &io = io_start->second;
++        DelayPair latency = io_clock_latency.at(io.domain);
++        auto add = [&](CriticalPath::Segment::Type type, delay_t delay) {
++            CriticalPath::Segment seg;
++            seg.type = type;
++            seg.delay = delay;
++            seg.from = std::make_pair(io.port, IdString());
++            seg.to = std::make_pair(sp_cell->name, sp_port.name);
++            seg.net = IdString();
++            report.segments.push_back(seg);
++        };
++        add(CriticalPath::Segment::Type::INPUT_DELAY, longest_path ? io.delay.max_delay : io.delay.min_delay);
++        add(CriticalPath::Segment::Type::LOGIC, longest_path ? io.buffer.max_delay : io.buffer.min_delay);
++        add(CriticalPath::Segment::Type::CLK_LATENCY, longest_path ? -latency.min_delay : -latency.max_delay);
++    }
++
+     const CellInfo *prev_cell = sp_cell;
+     IdString prev_port = sp_port.name;
+ 
+@@ -1205,6 +1324,24 @@ CriticalPath TimingAnalyser::build_critical_path_report(domain_id_t domain_pair,
+         report.segments.push_back(seg_logic);
+     }
+ 
++    auto io_end = io_ends.find(endpoint);
++    if (io_end != io_ends.end()) {
++        const IoDelay &io = io_end->second;
++        DelayPair latency = io_clock_latency.at(io.domain);
++        auto add = [&](CriticalPath::Segment::Type type, delay_t delay) {
++            CriticalPath::Segment seg;
++            seg.type = type;
++            seg.delay = delay;
++            seg.from = std::make_pair(prev_cell->name, prev_port);
++            seg.to = std::make_pair(io.port, IdString());
++            seg.net = IdString();
++            report.segments.push_back(seg);
++        };
++        add(CriticalPath::Segment::Type::LOGIC, longest_path ? io.buffer.max_delay : io.buffer.min_delay);
++        add(CriticalPath::Segment::Type::CLK_LATENCY, longest_path ? latency.max_delay : latency.min_delay);
++        add(CriticalPath::Segment::Type::OUTPUT_DELAY, longest_path ? io.delay.max_delay : io.delay.min_delay);
++    }
++
+     return report;
+ }
+ 
+@@ -1232,8 +1369,13 @@ void TimingAnalyser::build_crit_path_reports()
+ 
+         if (launch.clock != capture.clock || launch.is_async())
+             continue;
++        if (dp.setup_exception >= 0)
++            continue;
+ 
+         auto path_delay = delay_by_domain.at(i);
++
++        if (path_delay <= 0)
++            continue;
+ 
+         double Fmax;
+ 
+@@ -1269,6 +1411,8 @@ void TimingAnalyser::build_crit_path_reports()
+             continue;
+         if (is_false_clock_pair(ctx, launch.clock, capture.clock))
+             continue;
++        if (dp.setup_exception >= 0)
++            continue;
+ 
+         auto worst_endpoint = get_worst_eps(i, 1);
+         if (worst_endpoint.empty())
+@@ -1285,6 +1429,8 @@ void TimingAnalyser::build_crit_path_reports()
+         }
+     }
+ 
++    build_constrained_path_reports();
++
+     auto cmp_crit_path = [&](const CriticalPath &ra, const CriticalPath &rb) {
+         const auto &a = ra.clock_pair;
+         const auto &b = rb.clock_pair;
+@@ -1355,7 +1501,7 @@ std::vector<CriticalPath> TimingAnalyser::get_min_delay_violations()
+             const CellInfo *ci = cell_info(ep.first);
+             int clkInfoCount = 0;
+             const TimingPortClass cls = ctx->getPortTimingClass(ci, ep.first.port, clkInfoCount);
+-            if (cls != TMG_REGISTER_INPUT)
++            if (cls != TMG_REGISTER_INPUT && !io_ends.count(ep.first))
+                 continue;
+ 
+             const auto &port = ports.at(ep.first);
+@@ -1370,18 +1516,29 @@ std::vector<CriticalPath> TimingAnalyser::get_min_delay_violations()
+                 auto clocks = std::make_pair(launch_clock, capture_clock);
+                 auto related_clocks = clock_delays.count(clocks) > 0;
+ 
+-                if (launch_id == async_clock_id || (launch_id != capture_id && !related_clocks)) {
++                const auto &pair = domain_pairs.at(dom_pair_id);
++                const bool one_clock = launch_clock == capture_clock && launch.key.edge == capture.key.edge;
++                if (launch_id == async_clock_id || (!one_clock && !related_clocks && !pair.has_hold_relationship)) {
+                     continue;
+                 }
+                 if (is_false_clock_pair(ctx, launch_clock, capture_clock))
+                     continue;
++                delay_t hold_requirement = pair.hold_relationship;
++                if (pair.hold_exception >= 0) {
++                    const TimingException &ex = ctx->timing_exceptions.at(pair.hold_exception);
++                    if (ex.kind != TimingException::MIN_DELAY)
++                        continue;
++                    hold_requirement = ex.value;
++                } else {
++                    hold_requirement += clock_uncertainty(ctx, launch_clock, capture_clock, false);
++                }
+ 
+                 delay_t clock_to_clock = 0;
+                 if (related_clocks) {
+                     clock_to_clock = clock_delays.at(clocks);
+                 }
+ 
+-                auto hold_slack = arr.value.minDelay() - req.value.maxDelay() + clock_to_clock;
++                auto hold_slack = arr.value.minDelay() - req.value.maxDelay() + clock_to_clock - hold_requirement;
+ 
+                 if (hold_slack <= 0) {
+                     auto report = build_critical_path_report(dom_pair_id, ep.first, false);
+@@ -1420,10 +1577,10 @@ domain_id_t TimingAnalyser::domain_id(IdString cell, IdString clock_port, ClockE
+     return domain_id(ctx->cells.at(cell)->ports.at(clock_port).net, edge);
+ }
+ 
+-domain_id_t TimingAnalyser::domain_id(const NetInfo *net, ClockEdge edge)
++domain_id_t TimingAnalyser::domain_id(const NetInfo *net, ClockEdge edge, int tag)
+ {
+     NPNR_ASSERT(net != nullptr);
+-    ClockDomainKey key{net->name, edge};
++    ClockDomainKey key{net->name, edge, tag};
+     auto inserted = domain_to_id.emplace(key, domains.size());
+     if (inserted.second) {
+         domains.emplace_back(key);
+@@ -1445,7 +1602,8 @@ void TimingAnalyser::copy_domains(const CellPortKey &from, const CellPortKey &to
+ {
+     auto &f = ports.at(from), &t = ports.at(to);
+     for (auto &dom : (backward ? f.required : f.arrival)) {
+-        updated_domains |= (backward ? t.required : t.arrival).emplace(dom.first, ArrivReqTime{}).second;
++        domain_id_t to_dom = backward ? dom.first : through_domain(to, dom.first, true);
++        updated_domains |= (backward ? t.required : t.arrival).emplace(to_dom, ArrivReqTime{}).second;
+     }
+ }
+ 
+@@ -1469,6 +1627,398 @@ const std::string TimingAnalyser::arcType_to_str(CellArc::ArcType typ)
+     }
+ }
+ 
++
++
++
++void TimingAnalyser::setup_exceptions()
++{
++    exception_from_cell.clear();
++    exception_to_cell.clear();
++    exception_through.clear();
++    through_domain_map.clear();
++    auto priority = [&](int k) {
++        TimingException::Kind kind = ctx->timing_exceptions.at(k).kind;
++        int rank = kind == TimingException::FALSE_PATH ? 0 : (kind == TimingException::MULTICYCLE ? 2 : 1);
++        return std::make_pair(rank, k);
++    };
++    auto claim = [&](dict<IdString, int> &by_cell, IdString cell, int k) {
++        auto found = by_cell.find(cell);
++        if (found == by_cell.end() || priority(k) < priority(found->second))
++            by_cell[cell] = k;
++    };
++    for (int k = 0; k < int(ctx->timing_exceptions.size()); k++) {
++        const TimingException &ex = ctx->timing_exceptions.at(k);
++        for (IdString cell : ex.from_cells)
++            claim(exception_from_cell, cell, k);
++        for (IdString cell : ex.to_cells)
++            claim(exception_to_cell, cell, k);
++        for (auto &pin : ex.through)
++            if (ports.count(CellPortKey(pin.first, pin.second)))
++                exception_through[CellPortKey(pin.first, pin.second)].push_back(k);
++    }
++}
++
++domain_id_t TimingAnalyser::tagged_domain(domain_id_t dom, int tag)
++{
++    const ClockDomainKey key = domains.at(dom).key;
++    ClockDomainKey tagged{key.clock, key.edge, tag};
++    auto inserted = domain_to_id.emplace(tagged, domains.size());
++    if (inserted.second)
++        domains.emplace_back(tagged);
++    return inserted.first->second;
++}
++
++
++domain_id_t TimingAnalyser::through_domain(const CellPortKey &port, domain_id_t dom, bool create)
++{
++    auto pins = exception_through.find(port);
++    if (pins == exception_through.end())
++        return dom;
++    const int tag = domains.at(dom).key.tag;
++    for (int k : pins->second) {
++        const bool from_matched =
++                tag == 2 * k || (tag == -1 && ctx->timing_exceptions.at(k).from_cells.empty());
++        if (!from_matched)
++            continue;
++        auto key = std::make_pair(dom, k);
++        auto found = through_domain_map.find(key);
++        if (found != through_domain_map.end())
++            return found->second;
++        if (!create)
++            return dom;
++        domain_id_t tagged = tagged_domain(dom, 2 * k + 1);
++        through_domain_map[key] = tagged;
++        return tagged;
++    }
++    return dom;
++}
++
++
++
++void TimingAnalyser::assign_pair_exceptions()
++{
++    for (auto &dp : domain_pairs) {
++        const ClockDomainKey &launch = domains.at(dp.key.launch).key;
++        const ClockDomainKey &capture = domains.at(dp.key.capture).key;
++        dp.setup_exception = dp.hold_exception = -1;
++        dp.hold_relationship = 0;
++        dp.has_hold_relationship = false;
++        if (launch.is_async() || capture.is_async())
++            continue;
++        const ClockConstraint *lc = clock_constraint(ctx, launch.clock), *cc = clock_constraint(ctx, capture.clock);
++        auto rank = [&](int k) {
++            TimingException::Kind kind = ctx->timing_exceptions.at(k).kind;
++            return kind == TimingException::FALSE_PATH ? 0 : (kind == TimingException::MULTICYCLE ? 2 : 1);
++        };
++        for (int k = 0; k < int(ctx->timing_exceptions.size()); k++) {
++            const TimingException &ex = ctx->timing_exceptions.at(k);
++            const bool needs_launch_tag = !ex.from_cells.empty() || !ex.through.empty();
++            if (needs_launch_tag && launch.tag != 2 * k + 1)
++                continue;
++            if (!ex.to_cells.empty() && capture.tag != -(k + 2))
++                continue;
++            if (!ex.from_clocks.empty() && (lc == nullptr || !ex.from_clocks.count(lc->name)))
++                continue;
++            if (!ex.to_clocks.empty() && (cc == nullptr || !ex.to_clocks.count(cc->name)))
++                continue;
++            const bool names_any_path = !needs_launch_tag && ex.to_cells.empty() && ex.from_clocks.empty() &&
++                                        ex.to_clocks.empty();
++            if (names_any_path)
++                continue;
++            const bool takes_setup = ex.kind != TimingException::MIN_DELAY;
++            const bool takes_hold = ex.kind == TimingException::FALSE_PATH || ex.kind == TimingException::MIN_DELAY ||
++                                    (ex.kind == TimingException::MAX_DELAY && ex.datapath_only);
++            if (takes_setup && (dp.setup_exception < 0 || rank(k) < rank(dp.setup_exception)))
++                dp.setup_exception = k;
++            if (takes_hold && (dp.hold_exception < 0 || rank(k) < rank(dp.hold_exception)))
++                dp.hold_exception = k;
++        }
++        const bool one_clock = launch.clock == capture.clock && launch.edge == capture.edge;
++        if (one_clock) {
++            dp.has_hold_relationship = true;
++        } else {
++            delay_t relationship;
++            if (clock_hold_relationship(ctx, launch.clock, launch.edge, capture.clock, capture.edge, relationship)) {
++                dp.hold_relationship = relationship;
++                dp.has_hold_relationship = true;
++            }
++        }
++        bool datapath_only = false;
++        if (dp.setup_exception >= 0) {
++            const TimingException &ex = ctx->timing_exceptions.at(dp.setup_exception);
++            datapath_only = ex.datapath_only;
++            if (ex.kind == TimingException::MAX_DELAY)
++                dp.period = DelayPair(ex.value);
++            else if (ex.kind == TimingException::MULTICYCLE && cc != nullptr)
++                dp.period = DelayPair(dp.period.minDelay() + cc->period.minDelay() * (ex.setup_cycles - 1));
++        }
++        if (!datapath_only)
++            dp.period = DelayPair(dp.period.minDelay() - clock_uncertainty(ctx, launch.clock, capture.clock, true));
++    }
++}
++
++delay_t TimingAnalyser::clock_to_clock_delay(domain_id_t pair) const
++{
++    const auto &dp = domain_pairs.at(pair);
++    if (dp.setup_exception >= 0 && ctx->timing_exceptions.at(dp.setup_exception).datapath_only)
++        return 0;
++    auto clocks = std::make_pair(domains.at(dp.key.launch).key.clock, domains.at(dp.key.capture).key.clock);
++    auto found = clock_delays.find(clocks);
++    return found == clock_delays.end() ? 0 : found->second;
++}
++
++
++void TimingAnalyser::build_constrained_path_reports()
++{
++    auto &paths = result.constrained_paths;
++    paths.clear();
++    for (int i = 0; i < int(domain_pairs.size()); i++) {
++        auto &dp = domain_pairs.at(i);
++        const ClockDomainKey &launch = domains.at(dp.key.launch).key;
++        const ClockDomainKey &capture = domains.at(dp.key.capture).key;
++        auto add_worst = [&](const std::string &what, const std::vector<CellPortKey> &eps,
++                             const dict<CellPortKey, IoDelay> *io_ports) {
++            bool found = false;
++            TimingResult::ConstrainedPath worst;
++            for (auto &ep : eps) {
++                auto &pd = ports.at(ep);
++                if (!pd.domain_pairs.count(i))
++                    continue;
++                delay_t delay = -pd.domain_pairs.at(i).setup_slack;
++                if (found && delay <= worst.delay)
++                    continue;
++                found = true;
++                worst.delay = delay;
++                worst.endpoint = io_ports != nullptr ? io_ports->at(ep).port : ep.cell;
++                if (io_ports != nullptr)
++                    worst.clock_latency = io_clock_latency.at(io_ports->at(ep).domain);
++            }
++            if (!found)
++                return;
++            worst.what = what;
++            worst.clock_pair.start.clock = launch.clock;
++            worst.clock_pair.start.edge = launch.edge;
++            worst.clock_pair.end.clock = capture.clock;
++            worst.clock_pair.end.edge = capture.edge;
++            worst.requirement = dp.period.minDelay();
++            paths.push_back(worst);
++        };
++
++
++        const bool new_hold_check = !launch.is_async() && !setup_only &&
++                                    (dp.hold_exception >= 0 ||
++                                     (dp.has_hold_relationship && launch.clock != capture.clock));
++        const bool hold_is_false = dp.hold_exception >= 0 &&
++                                   ctx->timing_exceptions.at(dp.hold_exception).kind != TimingException::MIN_DELAY;
++        if (new_hold_check && !hold_is_false && !is_false_clock_pair(ctx, launch.clock, capture.clock)) {
++            TimingResult::ConstrainedPath worst;
++            bool found = false;
++            for (auto &ep : domains.at(dp.key.capture).endpoints) {
++                auto &pd = ports.at(ep.first);
++                if (!pd.domain_pairs.count(i))
++                    continue;
++                delay_t slack = pd.domain_pairs.at(i).hold_slack;
++                if (found && slack >= worst.delay)
++                    continue;
++                found = true;
++                worst.delay = slack;
++                worst.endpoint = ep.first.cell;
++            }
++            if (found) {
++                worst.is_hold = true;
++                worst.requirement = dp.hold_exception >= 0
++                                            ? ctx->timing_exceptions.at(dp.hold_exception).value
++                                            : dp.hold_relationship + clock_uncertainty(ctx, launch.clock, capture.clock,
++                                                                                         false);
++                worst.what = dp.hold_exception >= 0 ? ctx->timing_exceptions.at(dp.hold_exception).name : "hold";
++                worst.clock_pair.start.clock = launch.clock;
++                worst.clock_pair.start.edge = launch.edge;
++                worst.clock_pair.end.clock = capture.clock;
++                worst.clock_pair.end.edge = capture.edge;
++                paths.push_back(worst);
++            }
++        }
++        if (dp.setup_exception >= 0) {
++            const TimingException &ex = ctx->timing_exceptions.at(dp.setup_exception);
++            if (ex.kind == TimingException::FALSE_PATH)
++                continue;
++            std::vector<CellPortKey> eps;
++            for (auto &ep : domains.at(dp.key.capture).endpoints)
++                eps.push_back(ep.first);
++            add_worst(ex.name, eps, nullptr);
++            continue;
++        }
++        std::vector<CellPortKey> out_eps, in_sps;
++        for (auto &io : io_ends)
++            if (io.second.domain == dp.key.capture)
++                out_eps.push_back(io.first);
++        for (auto &io : io_starts)
++            if (io.second.domain == dp.key.launch)
++                in_sps.push_back(io.first);
++        if (!out_eps.empty())
++            add_worst("set_output_delay", out_eps, &io_ends);
++        if (!in_sps.empty())
++            add_worst("set_input_delay", in_sps, &io_starts);
++    }
++}
++
++
++
++void TimingAnalyser::setup_io_delays()
++{
++    io_starts.clear();
++    io_ends.clear();
++    const IdString id_in = ctx->id("NEXTPNR_INPUT_DELAY"), id_out = ctx->id("NEXTPNR_OUTPUT_DELAY");
++    dict<IdString, NetInfo *> clock_net_by_name;
++    auto clock_net = [&](IdString name) -> NetInfo * {
++        auto cached = clock_net_by_name.find(name);
++        if (cached != clock_net_by_name.end())
++            return cached->second;
++        NetInfo *best = nullptr;
++        int best_sinks = 0;
++        for (auto &net : ctx->nets) {
++            NetInfo *ni = net.second.get();
++            if (ni->clkconstr == nullptr || ni->clkconstr->name != name)
++                continue;
++            int sinks = 0;
++            for (auto &usr : ni->users) {
++                int count = 0;
++                if (ctx->getPortTimingClass(usr.cell, usr.port, count) == TMG_CLOCK_INPUT)
++                    sinks++;
++            }
++            if (best == nullptr || sinks > best_sinks) {
++                best = ni;
++                best_sinks = sinks;
++            }
++        }
++        clock_net_by_name[name] = best;
++        return best;
++    };
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        for (const bool is_output : {false, true}) {
++            auto attr = ci->attrs.find(is_output ? id_out : id_in);
++            if (attr == ci->attrs.end())
++                continue;
++            std::istringstream fields(attr->second.as_string());
++            std::string clock_name;
++            int falling = 0;
++            double min_ns = 0, max_ns = 0;
++            if (!(fields >> clock_name >> falling >> min_ns >> max_ns)) {
++                log_warning("port '%s': malformed %s '%s', the port is not timed\n", ctx->nameOf(ci),
++                            (is_output ? id_out : id_in).c_str(ctx), attr->second.as_string().c_str());
++                continue;
++            }
++            NetInfo *clk = clock_net(ctx->id(clock_name));
++            if (clk == nullptr) {
++                log_warning("port '%s': clock '%s' of its %s delay is none of this design's clocks, so the port "
++                            "is not timed\n",
++                            ctx->nameOf(ci), clock_name.c_str(), is_output ? "output" : "input");
++                continue;
++            }
++            domain_id_t dom = domain_id(clk, falling ? FALLING_EDGE : RISING_EDGE);
++            DelayPair delay(ctx->getDelayFromNS(min_ns), ctx->getDelayFromNS(max_ns));
++            for (auto &port : ci->ports) {
++                NetInfo *pad_net = port.second.net;
++                if (pad_net == nullptr)
++                    continue;
++
++                auto buffer_pins = [&](CellInfo *buf, IdString pad_pin) {
++                    std::vector<std::pair<IdString, DelayPair>> pins;
++                    for (auto &other : buf->ports) {
++                        const bool away = is_output ? other.second.type == PORT_IN : other.second.type == PORT_OUT;
++                        if (!away || other.second.net == nullptr || other.first == pad_pin)
++                            continue;
++                        DelayQuad arc;
++                        bool has_arc = is_output ? ctx->getCellDelay(buf, other.first, pad_pin, arc)
++                                                 : ctx->getCellDelay(buf, pad_pin, other.first, arc);
++                        pins.emplace_back(other.first, has_arc ? arc.delayPair() : DelayPair(0));
++                    }
++                    return pins;
++                };
++                if (!is_output) {
++                    for (auto &usr : pad_net->users) {
++                        if (usr.cell == ci)
++                            continue;
++                        for (auto &pin : buffer_pins(usr.cell, usr.port)) {
++                            CellPortKey key(usr.cell->name, pin.first);
++                            io_starts[key] = IoDelay{dom, delay, pin.second, ci->name};
++                            ports.at(key).arrival[dom];
++                            domains.at(dom).startpoints.emplace_back(key, IdString());
++                        }
++                    }
++                } else if (pad_net->driver.cell != nullptr && pad_net->driver.cell != ci) {
++                    CellInfo *buf = pad_net->driver.cell;
++                    for (auto &pin : buffer_pins(buf, pad_net->driver.port)) {
++                        CellPortKey key(buf->name, pin.first);
++                        io_ends[key] = IoDelay{dom, delay, pin.second, ci->name};
++                        ports.at(key).required[dom];
++                        domains.at(dom).endpoints.emplace_back(key, IdString());
++                    }
++                }
++            }
++        }
++    }
++}
++
++
++
++DelayPair TimingAnalyser::clock_source_latency(const NetInfo *clock)
++{
++    delay_t lo = 0, hi = 0;
++    if (!with_clock_skew) {
++        bool first = true;
++        for (auto &usr : clock->users) {
++            int count = 0;
++            if (clock->driver.cell == nullptr || clock->driver.cell->bel == BelId() || usr.cell->bel == BelId())
++                continue;
++            if (ctx->getPortTimingClass(usr.cell, usr.port, count) != TMG_CLOCK_INPUT)
++                continue;
++            delay_t d = ctx->getNetinfoRouteDelay(clock, usr);
++            lo = first ? d : std::min(lo, d);
++            hi = first ? d : std::max(hi, d);
++            first = false;
++        }
++    }
++    const NetInfo *net = clock;
++    pool<IdString> seen;
++    while (net != nullptr && net->driver.cell != nullptr && seen.insert(net->name).second) {
++        CellInfo *drv = net->driver.cell;
++        const NetInfo *upstream = nullptr;
++        for (auto &port : drv->ports) {
++            DelayQuad arc;
++            if (port.second.type != PORT_IN || port.second.net == nullptr ||
++                !ctx->getCellDelay(drv, port.first, net->driver.port, arc))
++                continue;
++            lo += arc.minDelay();
++            hi += arc.maxDelay();
++            upstream = port.second.net;
++            const bool placed = upstream->driver.cell != nullptr && upstream->driver.cell->bel != BelId() &&
++                                drv->bel != BelId();
++            if (placed) {
++                delay_t d = ctx->getNetinfoRouteDelay(upstream, PortRef{drv, port.first});
++                lo += d;
++                hi += d;
++            }
++            break;
++        }
++        net = upstream;
++    }
++    return DelayPair(lo, hi);
++}
++
++void TimingAnalyser::update_io_clock_latency()
++{
++    io_clock_latency.clear();
++    for (auto *ios : {&io_starts, &io_ends})
++        for (auto &io : *ios) {
++            if (io_clock_latency.count(io.second.domain))
++                continue;
++            const NetInfo *clk = ctx->nets.at(domains.at(io.second.domain).key.clock).get();
++            io_clock_latency[io.second.domain] = clock_source_latency(clk);
++        }
++}
++
+ CellInfo *TimingAnalyser::cell_info(const CellPortKey &key) { return ctx->cells.at(key.cell).get(); }
+ 
+ PortInfo &TimingAnalyser::port_info(const CellPortKey &key) { return ctx->cells.at(key.cell)->ports.at(key.port); }
+diff --git a/common/kernel/timing.h b/common/kernel/timing.h
+index 4fe42866..ca36e815 100644
+--- a/common/kernel/timing.h
++++ b/common/kernel/timing.h
+@@ -49,13 +49,22 @@ struct ClockDomainKey
+ {
+     IdString clock;
+     ClockEdge edge;
+-    ClockDomainKey(IdString clock_net, ClockEdge edge) : clock(clock_net), edge(edge) {};
+-    // probably also need something here to deal with constraints
++
++
++
++    int tag = -1;
++    ClockDomainKey(IdString clock_net, ClockEdge edge, int tag = -1) : clock(clock_net), edge(edge), tag(tag) {};
+     inline bool is_async() const { return clock == IdString(); }
+ 
+-    unsigned int hash() const { return mkhash(clock.hash(), int(edge)); }
++    unsigned int hash() const
++    {
++        return tag == -1 ? mkhash(clock.hash(), int(edge)) : mkhash(mkhash(clock.hash(), int(edge)), tag);
++    }
+ 
+-    inline bool operator==(const ClockDomainKey &other) const { return (clock == other.clock) && (edge == other.edge); }
++    inline bool operator==(const ClockDomainKey &other) const
++    {
++        return (clock == other.clock) && (edge == other.edge) && (tag == other.tag);
++    }
+ };
+ 
+ typedef int domain_id_t;
+@@ -134,6 +143,33 @@ struct TimingAnalyser
+ 
+     std::vector<CriticalPath> get_min_delay_violations();
+ 
++
++
++
++    struct IoDelay
++    {
++        domain_id_t domain;
++        DelayPair delay;
++        DelayPair buffer;
++        IdString port;
++    };
++    dict<CellPortKey, IoDelay> io_starts, io_ends;
++    dict<domain_id_t, DelayPair> io_clock_latency;
++    void setup_io_delays();
++    void update_io_clock_latency();
++    DelayPair clock_source_latency(const NetInfo *clock);
++
++
++    dict<IdString, int> exception_from_cell, exception_to_cell;
++    dict<CellPortKey, std::vector<int>> exception_through;
++    dict<std::pair<domain_id_t, int>, domain_id_t> through_domain_map;
++    void setup_exceptions();
++    domain_id_t tagged_domain(domain_id_t dom, int tag);
++    domain_id_t through_domain(const CellPortKey &port, domain_id_t dom, bool create);
++    void assign_pair_exceptions();
++    void build_constrained_path_reports();
++    delay_t clock_to_clock_delay(domain_id_t pair) const;
++
+     dict<domain_id_t, delay_t> max_delay_by_domain_pairs();
+ 
+     // get the N worst endpoints for a given domain pair
+@@ -221,13 +257,19 @@ struct TimingAnalyser
+         ClockDomainPairKey key;
+         DelayPair period{0};
+         delay_t worst_setup_slack, worst_hold_slack;
++
++
++        int setup_exception = -1, hold_exception = -1;
++
++        delay_t hold_relationship = 0;
++        bool has_hold_relationship = false;
+     };
+ 
+     CellInfo *cell_info(const CellPortKey &key);
+     PortInfo &port_info(const CellPortKey &key);
+ 
+     domain_id_t domain_id(IdString cell, IdString clock_port, ClockEdge edge);
+-    domain_id_t domain_id(const NetInfo *net, ClockEdge edge);
++    domain_id_t domain_id(const NetInfo *net, ClockEdge edge, int tag = -1);
+     domain_id_t domain_pair_id(domain_id_t launch, domain_id_t capture);
+ 
+     void copy_domains(const CellPortKey &from, const CellPortKey &to, bool backwards);
+diff --git a/common/kernel/timing_log.cc b/common/kernel/timing_log.cc
+index 09ea2b56..c7322eb2 100644
+--- a/common/kernel/timing_log.cc
++++ b/common/kernel/timing_log.cc
+@@ -82,7 +82,10 @@ static void log_crit_paths(const Context *ctx, TimingResult &result)
+                 segment.type == CriticalPath::Segment::Type::SOURCE ||
+                 segment.type == CriticalPath::Segment::Type::LOGIC ||
+                 segment.type == CriticalPath::Segment::Type::SETUP ||
+-                segment.type == CriticalPath::Segment::Type::HOLD) {
++                segment.type == CriticalPath::Segment::Type::HOLD ||
++                segment.type == CriticalPath::Segment::Type::INPUT_DELAY ||
++                segment.type == CriticalPath::Segment::Type::OUTPUT_DELAY ||
++                segment.type == CriticalPath::Segment::Type::CLK_LATENCY) {
+                 logic_total += delay;
+ 
+                 log_info("%10s % 5.2f % 5.2f Source %s.%s\n", CriticalPath::Segment::type_to_str(segment.type).c_str(),
+@@ -207,7 +210,7 @@ static void log_fmax(Context *ctx, TimingResult &result, bool warn_on_failure)
+ 
+     bool allow_fail = bool_or_default(ctx->settings, ctx->id("timing/allowFail"), false);
+ 
+-    if (result.clock_paths.empty() && result.clock_paths.empty()) {
++    if (result.clock_paths.empty() && result.constrained_paths.empty()) {
+         log_info("No Fmax available; no interior timing paths found in design.\n");
+         return;
+     }
+@@ -349,6 +352,47 @@ static void log_fmax(Context *ctx, TimingResult &result, bool warn_on_failure)
+     if (reported_requirement)
+         log_break();
+ 
++
++    for (auto &path : result.constrained_paths) {
++        if (path.is_hold) {
++            bool held = path.delay >= path.requirement;
++            auto ev_a = clock_event_name(ctx, path.clock_pair.start, max_width_xca);
++            auto ev_b = clock_event_name(ctx, path.clock_pair.end, max_width_xcb);
++            std::string msg = stringf("Min delay (%s) for %s -> %s (worst at %s): %.02f ns (%s at requirement "
++                                      "%.02f ns, slack %.02f ns)\n",
++                                      path.what.c_str(), ev_a.c_str(), ev_b.c_str(), path.endpoint.c_str(ctx),
++                                      ctx->getDelayNS(path.delay), held ? "PASS" : "FAIL",
++                                      ctx->getDelayNS(path.requirement),
++                                      ctx->getDelayNS(path.delay - path.requirement));
++            if (!warn_on_failure || held)
++                log_info("%s", msg.c_str());
++            else
++                log_warning("%s", msg.c_str());
++            continue;
++        }
++        bool passed = path.delay <= path.requirement;
++        auto ev_a = clock_event_name(ctx, path.clock_pair.start, max_width_xca);
++        auto ev_b = clock_event_name(ctx, path.clock_pair.end, max_width_xcb);
++        std::string latency;
++        if (path.what.compare(0, 4, "set_") == 0 && path.what.find("put_delay") != std::string::npos)
++            latency = stringf(", clock delay from its pad %.02f..%.02f ns",
++                              ctx->getDelayNS(path.clock_latency.min_delay),
++                              ctx->getDelayNS(path.clock_latency.max_delay));
++        std::string msg = stringf("Max delay for %s %s -> %s (worst at %s%s): %.02f ns (%s at requirement %.02f ns, "
++                                  "slack %.02f ns)\n",
++                                  path.what.c_str(), ev_a.c_str(), ev_b.c_str(), path.endpoint.c_str(ctx),
++                                  latency.c_str(), ctx->getDelayNS(path.delay), passed ? "PASS" : "FAIL",
++                                  ctx->getDelayNS(path.requirement), ctx->getDelayNS(path.requirement - path.delay));
++        if (!warn_on_failure || passed)
++            log_info("%s", msg.c_str());
++        else if (allow_fail)
++            log_warning("%s", msg.c_str());
++        else
++            log_nonfatal_error("%s", msg.c_str());
++    }
++    if (!result.constrained_paths.empty())
++        log_break();
++
+     // Report clock delays for xpaths
+     if (!xclock_delays.empty()) {
+         for (auto &pair : xclock_delays) {
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index e10b42f1..3918e028 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -1853,8 +1853,11 @@ struct FasmBackend
+             }
+ 
+             auto sr_name = str_or_default(ci->attrs, id_X_ORIG_PORT_SR, "R");
++
++
++            const bool is_a_register = ci->attrs.count(ctx->id("X_IOB_SDR")) > 0;
+             if (sr_name == "R") {
+-                for (int i = 1; i <= 4; i++)
++                for (int i = 1; i <= (is_a_register ? 1 : 4); i++)
+                     write_bit("IFF.ZSRVAL_Q" + std::to_string(i));
+             }
+         } else if (ci->type.in(id_OLOGICE2_OUTFF, id_OLOGICE3_OUTFF)) {
+diff --git a/himbaechel/uarch/xilinx/pack.cc b/himbaechel/uarch/xilinx/pack.cc
+index 6faa126f..ff445416 100644
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -457,6 +457,107 @@ bool XilinxPacker::can_add_ff_to_cluster(const CellInfo *lut, const CellInfo *ff
+     return true;
+ }
+ 
++
++
++
++
++void XilinxPacker::pack_async_reg_chains()
++{
++    const IdString id_async = ctx->id("ASYNC_REG");
++    auto is_true = [](const Property &p) {
++        if (!p.is_string)
++            return p.as_bool();
++        std::string v = p.as_string();
++        std::transform(v.begin(), v.end(), v.begin(), ::toupper);
++        return v == "TRUE" || v == "1" || v == "YES";
++    };
++    auto is_async_reg = [&](const CellInfo *ci) {
++        if (ci->type != id_SLICE_FFX || ci->cluster != ClusterId())
++            return false;
++        auto attr = ci->attrs.find(id_async);
++        if (attr != ci->attrs.end())
++            return is_true(attr->second);
++        const NetInfo *q = ci->getPort(id_Q);
++        if (q == nullptr)
++            return false;
++        auto net_attr = q->attrs.find(id_async);
++        return net_attr != q->attrs.end() && is_true(net_attr->second);
++    };
++    auto same_control_set = [&](const CellInfo *a, const CellInfo *b) {
++        auto inverted = [](const CellInfo *c) {
++            return bool_or_default(c->params, id_IS_R_INVERTED, false) ||
++                   bool_or_default(c->params, id_IS_S_INVERTED, false) ||
++                   bool_or_default(c->params, id_IS_CLR_INVERTED, false) ||
++                   bool_or_default(c->params, id_IS_PRE_INVERTED, false);
++        };
++        return a->getPort(id_CK) == b->getPort(id_CK) && a->getPort(id_CE) == b->getPort(id_CE) &&
++               a->getPort(id_SR) == b->getPort(id_SR) &&
++               int_or_default(a->params, id_IS_C_INVERTED, 0) == int_or_default(b->params, id_IS_C_INVERTED, 0) &&
++               inverted(a) == inverted(b) && a->attrs.count(id_X_FF_AS_LATCH) == b->attrs.count(id_X_FF_AS_LATCH) &&
++               a->attrs.count(id_X_FFSYNC) == b->attrs.count(id_X_FFSYNC);
++    };
++
++    auto next_stage = [&](const CellInfo *ff) -> CellInfo * {
++        const NetInfo *q = ff->getPort(id_Q);
++        if (q == nullptr)
++            return nullptr;
++        CellInfo *next = nullptr;
++        for (auto &usr : q->users) {
++            if (usr.port != id_D || !is_async_reg(usr.cell) || usr.cell == ff || !same_control_set(ff, usr.cell))
++                continue;
++            if (next != nullptr)
++                return nullptr;
++            next = usr.cell;
++        }
++        return next;
++    };
++    pool<IdString> has_previous;
++    std::vector<CellInfo *> candidates;
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        if (!is_async_reg(ci))
++            continue;
++        candidates.push_back(ci);
++        CellInfo *next = next_stage(ci);
++        if (next != nullptr)
++            has_previous.insert(next->name);
++    }
++    int chains = 0, flops = 0;
++    pool<IdString> done;
++    for (CellInfo *head : candidates) {
++        if (has_previous.count(head->name) || done.count(head->name))
++            continue;
++        std::vector<CellInfo *> chain;
++        for (CellInfo *ff = head; ff != nullptr && !done.count(ff->name); ff = next_stage(ff)) {
++            chain.push_back(ff);
++            done.insert(ff->name);
++        }
++        if (chain.size() < 2)
++            continue;
++        for (size_t base = 0; base + 1 < chain.size(); base += 4) {
++            CellInfo *root = chain.at(base);
++            size_t n = std::min<size_t>(4, chain.size() - base);
++            if (n < 2)
++                break;
++            root->cluster = root->name;
++            root->attrs[ctx->id("X_ASYNC_REG_CHAIN")] = std::string("1");
++            for (size_t i = 1; i < n; i++) {
++                CellInfo *ff = chain.at(base + i);
++                ff->cluster = root->name;
++                ff->constr_x = 0;
++                ff->constr_y = 0;
++                ff->constr_z = int(i) << 4;
++                ff->constr_abs_z = false;
++                root->constr_children.push_back(ff);
++            }
++            chains++;
++            flops += int(n);
++        }
++    }
++    if (chains > 0)
++        log_info("Constrained %d ASYNC_REG chain(s) of %d flip-flops to one slice each.\n", chains, flops);
++}
++
+ void XilinxPacker::pack_lutffs()
+ {
+     int pairs = 0;
+@@ -1546,6 +1647,7 @@ void XilinxImpl::pack()
+     packer.prepare_clocking();
+     packer.pack_constants();
+     packer.raise_bufg_ignore1();
++    packer.pack_iob_registers();
+     packer.pack_iologic();
+     packer.pack_idelayctrl();
+     packer.pack_cfg();
+@@ -1567,6 +1669,7 @@ void XilinxImpl::pack()
+     packer.pack_dsps();
+     packer.pack_ffs();
+     packer.finalise_muxfs();
++    packer.pack_async_reg_chains();
+     packer.pack_lutffs();
+     // The XDC put the netlist's cells in their pblocks; the clusters and the
+     // cells packing made follow them here, before the regional-clock pass
+@@ -1586,5 +1689,6 @@ void XilinxImpl::pack()
+         if (is_regional_buffer && buffer_is_placed)
+             packer.constrain_regional_clock_sinks(ci);
+     }
++    apply_xdc_path_exceptions();
+ }
+ NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/pack.h b/himbaechel/uarch/xilinx/pack.h
+index 12369384..5a60f489 100644
+--- a/himbaechel/uarch/xilinx/pack.h
++++ b/himbaechel/uarch/xilinx/pack.h
+@@ -124,6 +124,8 @@ struct XilinxPacker
+     void pack_ffs();
+     bool can_add_ff_to_cluster(const CellInfo *lut, const CellInfo *ff);
+     void pack_lutffs();
++
++    void pack_async_reg_chains();
+ 
+     bool is_constrained(const CellInfo *cell);
+     void pack_muxfs();
+@@ -206,6 +208,8 @@ struct XC7Packer : public XilinxPacker
+     void prepare_iologic();
+ 
+     void pack_iologic();
++
++    void pack_iob_registers();
+     void pack_idelayctrl();
+     void pack_cfg();
+     // JTAG chain number -> the BSCAN bel of the site that serves it.  USER<n>
+diff --git a/himbaechel/uarch/xilinx/pack_io.cc b/himbaechel/uarch/xilinx/pack_io.cc
+index 4e2fdc01..8963eb91 100644
+--- a/himbaechel/uarch/xilinx/pack_io.cc
++++ b/himbaechel/uarch/xilinx/pack_io.cc
+@@ -1843,4 +1843,124 @@ void XC7Packer::pack_gt()
+     }
+ }
+ 
++
++
++
++
++
++
++void XC7Packer::pack_iob_registers()
++{
++    auto is_true = [](const CellInfo *ci, IdString key) {
++        auto found = ci->attrs.find(key);
++        if (found == ci->attrs.end())
++            return false;
++        if (!found->second.is_string)
++            return found->second.as_bool();
++        std::string v = found->second.as_string();
++        std::transform(v.begin(), v.end(), v.begin(), ::toupper);
++        return v == "TRUE" || v == "1";
++    };
++    const pool<IdString> registers = {id_FDRE, id_FDSE, id_FDCE, id_FDPE};
++    auto is_inbuf = [&](const CellInfo *ci) {
++        return ci != nullptr &&
++               (boost::contains(ci->type.str(ctx), "INBUF_EN") || boost::contains(ci->type.str(ctx), "INBUF_DCIEN"));
++    };
++    auto is_outbuf = [&](const CellInfo *ci) {
++        return ci != nullptr &&
++               ci->type.in(id_IOB33_OUTBUF, id_IOB33M_OUTBUF, id_IOB18_OUTBUF_DCIEN, id_IOB18M_OUTBUF_DCIEN);
++    };
++
++    auto pad_of = [&](const CellInfo *buf) -> CellInfo * {
++        for (auto &port : buf->ports) {
++            const NetInfo *ni = port.second.net;
++            if (ni == nullptr)
++                continue;
++            for (auto &usr : ni->users)
++                if (usr.cell->type == id_PAD)
++                    return usr.cell;
++            if (ni->driver.cell != nullptr && ni->driver.cell->type == id_PAD)
++                return ni->driver.cell;
++        }
++        return nullptr;
++    };
++    pool<IdString> packed_pads;
++    int inputs = 0, outputs = 0;
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        if (!registers.count(ci->type))
++            continue;
++        NetInfo *d = ci->getPort(id_D), *q = ci->getPort(id_Q);
++        CellInfo *inbuf = (d != nullptr && d->users.entries() == 1 && is_inbuf(d->driver.cell)) ? d->driver.cell
++                                                                                                 : nullptr;
++        CellInfo *outbuf = nullptr;
++        if (q != nullptr && q->users.entries() == 1) {
++            const PortRef &usr = *q->users.begin();
++            if (is_outbuf(usr.cell) && usr.port == id_IN)
++                outbuf = usr.cell;
++        }
++        CellInfo *in_pad = inbuf != nullptr ? pad_of(inbuf) : nullptr;
++        CellInfo *out_pad = outbuf != nullptr ? pad_of(outbuf) : nullptr;
++        const bool asked = is_true(ci, id_IOB) || (in_pad != nullptr && is_true(in_pad, id_IOB)) ||
++                           (out_pad != nullptr && is_true(out_pad, id_IOB));
++        if (!asked)
++            continue;
++        const bool has_inverted_reset = bool_or_default(ci->params, id_IS_R_INVERTED, false) ||
++                                        bool_or_default(ci->params, id_IS_S_INVERTED, false) ||
++                                        bool_or_default(ci->params, id_IS_CLR_INVERTED, false) ||
++                                        bool_or_default(ci->params, id_IS_PRE_INVERTED, false);
++        if (has_inverted_reset || (in_pad == nullptr && out_pad == nullptr)) {
++            log_warning("IOB TRUE: register '%s' stays in a slice: %s\n", ctx->nameOf(ci),
++                        has_inverted_reset ? "its set/reset is inverted"
++                                           : "its D does not come from an input buffer alone and its Q does not "
++                                             "drive an output buffer alone");
++            continue;
++        }
++        const bool is_sync = ci->type.in(id_FDRE, id_FDSE);
++        const bool is_set = ci->type.in(id_FDSE, id_FDPE);
++        IdString sr_port = ci->type == id_FDRE   ? id_R
++                           : ci->type == id_FDSE ? id_S
++                           : ci->type == id_FDCE ? id_CLR
++                                                 : id_PRE;
++        int init = int_or_default(ci->params, id_INIT, 0);
++        ci->params.erase(id_INIT);
++        if (ci->ports.count(sr_port))
++            ci->renamePort(sr_port, is_set ? id_S : id_R);
++        ci->params[id_SRTYPE] = std::string(is_sync ? "SYNC" : "ASYNC");
++        ci->attrs[ctx->id("X_IOB_SDR")] = std::string("1");
++        if (in_pad != nullptr) {
++            ci->type = id_IDDR;
++            ci->renamePort(id_Q, id_Q1);
++            ci->params[id_INIT_Q1] = Property(init, 1);
++            ci->params[id_INIT_Q2] = Property(1, 1);
++            ci->params[id_DDR_CLK_EDGE] = std::string("OPPOSITE_EDGE");
++            packed_pads.insert(in_pad->name);
++            if (out_pad != nullptr)
++                packed_pads.insert(out_pad->name);
++            log_info("    IOB TRUE: register '%s' in the input logic of port '%s'\n", ctx->nameOf(ci),
++                     ctx->nameOf(in_pad));
++            inputs++;
++        } else {
++            ci->type = id_ODDR;
++            ci->renamePort(id_D, id_D1);
++            ci->addInput(id_D2);
++            ci->connectPort(id_D2, ci->getPort(id_D1));
++            ci->params[id_INIT] = Property(init, 1);
++            ci->params[id_DDR_CLK_EDGE] = std::string("SAME_EDGE");
++            packed_pads.insert(out_pad->name);
++            log_info("    IOB TRUE: register '%s' in the output logic of port '%s'\n", ctx->nameOf(ci),
++                     ctx->nameOf(out_pad));
++            outputs++;
++        }
++    }
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        if (ci->type == id_PAD && is_true(ci, id_IOB) && !packed_pads.count(ci->name))
++            log_warning("IOB TRUE on port '%s': no register next to it to move into the I/O logic\n",
++                        ctx->nameOf(ci));
++    }
++    if (inputs + outputs > 0)
++        log_info("IOB TRUE: %d input and %d output register(s) in the I/O logic\n", inputs, outputs);
++}
++
+ NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/xdc.cc b/himbaechel/uarch/xilinx/xdc.cc
+index 759a8e6f..ed120d1e 100644
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -573,6 +573,66 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 cells.push_back(pin.first);
+         return cells;
+     };
++
++
++
++    auto add_path_exception = [&](XdcPathException &pe, const std::string &from,
++                                  const std::vector<std::string> &through, const std::string &to) {
++        const char *what = pe.ex.name.c_str();
++        auto side = [&](const std::string &sel, std::vector<XdcClockPattern> &clocks, std::vector<IdString> &cells,
++                        const char *which) {
++            if (sel.empty())
++                return true;
++            XdcQuery q = parse_query(sel, what);
++            if (!q.supported)
++                return false;
++            if (q.kind == "get_clocks") {
++                for (auto &p : query_clocks(q))
++                    clocks.push_back(p);
++                return true;
++            }
++            if (q.kind == "get_cells" || q.kind == "get_pins") {
++                std::vector<CellInfo *> found = query_endpoint_cells(q);
++                for (CellInfo *ci : found)
++                    cells.push_back(ci->name);
++                if (found.empty())
++                    log_warning("%s: %s %s matches no cell, so it is NOT applied\n", what, which, sel.c_str());
++                return !found.empty();
++            }
++            log_warning("%s: %s %s is NOT applied: only clocks, cells and pins are taken\n", what, which,
++                        sel.c_str());
++            return false;
++        };
++        if (!side(from, pe.from_clocks, pe.from_cells, "-from") || !side(to, pe.to_clocks, pe.to_cells, "-to"))
++            return false;
++        if (through.size() > 1)
++            log_warning("%s: %d -through lists are taken as one (a path through any of their pins)\n", what,
++                        int(through.size()));
++        for (const std::string &sel : through) {
++            XdcQuery q = parse_query(sel, what);
++            if (!q.supported)
++                return false;
++            const size_t before = pe.through.size();
++            if (q.kind == "get_pins") {
++                for (auto &pin : query_pins(q))
++                    pe.through.emplace_back(pin.first->name, pin.second);
++            } else if (q.kind == "get_nets") {
++                for (NetInfo *ni : query_nets(q))
++                    for (auto &usr : ni->users)
++                        pe.through.emplace_back(usr.cell->name, usr.port);
++            } else {
++                log_warning("%s: -through %s is NOT applied: only pins and nets are taken\n", what, sel.c_str());
++                return false;
++            }
++            if (pe.through.size() == before) {
++                log_warning("%s: -through %s matches no pin, so it is NOT applied\n", what, sel.c_str());
++                return false;
++            }
++        }
++        log_info("%s: %d -from cell(s), %d -through pin(s), %d -to cell(s)\n", what, int(pe.from_cells.size()),
++                 int(pe.through.size()), int(pe.to_cells.size()));
++        return true;
++    };
+ 
+     while (std::getline(in, line)) {
+         ++lineno;
+@@ -667,6 +727,7 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             // All remaining arguments are supposed to designate ports or cells.  Ports and cells
+             // carry the property; nets and pins have none that place and route reads.
+             std::vector<CellInfo *> dest;
++            std::vector<NetInfo *> dest_nets;
+             int unapplied_targets = 0;
+             for (int cursor = 3; cursor < int(arguments.size()); cursor++) {
+                 const std::string &target = arguments.at(cursor);
+@@ -699,7 +760,9 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                                     target.c_str(), lineno);
+                     dest.insert(dest.end(), cells.begin(), cells.end());
+                 } else if (q.kind == "get_nets") {
+-                    unapplied_targets += int(query_nets(q).size());
++                    std::vector<NetInfo *> nets = query_nets(q);
++                    dest_nets.insert(dest_nets.end(), nets.begin(), nets.end());
++                    unapplied_targets += int(nets.size());
+                 } else if (q.kind == "get_pins") {
+                     unapplied_targets += int(query_pins(q).size());
+                 } else {
+@@ -710,17 +773,15 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             // The properties place and route reads: the pad's site, standard, drive,
+             // slew, pull and termination, and the site or bel of a cell
+             const pool<std::string> applied = {"PACKAGE_PIN", "LOC", "BEL", "IOSTANDARD", "DRIVE",
+-                                               "SLEW", "PULLTYPE", "IN_TERM"};
++                                               "SLEW", "PULLTYPE", "IN_TERM", "IOB", "ASYNC_REG"};
++
++            const pool<std::string> net_applied = {"CLOCK_DEDICATED_ROUTE"};
+             const dict<std::string, std::string> why_not_applied = {
+                     {"DIFF_TERM", "nothing writes the differential termination, so the input is left unterminated"},
+-                    {"IOB", "registers are not moved into the I/O logic; the flip-flop stays in a slice"},
+-                    {"ASYNC_REG", "synchronizer flip-flops are not kept together, and yosys may already have "
+-                                  "made a shift register (SRL) of the chain; (* keep *) on the registers stops that"},
+                     {"KEEP", "synthesis is over when the XDC is read; put it in the RTL for yosys"},
+                     {"DONT_TOUCH", "synthesis is over when the XDC is read; put it in the RTL for yosys"},
+                     {"KEEP_HIERARCHY", "the netlist is already flat when the XDC is read"},
+                     {"MARK_DEBUG", "no debug core is inserted"},
+-                    {"CLOCK_DEDICATED_ROUTE", "the router finds a clock route without checking for a dedicated one"},
+                     {"IODELAY_GROUP", "IDELAYCTRL instances are not grouped by it"},
+                     {"OFFCHIP_TERM", "only Vivado's I/O reports use it"},
+             };
+@@ -742,17 +803,22 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                     prop = "NEXTPNR_SITE_BEL";
+                     value = value.substr(value.rfind('.') == std::string::npos ? 0 : value.rfind('.') + 1);
+                 }
+-                const bool is_applied = applied.count(prop) || prop.compare(0, 8, "NEXTPNR_") == 0;
+-                const int targets = int(dest.size()) + unapplied_targets;
+-                if ((!is_applied || unapplied_targets > 0) && targets > 0) {
++                const bool is_net_property = net_applied.count(prop) > 0;
++                const bool is_applied = applied.count(prop) || is_net_property || prop.compare(0, 8, "NEXTPNR_") == 0;
++                const int unapplied_here = unapplied_targets - (is_net_property ? int(dest_nets.size()) : 0);
++                const int targets = int(dest.size()) + unapplied_here;
++                if ((!is_applied || unapplied_here > 0) && targets > 0) {
+                     auto reason = why_not_applied.find(prop);
+                     log_warning("set_property %s on %d object(s) is NOT applied: %s (on line %d)\n", prop.c_str(),
+-                                is_applied ? unapplied_targets : targets,
++                                is_applied ? unapplied_here : targets,
+                                 reason != why_not_applied.end() ? reason->second.c_str()
+                                 : is_applied ? "a net or pin does not carry it"
+                                              : "nothing in place and route reads it",
+                                 lineno);
+                 }
++                if (is_net_property)
++                    for (NetInfo *ni : dest_nets)
++                        ni->attrs[ctx->id(prop)] = value;
+                 for (auto c : dest) {
+                     IdString id_prop = ctx->id(prop);
+                     if (ctx->debug)
+@@ -1006,12 +1072,15 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             // set_false_path [-setup] [-from <clocks|cells|pins|ports>] [-to <...>]: between clocks it is a
+             // clock exception (resolved after packing); to or from cells, those cells' paths are not timed.
+             std::string from, to;
++            std::vector<std::string> through;
+             bool hold_only = false, setup_only = false;
+             for (int c = 1; c < int(arguments.size()); c++) {
+                 const std::string &a = arguments.at(c);
+                 const bool has_value = c + 1 < int(arguments.size());
+                 if (a == "-from" && has_value)
+                     from = arguments.at(++c);
++                else if (a == "-through" && has_value)
++                    through.push_back(arguments.at(++c));
+                 else if (a == "-to" && has_value)
+                     to = arguments.at(++c);
+                 else if (a == "-setup")
+@@ -1032,8 +1101,8 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                             lineno);
+                 goto nextline;
+             }
+-            if (from.empty() && to.empty()) {
+-                log_warning("set_false_path without -from or -to is NOT applied (on line %d)\n", lineno);
++            if (from.empty() && to.empty() && through.empty()) {
++                log_warning("set_false_path without -from, -through or -to is NOT applied (on line %d)\n", lineno);
+                 goto nextline;
+             }
+             XdcQuery fq, tq;
+@@ -1046,6 +1115,17 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 goto nextline;
+             auto is_clocks = [](const XdcQuery &q) { return q.kind.empty() || q.kind == "get_clocks"; };
+             auto is_cells = [](const XdcQuery &q) { return q.kind == "get_cells" || q.kind == "get_pins"; };
++            const bool is_a_path_exception =
++                    !through.empty() || (!fq.kind.empty() && !tq.kind.empty() && (is_cells(fq) || is_cells(tq)));
++            if (is_a_path_exception) {
++                XdcPathException pe;
++                pe.ex.kind = TimingException::FALSE_PATH;
++                pe.ex.name = stringf("set_false_path (line %d)", lineno);
++                pe.lineno = lineno;
++                if (add_path_exception(pe, from, through, to))
++                    xdc_path_exceptions.push_back(pe);
++                goto nextline;
++            }
+             if (is_clocks(fq) && is_clocks(tq)) {
+                 XdcClockException ex;
+                 ex.lineno = lineno;
+@@ -1081,14 +1161,182 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 log_info("set_false_path: no path %s %d cell(s) is timed (on line %d)\n", is_to ? "to" : "from",
+                          int(cells.size()), lineno);
+         } else if (cmd == "set_max_delay" || cmd == "set_min_delay") {
+-            log_warning("%s is NOT applied: the path is timed as if it were not there (against the clock "
+-                        "relationship, or not at all between unrelated clocks) (on line %d)\n",
+-                        cmd.c_str(), lineno);
++
++            XdcPathException pe;
++            pe.ex.kind = cmd == "set_max_delay" ? TimingException::MAX_DELAY : TimingException::MIN_DELAY;
++            pe.lineno = lineno;
++            bool got_value = false;
++            std::string from, to;
++            std::vector<std::string> through;
++            for (int c = 1; c < int(arguments.size()); c++) {
++                const std::string &a = arguments.at(c);
++                const bool has_value = c + 1 < int(arguments.size());
++                char *end = nullptr;
++                double v = std::strtod(a.c_str(), &end);
++                const bool is_number = !a.empty() && end != nullptr && *end == '\0';
++                if (a == "-datapath_only" && pe.ex.kind == TimingException::MAX_DELAY)
++                    pe.ex.datapath_only = true;
++                else if (a == "-from" && has_value)
++                    from = arguments.at(++c);
++                else if (a == "-to" && has_value)
++                    to = arguments.at(++c);
++                else if (a == "-through" && has_value)
++                    through.push_back(arguments.at(++c));
++                else if (a == "-reset_path")
++                    continue;
++                else if (is_number && !got_value) {
++                    pe.ex.value = ctx->getDelayFromNS(v);
++                    got_value = true;
++                } else {
++                    log_warning("%s: unsupported argument '%s', NOT applied (on line %d)\n", cmd.c_str(), a.c_str(),
++                                lineno);
++                    goto nextline;
++                }
++            }
++            if (!got_value || (from.empty() && to.empty() && through.empty())) {
++                log_warning("%s without a delay, or without -from, -through or -to, is NOT applied (on line %d)\n",
++                            cmd.c_str(), lineno);
++                goto nextline;
++            }
++            pe.ex.name = stringf("%s%s (line %d)", cmd.c_str(), pe.ex.datapath_only ? " -datapath_only" : "", lineno);
++            if (add_path_exception(pe, from, through, to))
++                xdc_path_exceptions.push_back(pe);
+         } else if (cmd == "set_input_delay" || cmd == "set_output_delay") {
+-            log_warning("%s is NOT applied: paths to and from ports are not timed (on line %d)\n", cmd.c_str(),
+-                        lineno);
+-        } else if (cmd == "set_clock_uncertainty" || cmd == "set_clock_latency" || cmd == "set_input_jitter" ||
+-                   cmd == "set_system_jitter") {
++
++
++
++            const bool is_input = cmd == "set_input_delay";
++            std::string clock;
++            bool fall = false, only_max = false, only_min = false, got_value = false;
++            double value = 0;
++            std::vector<std::string> targets;
++            for (int c = 1; c < int(arguments.size()); c++) {
++                const std::string &a = arguments.at(c);
++                const bool has_value = c + 1 < int(arguments.size());
++                char *end = nullptr;
++                double v = std::strtod(a.c_str(), &end);
++                const bool is_number = !a.empty() && end != nullptr && *end == '\0';
++                if (a == "-clock" && has_value) {
++                    XdcQuery q = parse_query(arguments.at(++c), cmd.c_str());
++                    if (!q.supported)
++                        goto nextline;
++                    const bool one_clock = (q.kind == "get_clocks" || q.kind == "get_cells") && q.names.size() == 1;
++                    if (!one_clock) {
++                        log_warning("%s: -clock takes one clock, NOT applied (on line %d)\n", cmd.c_str(), lineno);
++                        goto nextline;
++                    }
++                    clock = q.names.front();
++                } else if (a == "-clock_fall")
++                    fall = true;
++                else if (a == "-max")
++                    only_max = true;
++                else if (a == "-min")
++                    only_min = true;
++                else if (a == "-add_delay")
++                    continue;
++                else if (is_number && !got_value) {
++                    value = v;
++                    got_value = true;
++                } else if (!a.empty() && a.front() == '[')
++                    targets.push_back(a);
++                else {
++                    log_warning("%s: unsupported argument '%s', NOT applied (on line %d)\n", cmd.c_str(), a.c_str(),
++                                lineno);
++                    goto nextline;
++                }
++            }
++            if (clock.empty() || !got_value || targets.empty()) {
++                log_warning("%s without -clock, a delay or ports is NOT applied (a virtual clock is not supported) "
++                            "(on line %d)\n",
++                            cmd.c_str(), lineno);
++                goto nextline;
++            }
++            const IdString id_delay = ctx->id(is_input ? "NEXTPNR_INPUT_DELAY" : "NEXTPNR_OUTPUT_DELAY");
++            int applied_ports = 0;
++            for (const std::string &target : targets) {
++                XdcQuery q = parse_query(target, cmd.c_str());
++                if (!q.supported)
++                    continue;
++                if (q.kind != "get_ports") {
++                    log_warning("%s: %s is not a port, NOT applied (on line %d)\n", cmd.c_str(), target.c_str(),
++                                lineno);
++                    continue;
++                }
++                for (IdString port : query_ports(q)) {
++                    if (!ctx->cells.count(port))
++                        continue;
++                    CellInfo *ci = ctx->cells.at(port).get();
++                    double min_ns = value, max_ns = value;
++                    auto found = ci->attrs.find(id_delay);
++                    if (found != ci->attrs.end() && (only_max || only_min)) {
++                        std::istringstream old(found->second.as_string());
++                        std::string old_clock;
++                        int old_fall = 0;
++                        double old_min = 0, old_max = 0;
++                        const bool same_reference = (old >> old_clock >> old_fall >> old_min >> old_max) &&
++                                                    old_clock == clock && bool(old_fall) == fall;
++                        if (same_reference) {
++                            min_ns = only_max ? old_min : value;
++                            max_ns = only_min ? old_max : value;
++                        }
++                    }
++                    if (found != ci->attrs.end() && !only_max && !only_min)
++                        log_warning("%s: '%s' replaces the earlier delay of port '%s' (on line %d)\n", cmd.c_str(),
++                                    target.c_str(), port.c_str(ctx), lineno);
++                    ci->attrs[id_delay] = stringf("%s %d %.6f %.6f", clock.c_str(), fall ? 1 : 0, min_ns, max_ns);
++                    applied_ports++;
++                }
++            }
++            if (applied_ports == 0)
++                log_warning("%s: the ports match no port, so it is NOT applied (on line %d)\n", cmd.c_str(), lineno);
++            else
++                log_info("%s: %d port(s) timed against clock '%s'%s (on line %d)\n", cmd.c_str(), applied_ports,
++                         clock.c_str(), fall ? " (falling edge)" : "", lineno);
++        } else if (cmd == "set_clock_uncertainty" || cmd == "set_input_jitter" || cmd == "set_system_jitter") {
++
++
++            XdcClockSetting cs;
++            cs.lineno = lineno;
++            cs.is_jitter = cmd == "set_input_jitter";
++            bool got_value = false;
++            for (int c = 1; c < int(arguments.size()); c++) {
++                const std::string &a = arguments.at(c);
++                char *end = nullptr;
++                double v = std::strtod(a.c_str(), &end);
++                const bool is_number = !a.empty() && end != nullptr && *end == '\0';
++                if (a == "-setup" && cmd == "set_clock_uncertainty")
++                    cs.hold = false;
++                else if (a == "-hold" && cmd == "set_clock_uncertainty")
++                    cs.setup = false;
++                else if (is_number && !got_value) {
++                    cs.value_ns = v;
++                    got_value = true;
++                } else if (cmd != "set_system_jitter" && (a.front() == '[' || a.front() != '-')) {
++                    XdcQuery q = parse_query(a.front() == '[' ? a : "[get_clocks " + a + "]", cmd.c_str());
++                    if (!q.supported)
++                        goto nextline;
++                    for (auto &p : query_clocks(q))
++                        cs.clocks.push_back(p);
++                } else {
++                    log_warning("%s: unsupported argument '%s' (-from/-to clocks are not taken), NOT applied (on "
++                                "line %d)\n",
++                                cmd.c_str(), a.c_str(), lineno);
++                    goto nextline;
++                }
++            }
++            if (!got_value || (cmd != "set_system_jitter" && cs.clocks.empty())) {
++                log_warning("%s without a value or a clock is NOT applied (on line %d)\n", cmd.c_str(), lineno);
++                goto nextline;
++            }
++            if (cmd == "set_system_jitter") {
++                ctx->settings[ctx->id("timing/systemJitter")] = stringf("%.6f", cs.value_ns);
++                log_info("set_system_jitter: %.3f ns (on line %d)\n", cs.value_ns, lineno);
++            } else {
++                if (cs.is_jitter && !ctx->settings.count(ctx->id("timing/systemJitter")))
++                    ctx->settings[ctx->id("timing/systemJitter")] = std::string("0.050000");
++                xdc_clock_settings.push_back(cs);
++            }
++        } else if (cmd == "set_clock_latency") {
+             log_warning("%s is NOT applied: the timing analysis does not model it, so slack is reported without it "
+                         "(on line %d)\n",
+                         cmd.c_str(), lineno);
+@@ -1115,7 +1363,8 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             };
+             int cycles = 0;
+             bool is_hold = false;
+-            std::string to_sel;
++            std::string to_sel, from_sel;
++            std::vector<std::string> through_sel;
+             for (int c = 1; c < int(arguments.size()); c++) {
+                 const std::string &a = arguments.at(c);
+                 const bool has_value = c + 1 < int(arguments.size());
+@@ -1130,10 +1379,11 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                     continue;
+                 if (a == "-hold")
+                     is_hold = true;
+-                else if (a == "-from") {
+-                    log_warning("ignoring unsupported XDC option '-from' in set_multicycle_path (on line %d)\n", lineno);
+-                    goto nextline;
+-                } else if (a == "-to" && has_value)
++                else if (a == "-from" && has_value)
++                    from_sel = arguments.at(++c);
++                else if (a == "-through" && has_value)
++                    through_sel.push_back(arguments.at(++c));
++                else if (a == "-to" && has_value)
+                     to_sel = arguments.at(++c);
+                 else if (is_cycle_count)
+                     cycles = std::stoi(a);
+@@ -1147,6 +1397,20 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 log_info("set_multicycle_path -hold: hold stays checked on the launch edge (on line %d)\n", lineno);
+                 goto nextline;
+             }
++            if (!from_sel.empty() || !through_sel.empty()) {
++                if (cycles < 1) {
++                    log_warning("ignoring set_multicycle_path without N of 1 or more (on line %d)\n", lineno);
++                    goto nextline;
++                }
++                XdcPathException pe;
++                pe.ex.kind = TimingException::MULTICYCLE;
++                pe.ex.setup_cycles = cycles;
++                pe.ex.name = stringf("set_multicycle_path %d (line %d)", cycles, lineno);
++                pe.lineno = lineno;
++                if (add_path_exception(pe, from_sel, through_sel, to_sel))
++                    xdc_path_exceptions.push_back(pe);
++                goto nextline;
++            }
+             const bool is_incomplete = cycles < 1 || to_sel.empty();
+             if (is_incomplete) {
+                 log_warning("ignoring set_multicycle_path without N of 1 or more, or without -to (on line %d)\n",
+@@ -1593,7 +1857,7 @@ void XilinxImpl::add_pblock_routing_tiles(Region *pb_region)
+ // path from it is timed to.
+ void XilinxImpl::apply_xdc_clock_exceptions()
+ {
+-    if (xdc_clock_exceptions.empty())
++    if (xdc_clock_exceptions.empty() && xdc_clock_settings.empty() && xdc_path_exceptions.empty())
+         return;
+     dict<IdString, IdString> clock_primary;
+     for (auto &net : ctx->nets) {
+@@ -1666,6 +1930,76 @@ void XilinxImpl::apply_xdc_clock_exceptions()
+         for (IdString capture : entry.second)
+             log_info("    no path from clock '%s' to clock '%s' is timed (set_false_path or set_clock_groups)\n",
+                      entry.first.c_str(ctx), capture.c_str(ctx));
++    for (const auto &cs : xdc_clock_settings) {
++        pool<IdString> clocks = resolve(cs.clocks, cs.lineno);
++        delay_t value = ctx->getDelayFromNS(cs.value_ns);
++        for (auto &net : ctx->nets) {
++            ClockConstraint *cc = net.second->clkconstr.get();
++            if (cc == nullptr || !clocks.count(cc->name))
++                continue;
++            if (cs.is_jitter)
++                cc->input_jitter = value;
++            if (!cs.is_jitter && cs.setup)
++                cc->setup_uncertainty = value;
++            if (!cs.is_jitter && cs.hold)
++                cc->hold_uncertainty = value;
++        }
++        for (IdString clk : clocks)
++            log_info("    clock '%s': %s %.3f ns (on line %d)\n", clk.c_str(ctx),
++                     cs.is_jitter ? "input jitter" : "uncertainty", cs.value_ns, cs.lineno);
++    }
++    for (auto &pe : xdc_path_exceptions) {
++        for (IdString clk : resolve(pe.from_clocks, pe.lineno))
++            pe.ex.from_clocks.insert(clk);
++        for (IdString clk : resolve(pe.to_clocks, pe.lineno))
++            pe.ex.to_clocks.insert(clk);
++    }
++}
++
++
++
++void XilinxImpl::apply_xdc_path_exceptions()
++{
++    auto packed_pin = [&](CellInfo *ci, IdString pin) {
++        if (ci->ports.count(pin))
++            return pin;
++        const std::string &p = pin.str(ctx);
++        if (p == "C" && ci->ports.count(id_CK))
++            return id_CK;
++        const bool is_set_reset = p == "R" || p == "S" || p == "CLR" || p == "PRE";
++        if (is_set_reset && ci->ports.count(id_SR))
++            return id_SR;
++        const bool is_lut_input = p.size() == 2 && p[0] == 'I' && p[1] >= '0' && p[1] <= '5';
++        if (is_lut_input && ci->ports.count(ctx->idf("A%d", p[1] - '0' + 1)))
++            return ctx->idf("A%d", p[1] - '0' + 1);
++        return IdString();
++    };
++    for (auto &pe : xdc_path_exceptions) {
++        TimingException ex = pe.ex;
++        auto take_cells = [&](const std::vector<IdString> &names, pool<IdString> &cells) {
++            for (IdString name : names)
++                if (ctx->cells.count(name))
++                    cells.insert(name);
++        };
++        take_cells(pe.from_cells, ex.from_cells);
++        take_cells(pe.to_cells, ex.to_cells);
++        for (auto &pin : pe.through) {
++            if (!ctx->cells.count(pin.first))
++                continue;
++            IdString packed = packed_pin(ctx->cells.at(pin.first).get(), pin.second);
++            if (packed != IdString())
++                ex.through.insert(std::make_pair(pin.first, packed));
++        }
++        const pool<IdString> named_from(pe.from_cells.begin(), pe.from_cells.end());
++        const pool<IdString> named_to(pe.to_cells.begin(), pe.to_cells.end());
++        const pool<std::pair<IdString, IdString>> named_through(pe.through.begin(), pe.through.end());
++        const bool lost_some = ex.from_cells.size() < named_from.size() || ex.to_cells.size() < named_to.size() ||
++                               ex.through.size() < named_through.size();
++        if (lost_some)
++            log_warning("%s: some of its cells or pins are gone after packing; the rest is applied\n",
++                        ex.name.c_str());
++        ctx->timing_exceptions.push_back(ex);
++    }
+ }
+ 
+ NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index b61180ef..5dd17330 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -929,8 +929,168 @@ void XilinxImpl::prePlace()
+     }
+ }
+ 
++
++
++
++
++
++
++
++void XilinxImpl::check_clock_placement()
++{
++    auto reaches_ccio = [&](BelId inbuf) {
++        WireId start = ctx->getBelPinWire(inbuf, id_OUT);
++        if (start == WireId())
++            return false;
++        std::vector<WireId> frontier = {start};
++        pool<WireId> seen = {start};
++        for (int depth = 0; depth < 12 && !frontier.empty() && seen.size() < 4096; depth++) {
++            std::vector<WireId> next;
++            for (WireId w : frontier)
++                for (PipId pip : ctx->getPipsDownhill(w)) {
++                    WireId dst = ctx->getPipDstWire(pip);
++                    if (!seen.insert(dst).second)
++                        continue;
++                    const std::string name = ctx->getWireName(dst)[1].str(ctx);
++                    const bool is_clock_entry = boost::contains(name, "CCIO") || boost::contains(name, "I2GCLK") ||
++                                                boost::contains(name, "I2IOCLK");
++                    auto onward = ctx->getPipsDownhill(dst);
++                    if (is_clock_entry && onward.begin() != onward.end())
++                        return true;
++                    next.push_back(dst);
++                }
++            frontier.swap(next);
++        }
++        return false;
++    };
++    int y_bottom = -1, y_top = -1;
++    for (BelId bel : ctx->getBels()) {
++        if (ctx->getBelType(bel) != id_BUFGCTRL)
++            continue;
++        SiteIndex si = get_bel_site(bel);
++        const auto &sites = tile_extra_data(si.tile)->sites;
++        if (si.site < 0 || si.site >= int32_t(sites.ssize()))
++            continue;
++        const std::string site = get_site_name(si).str(ctx);
++        if (site == "BUFGCTRL_X0Y15")
++            y_bottom = ctx->getBelLocation(bel).y;
++        else if (site == "BUFGCTRL_X0Y16")
++            y_top = ctx->getBelLocation(bel).y;
++    }
++    if (y_bottom < 0 || y_top < 0)
++        return;
++    const double middle = (y_bottom + y_top) / 2.0;
++    const bool top_is_below = y_top > y_bottom;
++    auto is_top = [&](int y) { return top_is_below ? y > middle : y < middle; };
++    int failures = 0;
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        if (ci->type != id_BUFGCTRL || ci->bel == BelId())
++            continue;
++        for (IdString pin : {id_I0, id_I1}) {
++            NetInfo *in = ci->getPort(pin);
++            if (in == nullptr || in->driver.cell == nullptr)
++                continue;
++            CellInfo *buf = in->driver.cell;
++            const bool is_input_buffer = boost::contains(buf->type.str(ctx), "INBUF");
++            if (!is_input_buffer || buf->bel == BelId())
++                continue;
++            CellInfo *pad = nullptr;
++            for (auto &port : buf->ports)
++                if (port.second.net != nullptr)
++                    for (auto &usr : port.second.net->users)
++                        if (usr.cell->type == id_PAD)
++                            pad = usr.cell;
++            if (pad == nullptr || pad->bel == BelId())
++                continue;
++            const PadInfoPOD *pin_info = ctx->get_bel_package_pin(pad->bel);
++            if (pin_info == nullptr)
++                continue;
++            const std::string site_bel = ctx->getBelName(pad->bel)[1].str(ctx);
++            const bool is_clock_capable = reaches_ccio(buf->bel);
++            const bool is_n_side = boost::contains(site_bel, "33S.") || boost::contains(site_bel, "18S.");
++            const std::string function = site_bel;
++            const bool pad_top = is_top(ctx->getBelLocation(pad->bel).y);
++            const bool bufg_top = is_top(ctx->getBelLocation(ci->bel).y);
++            std::string why;
++            if (!is_clock_capable)
++                why = "the pin is not clock capable (" + function + ")";
++            else if (is_n_side)
++                why = "a single-ended clock is on the N side of its pair (" + function + ")";
++            else if (pad_top != bufg_top)
++                why = stringf("the BUFGCTRL is in the %s half of the device and the pin in the %s half",
++                              bufg_top ? "top" : "bottom", pad_top ? "top" : "bottom");
++            if (why.empty())
++                continue;
++            const bool demoted = str_or_default(in->attrs, ctx->id("CLOCK_DEDICATED_ROUTE"), "") == "FALSE";
++            std::string msg = stringf("clock placement (Vivado Place 30-574, rule_gclkio_bufg): port '%s' "
++                                      "(%s) drives BUFGCTRL '%s' at %s through '%s', and %s; the clock cannot use "
++                                      "the dedicated route.  CLOCK_DEDICATED_ROUTE FALSE on net '%s' accepts this\n",
++                                      ctx->nameOf(pad), IdString(pin_info->package_pin).c_str(ctx), ctx->nameOf(ci),
++                                      ctx->nameOfBel(ci->bel), ctx->nameOf(buf), why.c_str(), ctx->nameOf(in));
++            if (demoted)
++                log_warning("%s", msg.c_str());
++            else {
++                log_nonfatal_error("%s", msg.c_str());
++                failures++;
++            }
++        }
++    }
++    if (failures > 0 && !ctx->force)
++        log_error("%d clock placement rule violation(s); use --force to continue anyway\n", failures);
++}
++
++
++
++
++
++
++bool XilinxImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
++{
++    if (HimbaechelAPI::getCellDelay(cell, fromPort, toPort, delay))
++        return true;
++
++    const bool is_bufg_arc = cell->type == id_BUFGCTRL && fromPort.in(id_I0, id_I1) && toPort == id_O;
++    if (is_bufg_arc) {
++        delay = DelayQuad(ctx->getDelayFromNS(0.026), ctx->getDelayFromNS(0.096));
++        return true;
++    }
++    const std::string type = cell->type.str(ctx);
++    const bool is_input = boost::contains(type, "INBUF") && toPort == id_OUT;
++    const bool is_output = boost::contains(type, "OUTBUF") && fromPort == id_IN && toPort == id_OUT;
++    if (!is_input && !is_output)
++        return false;
++    const CellInfo *pad = nullptr;
++    for (auto &port : cell->ports) {
++        const NetInfo *ni = port.second.net;
++        if (ni == nullptr)
++            continue;
++        for (auto &usr : ni->users)
++            if (usr.cell->type == id_PAD)
++                pad = usr.cell;
++    }
++    if (pad == nullptr)
++        return false;
++    static const dict<std::string, double> input_ns = {{"LVCMOS33", 1.489}};
++    static const dict<std::string, double> output_ns = {{"LVCMOS33/12/SLOW", 3.569}};
++    std::string key = str_or_default(pad->attrs, id_IOSTANDARD, "");
++    if (is_output)
++        key += "/" + str_or_default(pad->attrs, id_DRIVE, "12") + "/" + str_or_default(pad->attrs, id_SLEW, "SLOW");
++    const auto &table = is_input ? input_ns : output_ns;
++    auto found = table.find(key);
++    if (found == table.end()) {
++        if (warned_pad_buffers.insert(key).second)
++            log_warning("no %s buffer delay is known for %s; port paths through it are timed without one\n",
++                        is_input ? "input" : "output", key.c_str());
++        return false;
++    }
++    delay = DelayQuad(ctx->getDelayFromNS(found->second));
++    return true;
++}
++
+ void XilinxImpl::postPlace()
+ {
++    check_clock_placement();
+     // "-o timing-opt=R[,N]": the timing-driven placement optimisation of common/place/timing_opt.cc (upstream; the iCE40 flow
+     // runs it behind --opt-timing) on the LUTs and flops of the critical paths, moving a cell up to R tiles, N rounds (default
+     // 30), with the measured delay matrix giving its estimates.  Off unless asked for, until it is measured on xc7
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index faee5cb0..93726e96 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -211,6 +211,33 @@ struct XilinxImpl : HimbaechelAPI
+     };
+     std::vector<XdcClockException> xdc_clock_exceptions;
+     void apply_xdc_clock_exceptions();
++
++
++
++    struct XdcPathException
++    {
++        TimingException ex;
++        std::vector<XdcClockPattern> from_clocks, to_clocks;
++        std::vector<IdString> from_cells, to_cells;
++        std::vector<std::pair<IdString, IdString>> through;
++        int lineno = 0;
++    };
++    std::vector<XdcPathException> xdc_path_exceptions;
++    void apply_xdc_path_exceptions();
++
++    struct XdcClockSetting
++    {
++        std::vector<XdcClockPattern> clocks;
++        bool is_jitter = false, setup = true, hold = true;
++        double value_ns = 0;
++        int lineno = 0;
++    };
++    std::vector<XdcClockSetting> xdc_clock_settings;
++
++    void check_clock_placement();
++
++    bool getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const override;
++    mutable pool<std::string> warned_pad_buffers;
+     void add_pblock_routing_tiles(Region *pb_region);
+     void pack() override;
+     void apply_loc_constraints(const pool<IdString> &only_types = {});
+diff --git a/himbaechel/uarch/xilinx/xilinx_place.cc b/himbaechel/uarch/xilinx/xilinx_place.cc
+index d90a22e1..4026350a 100644
+--- a/himbaechel/uarch/xilinx/xilinx_place.cc
++++ b/himbaechel/uarch/xilinx/xilinx_place.cc
+@@ -770,6 +770,19 @@ bool XilinxImpl::getClusterPlacement(ClusterId cluster, BelId root_bel,
+ {
+     CellInfo *root = getClusterRootCell(cluster);
+     const bool is_a_bram_cascade = root->type == id_RAMB36E1_RAMB36E1;
++    const bool is_a_synchronizer = root->attrs.count(ctx->id("X_ASYNC_REG_CHAIN")) > 0;
++    if (is_a_synchronizer) {
++
++        if (!HimbaechelAPI::getClusterPlacement(cluster, root_bel, placement))
++            return false;
++        const Loc root_loc = ctx->getBelLocation(root_bel);
++        for (auto &entry : placement) {
++            const Loc loc = ctx->getBelLocation(entry.second);
++            if (loc.x != root_loc.x || loc.y != root_loc.y || (loc.z >> 6) != (root_loc.z >> 6))
++                return false;
++        }
++        return true;
++    }
+     if (!is_a_bram_cascade)
+         return HimbaechelAPI::getClusterPlacement(cluster, root_bel, placement);
+     const bool root_bel_fits = ctx->isValidBelForCellType(root->type, root_bel);

@@ -1,0 +1,27 @@
+[board]
+name = "Digilent Basys 3"
+part = "xc7a35tcpg236-1"
+openfpgaloader_board = "basys3"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Basys-3-Master.xdc ('for the Basys3 rev B board', github.com/Digilent/digilent-xdc master c8644a9f, sha256 f6f289e9...d89c, read 2026-11-06); part from Digilent vivado-boards master d8d43ed9 new/board_files/basys3/C.0/board.xml (sha256 c97c8ee8...ee7a)"
+notes = "Only led[0..3] of the 16 LEDs are in the preset (the ofx templates drive four). UART: RsRx B18 is the FPGA input, RsTx A18 the output in Digilent's file."
+
+[clock]
+port = "clk"
+pin = "W5"
+period_ns = 10.0
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "U16"
+"led[1]" = "E19"
+"led[2]" = "U19"
+"led[3]" = "V19"
+
+[uart]
+uart_txd_in = "B18"
+uart_rxd_out = "A18"
+
+[dfx]
+example_region = "SLICE_X12Y100:SLICE_X15Y149"

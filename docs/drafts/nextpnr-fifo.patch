@@ -1,0 +1,267 @@
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index b46044f3..2f60cdab 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -2509,11 +2531,123 @@ struct FasmBackend
+         }
+     }
+ 
++    bool is_fifo(const CellInfo *ci) const
++    {
++        return ci != nullptr && ci->type.in(id_FIFO18E1_FIFO18E1, id_RAMBFIFO36E1_RAMBFIFO36E1);
++    }
++
++
++
++
++
++
++    void write_fifo_half(CellInfo *ci, int half)
++    {
++        const bool is_36 = ci->type == id_RAMBFIFO36E1_RAMBFIFO36E1;
++        const int width = int_or_default(ci->params, ctx->id("DATA_WIDTH"), 4);
++        const bool output_registered = int_or_default(ci->params, ctx->id("DO_REG"), 1) == 1;
++        for (const char *value : {"INIT", "SRVAL"}) {
++            const IdString p = ctx->id(value);
++            const bool nonzero =
++                    ci->params.count(p) && ci->params.at(p).str.find(Property::S1) != std::string::npos;
++            if (nonzero)
++                log_error("%s: a FIFO with a non-zero %s is not supported\n", ctx->nameOf(ci), value);
++        }
++        write_bit("IN_USE");
++        write_bit("FIFO_MODE");
++
++
++        const bool half_is_36_wide = fifo_port_width(ci) == 36;
++        if (half_is_36_wide) {
++            for (const char *w : {"READ_WIDTH_A_18", "READ_WIDTH_B_18", "WRITE_WIDTH_A_18", "WRITE_WIDTH_B_18",
++                                  "SDP_READ_WIDTH_36", "SDP_WRITE_WIDTH_36"})
++                write_bit(w);
++        } else {
++            dict<IdString, Property> saved = ci->params;
++            ci->params[ctx->id("READ_WIDTH_A")] = Property(width);
++            ci->params[ctx->id("WRITE_WIDTH_B")] = Property(width);
++            write_bram_width(ci, "READ_WIDTH_A", is_36, half == 1);
++            write_bram_width(ci, "WRITE_WIDTH_B", is_36, half == 1);
++            ci->params = saved;
++        }
++        write_bit("DOA_REG", output_registered);
++        write_bit("DOB_REG", output_registered);
++        write_bit("WRITE_MODE_A_NO_CHANGE");
++        write_bit("WRITE_MODE_B_NO_CHANGE");
++        const bool lower_pins_only = is_36 && half == 1;
++        static const std::vector<std::pair<const char *, const char *>> inverted_pins{
++                {"RDCLK", "CLKARDCLK"}, {"WRCLK", "CLKBWRCLK"},          {"RSTREG", "RSTREGARSTREG"},
++                {"RDEN", "ENARDEN"},    {"WREN", "ENBWREN"},              {"RST", "RSTRAMARSTRAM"}};
++        for (auto &pin : inverted_pins) {
++            const bool pin_has_a_net_here = !lower_pins_only || pin.first == std::string("RDCLK") ||
++                                            pin.first == std::string("WRCLK") || pin.first == std::string("RSTREG");
++            if (!pin_has_a_net_here)
++                continue;
++            const bool inverted = bool_or_default(ci->params, ctx->idf("IS_%s_INVERTED", pin.first), false);
++            write_bit(std::string("ZINV_") + pin.second, !inverted);
++        }
++        if (output_registered)
++            write_bit("ZINV_REGCLKARDRCLK", !bool_or_default(ci->params, ctx->id("IS_RDCLK_INVERTED"), false));
++        write_vector("ZINIT_A[17:0]", std::vector<bool>(18, true));
++        write_vector("ZINIT_B[17:0]", std::vector<bool>(18, true));
++        write_vector("ZSRVAL_A[17:0]", std::vector<bool>(18, true));
++        write_vector("ZSRVAL_B[17:0]", std::vector<bool>(18, true));
++    }
++
++
++
++    int fifo_port_width(CellInfo *ci)
++    {
++        const bool is_36 = ci->type == id_RAMBFIFO36E1_RAMBFIFO36E1;
++        const int width = int_or_default(ci->params, ctx->id("DATA_WIDTH"), 4);
++        if (!is_36)
++            return width;
++        return width == 9 ? 4 : width / 2;
++    }
++
++
++
++
++
++
++
++    void write_fifo_tile(CellInfo *ci)
++    {
++        const bool is_36 = ci->type == id_RAMBFIFO36E1_RAMBFIFO36E1;
++        const bool synchronous = str_or_default(ci->params, ctx->id("EN_SYN"), "FALSE") == "TRUE";
++        const bool fwft = str_or_default(ci->params, ctx->id("FIRST_WORD_FALL_THROUGH"), "FALSE") == "TRUE";
++        write_bit("EN_SYN", synchronous);
++        write_bit("FIRST_WORD_FALL_THROUGH", fwft);
++        const int port_width = fifo_port_width(ci);
++        const bool width_measured = port_width == 4 || port_width == 9 || port_width == 18 || port_width == 36;
++        if (!width_measured)
++            log_error("%s: DATA_WIDTH %d of a %s is not supported\n", ctx->nameOf(ci),
++                      int_or_default(ci->params, ctx->id("DATA_WIDTH"), 4), is_36 ? "FIFO36E1" : "FIFO18E1");
++        write_bit("FIFO_PORT_WIDTH_" + std::to_string(port_width));
++        auto offset = [&](const char *name, int adjust) {
++            int v = int_or_default(ci->params, ctx->id(name), 0x80) + adjust;
++            std::vector<bool> stored(13);
++            for (int i = 0; i < 13; i++)
++                stored[i] = !((v >> i) & 1);
++            return stored;
++        };
++        write_vector("ZALMOST_EMPTY_OFFSET[12:0]", offset("ALMOST_EMPTY_OFFSET", fwft ? -1 : 0));
++        write_vector("ZALMOST_FULL_OFFSET[12:0]", offset("ALMOST_FULL_OFFSET", synchronous ? 0 : 1));
++        if (is_36) {
++            const int width = int_or_default(ci->params, ctx->id("DATA_WIDTH"), 4);
++            const bool odd_width = width == 1 || width == 9;
++            for (const char *w : {"READ_WIDTH_A", "READ_WIDTH_B", "WRITE_WIDTH_A", "WRITE_WIDTH_B"})
++                write_bit(std::string("RAMB36.BRAM36_") + w + "_1", odd_width);
++        }
++    }
++
+     void write_bram_half(int tile, int half, CellInfo *ci)
+     {
+         push(uarch->tile_name(tile));
+         push("RAMB18_Y" + std::to_string(half));
+-        if (ci != nullptr) {
++        if (is_fifo(ci)) {
++            write_fifo_half(ci, half);
++        } else if (ci != nullptr) {
+             bool is_36 = ci->type == id_RAMB36E1_RAMB36E1;
+             write_bit("IN_USE");
+             write_bram_width(ci, "READ_WIDTH_A", is_36, half == 1);
+@@ -2592,7 +2726,9 @@ struct FasmBackend
+             }
+             // Ported from nextpnr-xilinx f0975539. Vivado sets both offsets
+             // to all-ones on a used tile whose lower half is occupied.
+-            if (ci != nullptr) {
++            if (is_fifo(ci)) {
++                write_fifo_tile(ci);
++            } else if (ci != nullptr) {
+                 write_vector("ZALMOST_EMPTY_OFFSET[12:0]", std::vector<bool>(13, true));
+                 write_vector("ZALMOST_FULL_OFFSET[12:0]", std::vector<bool>(13, true));
+             }
+@@ -2608,11 +2744,12 @@ struct FasmBackend
+                 CellInfo *l = nullptr, *u = nullptr;
+                 const auto &bts = uarch->tile_status[tile].bts;
+                 if (bts) {
+-                    if (bts->cells[BEL_RAM36] != nullptr) {
+-                        l = bts->cells[BEL_RAM36];
+-                        u = bts->cells[BEL_RAM36];
++                    CellInfo *ram36 = bts->cells[BEL_RAM36] ? bts->cells[BEL_RAM36] : bts->cells[BEL_RAMFIFO36];
++                    if (ram36 != nullptr) {
++                        l = ram36;
++                        u = ram36;
+                     } else {
+-                        l = bts->cells[BEL_RAM18_L];
++                        l = bts->cells[BEL_RAM18_L] ? bts->cells[BEL_RAM18_L] : bts->cells[BEL_FIFO18_L];
+                         u = bts->cells[BEL_RAM18_U];
+                     }
+                 }
+diff --git a/himbaechel/uarch/xilinx/pack.cc b/himbaechel/uarch/xilinx/pack.cc
+index cdb8d2a0..cb1bc7e9 100644
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -1051,9 +1051,79 @@ static bool bram_regclkb_without_net(const Context *ctx, const CellInfo *ci)
+     return sdp_by_mode || sdp_by_width;
+ }
+ 
++
++
++
++
++
++
++
++
++void XC7Packer::pack_fifos()
++{
++    std::vector<CellInfo *> fifos;
++    for (auto &cell : ctx->cells)
++        if (cell.second->type.in(id_FIFO18E1, id_FIFO36E1))
++            fifos.push_back(cell.second.get());
++    if (fifos.empty())
++        return;
++    log_info("Packing FIFOs..\n");
++
++
++    dict<IdString, XFormRule> rules[2];
++    for (int full_width = 0; full_width < 2; full_width++) {
++        const char *lo = full_width ? "DIADI%d" : "DIBDI%d", *hi = full_width ? "DIBDI%d" : "DIADI%d";
++        const char *plo = full_width ? "DIPADIP%d" : "DIPBDIP%d", *phi = full_width ? "DIPBDIP%d" : "DIPADIP%d";
++        XFormRule &f18 = rules[full_width][id_FIFO18E1];
++        f18.new_type = id_FIFO18E1_FIFO18E1;
++        for (int i = 0; i < 32; i++)
++            f18.port_xform[ctx->idf("DI[%d]", i)] = ctx->idf(i < 16 ? lo : hi, i % 16);
++        for (int i = 0; i < 4; i++)
++            f18.port_xform[ctx->idf("DIP[%d]", i)] = ctx->idf(i < 2 ? plo : phi, i % 2);
++
++        XFormRule &f36 = rules[full_width][id_FIFO36E1];
++        f36.new_type = id_RAMBFIFO36E1_RAMBFIFO36E1;
++        for (int i = 0; i < 64; i++) {
++            f36.port_xform[ctx->idf("DI[%d]", i)] = ctx->idf(i < 32 ? lo : hi, i % 32);
++            f36.port_xform[ctx->idf("DO[%d]", i)] = ctx->idf(i < 32 ? "DOADO%d" : "DOBDO%d", i % 32);
++        }
++        for (int i = 0; i < 8; i++) {
++            f36.port_xform[ctx->idf("DIP[%d]", i)] = ctx->idf(i < 4 ? plo : phi, i % 4);
++            f36.port_xform[ctx->idf("DOP[%d]", i)] = ctx->idf(i < 4 ? "DOPADOP%d" : "DOPBDOP%d", i % 4);
++        }
++        f36.port_multixform[id_RDCLK] = {ctx->id("CLKARDCLKL"), ctx->id("CLKARDCLKU")};
++        f36.port_multixform[id_WRCLK] = {ctx->id("CLKBWRCLKL"), ctx->id("CLKBWRCLKU")};
++        f36.port_multixform[id_RSTREG] = {ctx->id("RSTREGARSTREGL"), ctx->id("RSTREGARSTREGU")};
++        f36.port_multixform[ctx->id("REGCE")] = {ctx->id("REGCEAREGCEL"), ctx->id("REGCEAREGCEU")};
++        f36.port_multixform[ctx->id("RDRCLK")] = {ctx->id("REGCLKARDRCLKL"), ctx->id("REGCLKARDRCLKU")};
++        f36.port_xform[id_RDEN] = ctx->id("ENARDENL");
++        f36.port_xform[id_WREN] = ctx->id("ENBWRENL");
++        f36.port_xform[id_RST] = ctx->id("RSTRAMARSTRAMLRST");
++    }
++
++    for (auto ci : fifos) {
++        const bool uses_ecc = str_or_default(ci->params, ctx->id("EN_ECC_READ"), "FALSE") == "TRUE" ||
++                              str_or_default(ci->params, ctx->id("EN_ECC_WRITE"), "FALSE") == "TRUE";
++        if (uses_ecc)
++            log_error("%s: FIFO36E1 with EN_ECC_READ or EN_ECC_WRITE is not supported\n", ctx->nameOf(ci));
++
++
++        NetInfo *rdclk = ci->getPort(id_RDCLK);
++        const bool output_registered = int_or_default(ci->params, ctx->id("DO_REG"), 1) == 1;
++        if (output_registered && rdclk != nullptr) {
++            ci->addInput(ctx->id("RDRCLK"));
++            ci->connectPort(ctx->id("RDRCLK"), rdclk);
++        }
++        const int width = int_or_default(ci->params, ctx->id("DATA_WIDTH"), 4);
++        const bool full_width = width == (ci->type == id_FIFO36E1 ? 72 : 36);
++        xform_cell(rules[full_width], ci);
++    }
++}
++
+ void XC7Packer::pack_bram()
+ {
+     log_info("Packing BRAM..\n");
++    pack_fifos();
+ 
+     // Rules for normal TDP BRAM
+     dict<IdString, XFormRule> bram_rules;
+diff --git a/himbaechel/uarch/xilinx/pack.h b/himbaechel/uarch/xilinx/pack.h
+index 12369384..21236693 100644
+--- a/himbaechel/uarch/xilinx/pack.h
++++ b/himbaechel/uarch/xilinx/pack.h
+@@ -237,6 +237,7 @@ struct XC7Packer : public XilinxPacker
+ 
+     // BRAM
+     void pack_bram();
++    void pack_fifos();
+     void constrain_bram_cascades();
+ 
+     // DSP
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 243a77c1..52d95669 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -355,7 +355,8 @@ void XilinxImpl::update_bram_bel(BelId bel, CellInfo *cell)
+ {
+     IdString type = ctx->getBelType(bel);
+     if (!type.in(id_RAMBFIFO18E2_RAMBFIFO18E2, id_RAMBFIFO36E2_RAMBFIFO36E2, id_RAMB18E2_RAMB18E2, id_FIFO36E2_FIFO36E2,
+-                 id_RAMBFIFO36E1_RAMBFIFO36E1, id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1))
++                 id_RAMBFIFO36E1_RAMBFIFO36E1, id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1,
++                 id_FIFO18E1_FIFO18E1))
+         return;
+     auto &tts = tile_status.at(bel.tile);
+     if (!tts.bts)

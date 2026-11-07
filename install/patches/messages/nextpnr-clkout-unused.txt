@@ -1,0 +1,5 @@
+xilinx: program unused MMCM/PLL outputs as Vivado does
+
+An unconnected CLKOUTn without a DIVIDE parameter gets HIGH_TIME[0],
+LOW_TIME[0] and NO_COUNT (FRACTIONAL_NO_COUNT on CLKOUT5/6) instead of
+nothing.

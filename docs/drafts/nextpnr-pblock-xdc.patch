@@ -1,0 +1,593 @@
+From 5a62e6e8b32382ece9c46933a42dd0d359067648 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Wed, 4 Nov 2026 23:51:21 -0500
+Subject: [PATCH] xilinx: read pblocks from the XDC
+
+create_pblock, add_cells_to_pblock and resize_pblock -add build a
+placement Region per pblock, as Vivado's XDC describes one:
+
+- add_cells_to_pblock takes the get_cells forms the parser already
+  reads; a name that is no leaf cell is taken as a hierarchical
+  instance, so [get_cells u_rm] takes every flattened cell named
+  "u_rm.*" (or "u_rm/..." in Vivado's separator), and every cell whose
+  scopename attribute (yosys flatten -scopename) lies under u_rm.
+- resize_pblock -add takes site ranges such as
+  SLICE_X12Y100:SLICE_X15Y149, matched by site type and site
+  coordinates rather than the tile grid, so a SLICE range takes no
+  block RAM or DSP site.
+- set_property EXCLUDE_PLACEMENT true [get_pblocks <name>] makes the
+  pblock exclusive: isBelLocationValid then keeps every cell that is
+  not a member off its bels.  Other pblock properties are ignored
+  with a warning.
+
+The XDC is read before packing, so after pack_lutffs the pblocks are
+carried to what packing made: a cell named after the netlist cell it
+was made from takes that cell's pblock, and every cell of a cluster
+takes the pblock of its members, so that the root carries it to the
+placer.  A member without a bel of its type in its pblock is an error.
+The block RAM regrowth after placement now honours a cell's region.
+
+The router is not constrained: a Region bounds bels only.
+
+Not compiled: written without boost/eigen available.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ himbaechel/uarch/xilinx/bram_place.cc   |   4 +-
+ himbaechel/uarch/xilinx/pack.cc         |   4 +
+ himbaechel/uarch/xilinx/xdc.cc          | 416 +++++++++++++++++++++++-
+ himbaechel/uarch/xilinx/xilinx.h        |  14 +
+ himbaechel/uarch/xilinx/xilinx_place.cc |  10 +
+ 5 files changed, 444 insertions(+), 4 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/bram_place.cc b/himbaechel/uarch/xilinx/bram_place.cc
+index 2457203d..6cc744cf 100644
+--- a/himbaechel/uarch/xilinx/bram_place.cc
++++ b/himbaechel/uarch/xilinx/bram_place.cc
+@@ -276,7 +276,9 @@ bool XilinxImpl::place_brams_by_group()
+               [](const BramGroup &a, const BramGroup &b) { return a.members.size() > b.members.size(); });
+ 
+     auto try_bind = [&](CellInfo *ci, BelId bel) {
+-        const bool site_taken_or_wrong_type = !ctx->checkBelAvail(bel) || !ctx->isValidBelForCellType(ci->type, bel);
++
++        const bool site_taken_or_wrong_type =
++                !ctx->checkBelAvail(bel) || !ctx->isValidBelForCellType(ci->type, bel) || !ci->testRegion(bel);
+         if (site_taken_or_wrong_type)
+             return false;
+         ctx->bindBel(bel, ci, STRENGTH_USER);
+diff --git a/himbaechel/uarch/xilinx/pack.cc b/himbaechel/uarch/xilinx/pack.cc
+index ca9024a3..53795065 100644
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -1567,6 +1567,10 @@ void XilinxImpl::pack()
+     packer.pack_ffs();
+     packer.finalise_muxfs();
+     packer.pack_lutffs();
++
++
++
++    apply_pblocks_after_packing();
+ 
+     // Now that LUT-FF clusters exist, keep the sinks of every placed regional
+     // buffer (BUFIO/BUFR) inside the clock region that buffer drives.  The
+diff --git a/himbaechel/uarch/xilinx/xdc.cc b/himbaechel/uarch/xilinx/xdc.cc
+index 24252c8e..aec30adf 100644
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -17,6 +17,7 @@
+  *
+  */
+ 
++#include <algorithm>
+ #include <boost/algorithm/string.hpp>
+ #include <fstream>
+ #include <limits>
+@@ -103,7 +104,43 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             return str.substr(0, str.size() - 3);
+         return std::string();
+     };
+-    auto get_cells = [&](std::string str) {
++
++
++
++
++
++
++
++
++
++    auto add_hierarchy_cells = [&](const std::string &path, std::vector<CellInfo *> &cells) {
++        std::string name_prefix = path;
++        std::replace(name_prefix.begin(), name_prefix.end(), '/', '.');
++        std::string scope_path = name_prefix;
++        std::replace(scope_path.begin(), scope_path.end(), '.', ' ');
++        name_prefix += ".";
++        const IdString id_scopename = ctx->id("scopename");
++        for (auto &cell : ctx->cells) {
++            CellInfo *ci = cell.second.get();
++
++            const bool is_constant_driver = ci->type.in(id_GND, id_VCC);
++            if (is_constant_driver)
++                continue;
++            const std::string &name = cell.first.str(ctx);
++            const bool name_is_under_path = name.compare(0, name_prefix.size(), name_prefix) == 0;
++            bool scope_is_under_path = false;
++            auto scope = ci->attrs.find(id_scopename);
++            const bool has_a_scope = scope != ci->attrs.end() && scope->second.is_string;
++            if (has_a_scope) {
++                const std::string &s = scope->second.as_string();
++                scope_is_under_path =
++                        s == scope_path || s.compare(0, scope_path.size() + 1, scope_path + " ") == 0;
++            }
++            if (name_is_under_path || scope_is_under_path)
++                cells.push_back(ci);
++        }
++    };
++    auto get_cells = [&](std::string str, const bool expand_hierarchy) {
+         std::vector<CellInfo *> tgt_cells;
+         if (str.empty() || str.front() != '[')
+             log_error("failed to parse target (on line %d)\n", lineno);
+@@ -156,7 +193,9 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+         }
+         if (ctx->cells.count(cellname))
+             tgt_cells.push_back(ctx->cells.at(cellname).get());
+-        else {
++        else if (expand_hierarchy)
++            add_hierarchy_cells(target_name, tgt_cells);
++        if (tgt_cells.empty()) {
+             // A board-level XDC legitimately constrains every pin of the
+             // board while a design uses a subset, so a miss is not an error:
+             // stay silent like other arches do, and itemise only in verbose
+@@ -213,6 +252,27 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+         return tgt_nets;
+     };
+ 
++
++    auto get_pblock = [&](const std::string &str) -> XdcPblock * {
++        const bool is_command = str.size() >= 2 && str.front() == '[' && str.back() == ']';
++        std::vector<std::string> split = split_to_args(is_command ? str.substr(1, str.size() - 2) : str, false);
++        const bool is_get_pblocks = is_command && split.size() == 2 && split.front() == "get_pblocks";
++        if (!is_get_pblocks) {
++            log_nonfatal_error("expected [get_pblocks <name>], found '%s' (on line %d)\n", str.c_str(), lineno);
++            num_errors++;
++            return nullptr;
++        }
++        IdString pb_name = ctx->id(strip_quotes(split.at(1)));
++        auto found = pblocks.find(pb_name);
++        if (found == pblocks.end()) {
++            log_nonfatal_error("no pblock named '%s'; create_pblock has to come first (on line %d)\n",
++                               pb_name.c_str(ctx), lineno);
++            num_errors++;
++            return nullptr;
++        }
++        return &found->second;
++    };
++
+     while (std::getline(in, line)) {
+         ++lineno;
+         // Trim comments, from # until end of the line
+@@ -256,10 +316,28 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+                 log_warning("[current_design] isn't supported, ignoring (on line %d)\n", lineno);
+                 continue;
+             }
++            const bool targets_a_pblock = arguments.at(3).compare(0, 12, "[get_pblocks") == 0;
++            if (targets_a_pblock) {
++
++
++                XdcPblock *pb = get_pblock(arguments.at(3));
++                if (pb == nullptr)
++                    goto nextline;
++                for (const auto &pair : arg_pairs) {
++                    const bool is_exclude_placement = pair.first == "EXCLUDE_PLACEMENT";
++                    if (is_exclude_placement) {
++                        const bool value_is_true = pair.second == "true" || pair.second == "TRUE" || pair.second == "1";
++                        pb->exclusive = value_is_true;
++                    } else
++                        log_warning("ignoring unsupported pblock property '%s' (on line %d)\n", pair.first.c_str(),
++                                    lineno);
++                }
++                goto nextline;
++            }
+             // All remaining arguments are supposed to designate cells
+             std::vector<CellInfo *> dest;
+             for (int cursor = 3; cursor < int(arguments.size()); cursor++) {
+-                std::vector<CellInfo *> dest_loc = get_cells(arguments.at(cursor));
++                std::vector<CellInfo *> dest_loc = get_cells(arguments.at(cursor), false);
+                 // misses are reported (verbose-only) inside get_cells now
+                 dest.insert(dest.end(), dest_loc.begin(), dest_loc.end());
+             }
+@@ -523,6 +601,177 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             else
+                 log_info("set_multicycle_path: setup multicycle %d tagged on %d cells (on line %d)\n", cycles,
+                          int(tagged.size()), lineno);
++        } else if (cmd == "create_pblock") {
++
++
++
++
++            const bool has_one_name = arguments.size() == 2;
++            if (!has_one_name) {
++                log_nonfatal_error("expected a single pblock name to 'create_pblock' (on line %d)\n", lineno);
++                num_errors++;
++                goto nextline;
++            }
++            IdString pb_name = ctx->id(strip_quotes(arguments.at(1)));
++            const bool name_is_taken = pblocks.count(pb_name) != 0 || ctx->region.count(pb_name) != 0;
++            if (name_is_taken) {
++                log_nonfatal_error("a pblock or region named '%s' already exists (on line %d)\n", pb_name.c_str(ctx),
++                                   lineno);
++                num_errors++;
++                goto nextline;
++            }
++            std::unique_ptr<Region> pb_region(new Region());
++            pb_region->name = pb_name;
++            pb_region->constr_bels = false;
++            ctx->region[pb_name] = std::move(pb_region);
++            pblocks[pb_name].region = pb_name;
++        } else if (cmd == "add_cells_to_pblock") {
++
++
++
++
++            if (arguments.size() < 3) {
++                log_nonfatal_error("expected a pblock and cells to 'add_cells_to_pblock' (on line %d)\n", lineno);
++                num_errors++;
++                goto nextline;
++            }
++            XdcPblock *pb = get_pblock(arguments.at(1));
++            if (pb == nullptr)
++                goto nextline;
++            Region *pb_region = ctx->region.at(pb->region).get();
++            int added = 0;
++            for (int cursor = 2; cursor < int(arguments.size()); cursor++) {
++                const std::string &sel = arguments.at(cursor);
++                const bool is_option = !sel.empty() && sel.front() == '-';
++                if (is_option) {
++                    log_nonfatal_error("unsupported add_cells_to_pblock option '%s' (on line %d)\n", sel.c_str(),
++                                       lineno);
++                    num_errors++;
++                    continue;
++                }
++                std::vector<CellInfo *> members = get_cells(sel, true);
++                if (members.empty())
++                    log_warning("add_cells_to_pblock: %s matched no cells (on line %d)\n", sel.c_str(), lineno);
++                for (CellInfo *ci : members) {
++                    const bool is_in_another_pblock = ci->region != nullptr && ci->region != pb_region;
++                    if (is_in_another_pblock) {
++                        log_nonfatal_error("cell '%s' is already in pblock '%s' (on line %d)\n", ctx->nameOf(ci),
++                                           ci->region->name.c_str(ctx), lineno);
++                        num_errors++;
++                        continue;
++                    }
++
++                    ci->region = pb_region;
++                    added++;
++                }
++            }
++            log_info("add_cells_to_pblock: %d cell(s) in pblock '%s' (on line %d)\n", added, pb->region.c_str(ctx),
++                     lineno);
++        } else if (cmd == "resize_pblock") {
++
++
++
++
++
++            if (arguments.size() < 4) {
++                log_nonfatal_error("expected a pblock and -add <ranges> to 'resize_pblock' (on line %d)\n", lineno);
++                num_errors++;
++                goto nextline;
++            }
++            XdcPblock *pb = get_pblock(arguments.at(1));
++            if (pb == nullptr)
++                goto nextline;
++            struct SiteRange
++            {
++                std::string prefix;
++                IdString site_type;
++                int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++            };
++            std::vector<SiteRange> ranges;
++
++            auto parse_site = [](const std::string &site, std::string &prefix, int &x, int &y) {
++                size_t xpos = site.rfind("_X");
++                if (xpos == std::string::npos)
++                    return false;
++                size_t ypos = site.find('Y', xpos + 2);
++                if (ypos == std::string::npos)
++                    return false;
++                std::string xs = site.substr(xpos + 2, ypos - xpos - 2), ys = site.substr(ypos + 1);
++                auto is_number = [](const std::string &s) {
++                    return !s.empty() && s.size() <= 6 && std::all_of(s.begin(), s.end(), ::isdigit);
++                };
++                if (!is_number(xs) || !is_number(ys))
++                    return false;
++                prefix = site.substr(0, xpos);
++                x = std::stoi(xs);
++                y = std::stoi(ys);
++                return true;
++            };
++            for (int cursor = 2; cursor < int(arguments.size()); cursor++) {
++                const std::string &opt = arguments.at(cursor);
++                const bool has_value = cursor + 1 < int(arguments.size());
++                const bool is_add = opt == "-add" && has_value;
++                if (!is_add) {
++                    log_nonfatal_error("unsupported resize_pblock argument '%s', only -add <ranges> (on line %d)\n",
++                                       opt.c_str(), lineno);
++                    num_errors++;
++                    goto nextline;
++                }
++                for (const std::string &range : split_to_args(strip_quotes(arguments.at(++cursor)), false)) {
++                    size_t colon = range.find(':');
++                    std::string first = range.substr(0, colon);
++                    std::string last = colon == std::string::npos ? first : range.substr(colon + 1);
++                    SiteRange r;
++                    std::string last_prefix;
++                    const bool both_ends_are_sites = parse_site(first, r.prefix, r.x0, r.y0) &&
++                                                     parse_site(last, last_prefix, r.x1, r.y1);
++                    const bool ends_share_a_site_type = both_ends_are_sites && r.prefix == last_prefix;
++                    if (!ends_share_a_site_type) {
++                        log_nonfatal_error("expected a site range such as SLICE_X0Y0:SLICE_X3Y49, found '%s' (on "
++                                           "line %d)\n",
++                                           range.c_str(), lineno);
++                        num_errors++;
++                        continue;
++                    }
++                    r.site_type = ctx->id(r.prefix);
++                    if (r.x0 > r.x1)
++                        std::swap(r.x0, r.x1);
++                    if (r.y0 > r.y1)
++                        std::swap(r.y0, r.y1);
++                    ranges.push_back(r);
++                }
++            }
++
++
++
++
++            Region *pb_region = ctx->region.at(pb->region).get();
++            int added = 0;
++            for (BelId bel : ctx->getBels()) {
++                SiteIndex si = get_bel_site(bel);
++                const auto &sites = tile_extra_data(si.tile)->sites;
++                bool bel_in_enumerated_site = si.site >= 0 && si.site < int32_t(sites.ssize());
++                if (!bel_in_enumerated_site)
++                    continue;
++                const auto &site_data = sites[si.site];
++                const IdString site_type = IdString(site_data.name_prefix);
++                for (const auto &r : ranges) {
++                    const bool site_is_in_range = site_type == r.site_type && site_data.site_x >= r.x0 &&
++                                                  site_data.site_x <= r.x1 && site_data.site_y >= r.y0 &&
++                                                  site_data.site_y <= r.y1;
++                    if (site_is_in_range) {
++                        pb_region->bels.insert(bel);
++                        added++;
++                        break;
++                    }
++                }
++            }
++            if (added == 0 && !ranges.empty())
++                log_warning("resize_pblock: no site of this device lies within the ranges given (on line %d)\n",
++                            lineno);
++            pb_region->constr_bels = !pb_region->bels.empty();
++            log_info("resize_pblock: pblock '%s' has %d bel(s) (on line %d)\n", pb->region.c_str(ctx),
++                     int(pb_region->bels.size()), lineno);
+         } else {
+             log_warning("ignoring unsupported XDC command '%s' (on line %d)\n", cmd.c_str(), lineno);
+         }
+@@ -541,6 +790,167 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+     if (num_errors > 0) {
+         log_error("Stopping the program after %u errors found in XDC file\n", num_errors);
+     }
++
++
++    const bool xdc_has_a_pblock = !pblocks.empty();
++    if (xdc_has_a_pblock)
++        for (auto &cell : ctx->cells)
++            pblock_prepack_cells[cell.first.str(ctx)] =
++                    cell.second->region != nullptr ? cell.second->region->name : IdString();
++}
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++void XilinxImpl::apply_pblocks_after_packing()
++{
++    if (pblocks.empty())
++        return;
++    auto pblock_of = [&](const CellInfo *ci) -> Region * {
++        const bool is_in_a_pblock = ci->region != nullptr && pblocks.count(ci->region->name) != 0;
++        return is_in_a_pblock ? ci->region : nullptr;
++    };
++
++
++
++    int inherited = 0;
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        const std::string &name = cell.first.str(ctx);
++        const bool made_by_packing = pblock_prepack_cells.count(name) == 0;
++        if (!made_by_packing || ci->region != nullptr)
++            continue;
++        for (size_t dollar = name.rfind('$'); dollar != std::string::npos && dollar > 0;
++             dollar = name.rfind('$', dollar - 1)) {
++            auto source = pblock_prepack_cells.find(name.substr(0, dollar));
++            const bool prefix_names_a_netlist_cell = source != pblock_prepack_cells.end();
++            if (!prefix_names_a_netlist_cell)
++                continue;
++            const bool source_was_in_a_pblock = source->second != IdString();
++            if (source_was_in_a_pblock) {
++                ci->region = ctx->region.at(source->second).get();
++                inherited++;
++            }
++            break;
++        }
++    }
++
++
++    dict<ClusterId, std::vector<CellInfo *>> cluster_cells;
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        const bool is_in_a_cluster = ci->cluster != ClusterId();
++        if (is_in_a_cluster)
++            cluster_cells[ci->cluster].push_back(ci);
++    }
++    int pulled_in = 0;
++    for (auto &cluster : cluster_cells) {
++        Region *cluster_pblock = nullptr;
++        for (CellInfo *ci : cluster.second) {
++            Region *member_pblock = pblock_of(ci);
++            if (member_pblock == nullptr)
++                continue;
++            const bool cluster_spans_two_pblocks = cluster_pblock != nullptr && cluster_pblock != member_pblock;
++            if (cluster_spans_two_pblocks)
++                log_error("cluster '%s' has cells in pblocks '%s' and '%s', but it is placed as one piece\n",
++                          cluster.first.c_str(ctx), cluster_pblock->name.c_str(ctx), member_pblock->name.c_str(ctx));
++            cluster_pblock = member_pblock;
++        }
++        if (cluster_pblock == nullptr)
++            continue;
++        for (CellInfo *ci : cluster.second) {
++            if (ci->region == cluster_pblock)
++                continue;
++
++            const bool is_a_netlist_cell_from_outside = pblock_prepack_cells.count(ci->name.str(ctx)) != 0;
++            if (is_a_netlist_cell_from_outside) {
++                pulled_in++;
++                if (ctx->verbose)
++                    log_info("    '%s' joins pblock '%s' with its cluster '%s'\n", ctx->nameOf(ci),
++                             cluster_pblock->name.c_str(ctx), cluster.first.c_str(ctx));
++            }
++            ci->region = cluster_pblock;
++        }
++    }
++    if (pulled_in > 0)
++        log_warning("%d cell(s) outside any pblock were packed into a cluster with pblock cells, and are now in "
++                    "that pblock (-v lists them)\n",
++                    pulled_in);
++
++
++    dict<std::pair<IdString, IdString>, bool> pblock_has_a_bel_for;
++    dict<IdString, int> member_count;
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        Region *pb = pblock_of(ci);
++        if (pb == nullptr)
++            continue;
++        member_count[pb->name]++;
++        if (!pb->constr_bels)
++            continue;
++        auto key = std::make_pair(pb->name, ci->type);
++        if (!pblock_has_a_bel_for.count(key)) {
++            bool found = false;
++            for (BelId bel : pb->bels) {
++                if (ctx->isValidBelForCellType(ci->type, bel)) {
++                    found = true;
++                    break;
++                }
++            }
++            pblock_has_a_bel_for[key] = found;
++        }
++        if (!pblock_has_a_bel_for.at(key))
++            log_error("cell '%s' of type '%s' is in pblock '%s', which has no site for it; give the pblock a "
++                      "range of that site type with resize_pblock -add\n",
++                      ctx->nameOf(ci), ci->type.c_str(ctx), pb->name.c_str(ctx));
++    }
++
++    for (auto &pb : pblocks) {
++        Region *r = ctx->region.at(pb.second.region).get();
++        const int members = member_count.count(pb.first) ? member_count.at(pb.first) : 0;
++        if (!r->constr_bels) {
++            if (members > 0)
++                log_warning("pblock '%s' has %d cell(s) but no sites, so they are placed anywhere\n",
++                            pb.first.c_str(ctx), members);
++            continue;
++        }
++        log_info("pblock '%s': %d cell(s) on %d bel(s)%s\n", pb.first.c_str(ctx), members, int(r->bels.size()),
++                 pb.second.exclusive ? ", exclusive" : "");
++        if (!pb.second.exclusive)
++            continue;
++        for (BelId bel : r->bels) {
++            auto owner = exclusive_pblock_bels.find(bel);
++            const bool overlaps_another_exclusive_pblock = owner != exclusive_pblock_bels.end() && owner->second != r;
++            if (overlaps_another_exclusive_pblock)
++                log_error("EXCLUDE_PLACEMENT pblocks '%s' and '%s' overlap at %s\n", owner->second->name.c_str(ctx),
++                          pb.first.c_str(ctx), ctx->nameOfBel(bel));
++            exclusive_pblock_bels[bel] = r;
++        }
++    }
++
++
++    for (auto &entry : exclusive_pblock_bels) {
++        CellInfo *bound = ctx->getBoundBelCell(entry.first);
++        const bool bound_cell_is_not_a_member = bound != nullptr && bound->region != entry.second;
++        if (bound_cell_is_not_a_member)
++            log_error("cell '%s' was placed at %s by packing, inside EXCLUDE_PLACEMENT pblock '%s', of which it "
++                      "is not a member\n",
++                      ctx->nameOf(bound), ctx->nameOfBel(entry.first), entry.second->name.c_str(ctx));
++    }
++    if (inherited > 0)
++        log_info("pblocks: %d cell(s) made by packing joined the pblock of the cell they were made from\n",
++                 inherited);
+ }
+ 
+ NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 618a239e..c896f233 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -177,6 +177,20 @@ struct XilinxImpl : HimbaechelAPI
+ 
+     // Flow management
+     void parse_xdc(const std::string &filename);
++
++
++
++    struct XdcPblock
++    {
++        IdString region;
++        bool exclusive = false;
++    };
++    dict<IdString, XdcPblock> pblocks;
++
++
++    dict<std::string, IdString> pblock_prepack_cells;
++    dict<BelId, const Region *> exclusive_pblock_bels;
++    void apply_pblocks_after_packing();
+     void pack() override;
+     void apply_loc_constraints(const pool<IdString> &only_types = {});
+     void prePlace() override;
+diff --git a/himbaechel/uarch/xilinx/xilinx_place.cc b/himbaechel/uarch/xilinx/xilinx_place.cc
+index 3f3d4b59..d90a22e1 100644
+--- a/himbaechel/uarch/xilinx/xilinx_place.cc
++++ b/himbaechel/uarch/xilinx/xilinx_place.cc
+@@ -689,6 +689,16 @@ bool XilinxImpl::isBelLocationValid(BelId bel, bool explain_invalid) const
+             }
+         }
+     }
++    const bool bel_is_in_an_exclusive_pblock = !exclusive_pblock_bels.empty() && exclusive_pblock_bels.count(bel) != 0;
++    if (bel_is_in_an_exclusive_pblock) {
++
++
++
++        const CellInfo *bound = ctx->getBoundBelCell(bel);
++        const bool bound_cell_is_not_a_member = bound != nullptr && bound->region != exclusive_pblock_bels.at(bel);
++        if (bound_cell_is_not_a_member)
++            return false;
++    }
+     if (is_logic_tile(bel)) {
+         if (!tile_status.at(bel.tile).lts)
+             return true;
+-- 
+2.53.0
+

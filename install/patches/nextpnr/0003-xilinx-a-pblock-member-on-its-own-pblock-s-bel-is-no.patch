@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: a pblock member on its own pblock's bel is not new in
+ a closed tile
+
+-o prerouted closes every tile that a reference route passes through, and
+isBelLocationValid then rejects a cell without a BEL attribute in such a
+tile.  In a partial-reconfiguration flow the static nets that feed a
+partition are replayed up to the partition's own cells, so their tiles are
+closed, and a module cell that the packer puts into the same slice is
+rejected.  A member of an EXCLUDE_PLACEMENT pblock that sits on one of
+that pblock's own bels is not counted as new: no static cell can use those
+bels anyway.
+---
+ himbaechel/uarch/xilinx/xilinx_place.cc | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/xilinx_place.cc b/himbaechel/uarch/xilinx/xilinx_place.cc
+index d90a22e1..9c2e280a 100644
+--- a/himbaechel/uarch/xilinx/xilinx_place.cc
++++ b/himbaechel/uarch/xilinx/xilinx_place.cc
+@@ -665,8 +665,19 @@ bool XilinxImpl::isBelLocationValid(BelId bel, bool explain_invalid) const
+ {
+     const bool tile_is_closed_to_new_cells = !frozen_tiles.empty() && frozen_tiles.count(bel.tile) != 0;
+     if (tile_is_closed_to_new_cells) {
+-        // a cell that would be new in a closed tile: the design did not pin it there
+-        auto would_be_a_new_cell = [&](CellInfo *ci) { return ci != nullptr && ci->attrs.count(id_BEL) == 0; };
++
++
++
++
++        auto is_on_a_bel_of_its_own_pblock = [&](const CellInfo *ci) {
++            if (ci->region == nullptr || exclusive_pblock_bels.empty())
++                return false;
++            auto owner = exclusive_pblock_bels.find(ci->bel);
++            return owner != exclusive_pblock_bels.end() && owner->second == ci->region;
++        };
++        auto would_be_a_new_cell = [&](CellInfo *ci) {
++            return ci != nullptr && ci->attrs.count(id_BEL) == 0 && !is_on_a_bel_of_its_own_pblock(ci);
++        };
+         const bool bel_is_in_a_logic_tile = is_logic_tile(bel);
+         const bool bel_is_in_a_bram_tile = is_bram_tile(bel);
+         if (bel_is_in_a_logic_tile) {

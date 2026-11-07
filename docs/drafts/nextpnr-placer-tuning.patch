@@ -1,0 +1,288 @@
+diff --git a/common/kernel/command.cc b/common/kernel/command.cc
+index 1f23b661..76c692a3 100644
+--- a/common/kernel/command.cc
++++ b/common/kernel/command.cc
+@@ -385,6 +385,28 @@ po::options_description CommandHandler::getGeneralOptions()
+     general.add_options()("placer-heap-no-ctrl-set", "disable control set awareness in placer heap");
+ 
+     general.add_options()("static-dump-density", "write density csv files during placer-static flow");
++    general.add_options()("placer-static-timingweight", po::value<float>(),
++                          "placer static: net weight of an arc is 1 + W * criticality ^ E (float W, default: 5)");
++    general.add_options()("placer-static-critexp", po::value<float>(),
++                          "placer static: criticality exponent E of the arc weight (float, default: 2)");
++    general.add_options()("placer-static-target-util", po::value<double>(),
++                          "placer static: total area of cells and fillers as a fraction of the device (default: 0.7)");
++    general.add_options()("placer-static-ip-wait", po::value<float>(),
++                          "placer static: legalise block RAMs and DSPs only once the logic overlap is below this "
++                          "fraction, so their sites follow the logic (float, default: off)");
++    general.add_options()("placer-static-overlap-stop", po::value<float>(),
++                          "placer static: stop spreading and legalise the logic once its overlap is below this "
++                          "fraction (float, default: 0.1)");
++    general.add_options()("placer1-critexp", po::value<float>(),
++                          "placer1 and placement refinement: criticality exponent of the timing cost (float, default: 8)");
++    general.add_options()("placer1-timing-tradeoff", po::value<float>(),
++                          "placer1 and placement refinement: weight of timing against wirelength, 0..1 (default: 0.5)");
++    general.add_options()("tmg-crit-target", po::value<float>(),
++                          "criticality from the slack against F times each clock's constraint instead of from the "
++                          "delay relative to the worst path (float F, e.g. 1.0; default: off)");
++    general.add_options()("tmg-crit-floor", po::value<float>(),
++                          "with --tmg-crit-target: criticality of a path that just meets the target; failing "
++                          "paths are spread over [floor, 1] (float, default: 0.9)");
+ 
+ #if !defined(NPNR_DISABLE_THREADS)
+     general.add_options()("parallel-refine", "use new experimental parallelised engine for placement refinement");
+@@ -603,6 +625,24 @@ void CommandHandler::setupContext(Context *ctx)
+ 
+     if (vm.count("static-dump-density"))
+         ctx->settings[ctx->id("static/dump_density")] = true;
++    if (vm.count("placer-static-timingweight"))
++        ctx->settings[ctx->id("placerStatic/timingWeight")] = std::to_string(vm["placer-static-timingweight"].as<float>());
++    if (vm.count("placer-static-critexp"))
++        ctx->settings[ctx->id("placerStatic/critExp")] = std::to_string(vm["placer-static-critexp"].as<float>());
++    if (vm.count("placer-static-target-util"))
++        ctx->settings[ctx->id("placerStatic/targetUtil")] = std::to_string(vm["placer-static-target-util"].as<double>());
++    if (vm.count("placer-static-ip-wait"))
++        ctx->settings[ctx->id("placerStatic/ipLegaliseLogicOverlap")] = std::to_string(vm["placer-static-ip-wait"].as<float>());
++    if (vm.count("placer-static-overlap-stop"))
++        ctx->settings[ctx->id("placerStatic/logicOverlapStop")] = std::to_string(vm["placer-static-overlap-stop"].as<float>());
++    if (vm.count("placer1-critexp"))
++        ctx->settings[ctx->id("placer1/critExp")] = std::to_string(vm["placer1-critexp"].as<float>());
++    if (vm.count("placer1-timing-tradeoff"))
++        ctx->settings[ctx->id("placer1/timingTradeoff")] = std::to_string(vm["placer1-timing-tradeoff"].as<float>());
++    if (vm.count("tmg-crit-target"))
++        ctx->settings[ctx->id("timing/critTarget")] = std::to_string(vm["tmg-crit-target"].as<float>());
++    if (vm.count("tmg-crit-floor"))
++        ctx->settings[ctx->id("timing/critFloor")] = std::to_string(vm["tmg-crit-floor"].as<float>());
+ 
+     // Setting default values
+     if (ctx->settings.find(ctx->id("target_freq")) == ctx->settings.end())
+diff --git a/common/kernel/context.h b/common/kernel/context.h
+index 473d9b21..e7cb3179 100644
+--- a/common/kernel/context.h
++++ b/common/kernel/context.h
+@@ -121,6 +121,18 @@ struct Context : Arch, DeterministicRNG
+         return defaultValue;
+     }
+ 
++    template <typename T> T setting_or(const char *name, T defaultValue) const
++    {
++        auto known = idstring_str_to_idx->find(name);
++        if (known == idstring_str_to_idx->end())
++            return defaultValue;
++        auto found = settings.find(IdString(known->second));
++        if (found == settings.end())
++            return defaultValue;
++        return boost::lexical_cast<T>(found->second.is_string ? found->second.as_string()
++                                                              : std::to_string(found->second.as_int64()));
++    }
++
+     template <typename T> T setting(const char *name) const
+     {
+         IdString new_id = id(name);
+diff --git a/common/kernel/timing.cc b/common/kernel/timing.cc
+index e1e9f17d..d2d01f22 100644
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -42,6 +42,8 @@ TimingAnalyser::TimingAnalyser(Context *ctx) : ctx(ctx)
+         auto clock_skew = ctx->settings.find(IdString(known->second));
+         with_clock_skew = clock_skew != ctx->settings.end() && clock_skew->second.as_bool();
+     }
++    crit_target = ctx->setting_or<float>("timing/critTarget", 0.0f);
++    crit_floor = ctx->setting_or<float>("timing/critFloor", 0.9f);
+     ClockDomainKey key{IdString(), ClockEdge::RISING_EDGE};
+     domain_to_id.emplace(key, 0);
+     domains.emplace_back(key);
+@@ -839,8 +841,19 @@ void TimingAnalyser::compute_criticality()
+             if (domains.at(dp.key.launch).key.is_async() || domains.at(dp.key.capture).key.is_async())
+                 continue;
+ 
+-            float crit =
+-                    1.0f - (float(pdp.second.setup_slack) - float(dp.worst_setup_slack)) / float(-dp.worst_setup_slack);
++            float crit;
++            delay_t budget = delay_t(float(dp.period.minDelay()) * crit_target);
++            if (budget > 0) {
++                float slack = float(budget + pdp.second.setup_slack);
++                float worst = float(budget + dp.worst_setup_slack);
++                if (slack < 0)
++                    crit = crit_floor + (1.0f - crit_floor) * slack / worst;
++                else
++                    crit = crit_floor * (1.0f - slack / float(budget));
++            } else {
++                crit = 1.0f -
++                       (float(pdp.second.setup_slack) - float(dp.worst_setup_slack)) / float(-dp.worst_setup_slack);
++            }
+             crit = std::min(crit, 1.0f);
+             crit = std::max(crit, 0.0f);
+             pdp.second.criticality = crit;
+diff --git a/common/kernel/timing.h b/common/kernel/timing.h
+index 4fe42866..202f56c2 100644
+--- a/common/kernel/timing.h
++++ b/common/kernel/timing.h
+@@ -101,6 +101,9 @@ struct TimingAnalyser
+     // Enable analysis of clock skew between FFs.
+     bool with_clock_skew = false;
+ 
++    float crit_target = 0;
++    float crit_floor = 0.9f;
++
+     bool setup_only = false;
+     bool have_loops = false;
+     bool updated_domains = false;
+diff --git a/common/place/placer1.cc b/common/place/placer1.cc
+index ea19f9c8..fb6e9be0 100644
+--- a/common/place/placer1.cc
++++ b/common/place/placer1.cc
+@@ -73,6 +73,8 @@ class SAPlacer
+             max_y = std::max(max_y, loc.y);
+         }
+         diameter = std::max(max_x, max_y) + 1;
++        crit_exp = cfg.critExp;
++        lambda = cfg.timingTradeoff;
+ 
+         pool<IdString> cell_types_in_use;
+         for (auto &cell : ctx->cells) {
+@@ -1240,6 +1242,8 @@ Placer1Cfg::Placer1Cfg(Context *ctx)
+     timing_driven = ctx->setting<bool>("timing_driven");
+     hpwl_scale_x = 1;
+     hpwl_scale_y = 1;
++    critExp = ctx->setting_or<float>("placer1/critExp", 8.0f);
++    timingTradeoff = ctx->setting_or<float>("placer1/timingTradeoff", 0.5f);
+ }
+ 
+ bool placer1(Context *ctx, Placer1Cfg cfg)
+diff --git a/common/place/placer1.h b/common/place/placer1.h
+index 1ec3991e..f9adf779 100644
+--- a/common/place/placer1.h
++++ b/common/place/placer1.h
+@@ -33,6 +33,7 @@ struct Placer1Cfg
+     int timingFanoutThresh;
+     bool timing_driven;
+     int hpwl_scale_x, hpwl_scale_y;
++    float critExp, timingTradeoff;
+ };
+ 
+ extern bool placer1(Context *ctx, Placer1Cfg cfg);
+diff --git a/common/place/placer_static.cc b/common/place/placer_static.cc
+index 1c2c259a..fc1f9fb5 100644
+--- a/common/place/placer_static.cc
++++ b/common/place/placer_static.cc
+@@ -632,8 +632,6 @@ class StaticPlacer
+         }
+     }
+ 
+-    const double target_util = 0.7;
+-
+     void insert_dark()
+     {
+         log_info("⌁ inserting dark nodes...\n");
+@@ -662,10 +660,10 @@ class StaticPlacer
+             const auto &g = groups.at(group);
+             double util = g.concrete_area / g.total_area;
+             log_info("⌁   group %s pre-spacer utilisation %.02f%% (target %.02f%%)\n", ctx->nameOf(cg.name),
+-                     (util * 100.0), (target_util * 100.0));
++                     (util * 100.0), (cfg.target_util * 100.0));
+             // TODO: better computation of spacer size and placement?
+             int inserted_spacers = 0;
+-            int spacer_count = (g.total_area * target_util - g.concrete_area) / cg.spacer_rect.area();
++            int spacer_count = (g.total_area * cfg.target_util - g.concrete_area) / cg.spacer_rect.area();
+             if (spacer_count <= 0)
+                 continue;
+             while (inserted_spacers < spacer_count) {
+@@ -969,7 +967,7 @@ class StaticPlacer
+                     }
+                 }
+             }
+-            float weight = 1.0 + 5 * std::pow(crit, 2);
++            float weight = 1.0 + double(cfg.timing_weight) * std::pow(double(crit), double(cfg.crit_exp));
+             gradient += weight * (d_min - d_max);
+         }
+ 
+@@ -1677,7 +1675,10 @@ class StaticPlacer
+                     float ip_overlap = 0;
+                     for (int i = cfg.logic_groups; i < int(groups.size()); i++)
+                         ip_overlap = std::max(ip_overlap, groups.at(i).overlap);
+-                    if (ip_overlap < 0.15) {
++                    float logic_overlap = 0;
++                    for (int i = 0; i < cfg.logic_groups; i++)
++                        logic_overlap = std::max(logic_overlap, groups.at(i).overlap);
++                    if (ip_overlap < 0.15 && logic_overlap < cfg.ip_legalise_logic_overlap) {
+                         legalise_step(true);
+                         legalised_ip = true;
+                         for (int i = cfg.logic_groups; i < int(groups.size()); i++)
+@@ -1691,7 +1692,8 @@ class StaticPlacer
+                         best_overlap = logic_overlap;
+                         best_overlap_iter = iter;
+                     }
+-                    if (logic_overlap < 0.1 || (logic_overlap < 0.2 && iter > (best_overlap_iter + 50))) {
++                    if (logic_overlap < cfg.logic_overlap_stop ||
++                        (logic_overlap < 2 * cfg.logic_overlap_stop && iter > (best_overlap_iter + 50))) {
+                         legalise_step(false);
+                         break;
+                     }
+@@ -1718,6 +1720,11 @@ bool placer_static(Context *ctx, PlacerStaticCfg cfg)
+ PlacerStaticCfg::PlacerStaticCfg(Context *ctx)
+ {
+     timing_driven = ctx->setting<bool>("timing_driven");
++    timing_weight = ctx->setting_or<float>("placerStatic/timingWeight", 5.0f);
++    crit_exp = ctx->setting_or<float>("placerStatic/critExp", 2.0f);
++    target_util = ctx->setting_or<double>("placerStatic/targetUtil", 0.7);
++    ip_legalise_logic_overlap = ctx->setting_or<float>("placerStatic/ipLegaliseLogicOverlap", 2.0f);
++    logic_overlap_stop = ctx->setting_or<float>("placerStatic/logicOverlapStop", 0.1f);
+ 
+     hpwl_scale_x = 1;
+     hpwl_scale_y = 1;
+diff --git a/common/place/placer_static.h b/common/place/placer_static.h
+index 8d2e47c4..9dad4961 100644
+--- a/common/place/placer_static.h
++++ b/common/place/placer_static.h
+@@ -64,6 +64,10 @@ struct PlacerStaticCfg
+     // for calculating timing estimates based on distance
+     // estimate = c + mx*dx + my * dy
+     delay_t timing_c = 100, timing_mx = 100, timing_my = 100;
++    float timing_weight = 5, crit_exp = 2;
++    double target_util = 0.7;
++    float ip_legalise_logic_overlap = 2.0f;
++    float logic_overlap_stop = 0.1f;
+     // groups of cells that should be placed together.
+     // groups < logic_groups are logic like LUTs and FFs, further groups for BRAM/DSP/misc
+     std::vector<StaticCellGroupCfg> cell_groups;
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index b687d89c..74c0039a 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -109,6 +109,12 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("timing-opt", po::value<std::string>(),
+                            "after placing, the timing-driven placement optimisation on the critical paths: R[,N] moves a "
+                            "cell up to R tiles, N rounds (default 30); off unless given");
++    specific.add_options()("static-hpwl-x", po::value<int>(),
++                           "static placer: wirelength weight of a horizontal tile step against a vertical one "
++                           "(default 2)");
++    specific.add_options()("static-ff-area", po::value<float>(),
++                           "static placer: area of a flipflop in slice-bel units of 1/16 (default 1.4: control-set "
++                           "and input-pin limits keep a slice from filling up)");
+     specific.add_options()("hardblock-timing", po::value<std::string>()->implicit_value(""),
+                            "time the DSP48E1 and ICAPE2 pins with the prjxray-db SDF arcs (off by default: they are "
+                            "untimed); see hardblock_timing.cc");
+@@ -1027,7 +1033,9 @@ void XilinxImpl::configurePlacerHeap(PlacerHeapCfg &cfg)
+ 
+ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+ {
+-    cfg.hpwl_scale_x = 2;
++    cfg.hpwl_scale_x = ctx->args.options.count("static-hpwl-x")
++                               ? std::max(1, ctx->args.options.at("static-hpwl-x").as<int>())
++                               : 2;
+     cfg.hpwl_scale_y = 1;
+ 
+     cfg.glbBufTypes.insert(id_PSEUDO_GND);
+@@ -1072,7 +1080,10 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+         auto &comb = cfg.cell_groups.back();
+         comb.name = ctx->id("FF");
+         // Assume one FF occupies 1.5 bels due to control set packing and slice input restrictions
+-        comb.cell_area[id_SLICE_FFX] = StaticRect(1.0f, 0.0875f);
++        float ff_area = ctx->args.options.count("static-ff-area")
++                                ? ctx->args.options.at("static-ff-area").as<float>() / 16.0f
++                                : 0.0875f;
++        comb.cell_area[id_SLICE_FFX] = StaticRect(1.0f, ff_area);
+         comb.bel_area[id_SLICE_FFX] = StaticRect(1.0f, 0.0625f);
+         comb.spacer_rect = StaticRect(1.0f, 0.125f);
+     }

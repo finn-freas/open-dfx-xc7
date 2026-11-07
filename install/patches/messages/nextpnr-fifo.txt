@@ -1,0 +1,8 @@
+xilinx: FIFO18E1 and FIFO36E1
+
+FIFO18E1 is placed on the FIFO18E1 bel of the lower RAMB18 site and
+FIFO36E1 on the RAMBFIFO36E1 bel, with Vivado's pin map, and their FASM
+is written (mode, widths, registers, inverters, offsets as Vivado stores
+them, FIFO_PORT_WIDTH).  ECC, a non-zero INIT/SRVAL and FIFO36E1
+DATA_WIDTH 4 are refused.  Needs the prjxray-db FIFO_PORT_WIDTH
+features.

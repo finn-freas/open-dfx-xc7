@@ -1,0 +1,7 @@
+xilinx: keep a MUXF7 that also feeds fabric in its MUXF8 tree
+
+pack_muxfs took a MUXF7 (or MUXF8) as the root of its own tree unless
+its output had exactly one user, the parent mux, so a MUXF7 that drives
+both a MUXF8 and fabric logic broke the MUXF8 tree.  Treat it as part of
+the tree when it feeds exactly one parent mux on a data input, whatever
+else its output drives.

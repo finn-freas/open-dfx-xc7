@@ -1,0 +1,6 @@
+clkbufmap: keep clock-buffer inputs on the unbuffered clock
+
+When a net that gets a new buffer also drives the input of a clock
+buffer (a cell type with a clkbuf_driver output, such as BUFIO or BUFR),
+that input is connected back to the unbuffered net, so a BUFG is no
+longer put in front of a BUFIO/BUFR input.

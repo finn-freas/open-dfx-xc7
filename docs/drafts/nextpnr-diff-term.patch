@@ -1,0 +1,48 @@
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index b46044f3..2f60cdab 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -1502,6 +1502,7 @@ struct FasmBackend
+                     fasm_ctx.back() = saved;
+                 }
+             }
++            bool terminated_receiver = false;
+             if (!is_diff) {
+                 if (iostandard == "LVCMOS33" || iostandard == "LVTTL" || iostandard == "LVCMOS25") {
+                     if (!is_riob18)
+@@ -1625,12 +1626,33 @@ struct FasmBackend
+                     write_bit("LVDS_25_SSTL135_SSTL15.IN_DIFF");
+                 }
+ 
++
++
++
++
++
++
++
++                const std::string diff_term = str_or_default(pad->attrs, ctx->id("DIFF_TERM"), "FALSE");
++                const bool wants_diff_term = diff_term == "TRUE" || diff_term == "true" || diff_term == "1";
++                if (wants_diff_term) {
++                    const bool termination_known = is_lvds25 && !is_hp_bank;
++                    if (!termination_known)
++                        log_error("DIFF_TERM on %s (%s, tile %s) is not supported\n", ctx->nameOf(pad),
++                                  iostandard.c_str(), tile.c_str());
++                    terminated_receiver = is_master_half && !is_output;
++                }
++
+                 if (pad->attrs.count(id_IN_TERM))
+                     write_bit("IN_TERM." + pad->attrs.at(id_IN_TERM).as_string());
+             }
+ 
+-            // IN_ONLY
+-            if (!is_output) {
++
++
++
++            if (terminated_receiver) {
++                write_bit("LVDS_25.IN_ONLY_DIFF_TERM");
++            } else if (!is_output) {
+                 if (is_riob18) {
+                     bool is_diff_master_half = is_diff && is_master_half;
+                     if (is_diff_master_half) {

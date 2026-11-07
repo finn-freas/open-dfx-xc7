@@ -1,0 +1,301 @@
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -457,6 +457,101 @@
+     return true;
+ }
+ 
++
++
++
++
++
++
++void XilinxPacker::pair_luts(int min_shared)
++{
++    auto pairable = [&](const CellInfo *ci) {
++        if (ci->type != id_SLICE_LUTX || ci->cluster != ClusterId() || !ci->constr_children.empty())
++            return false;
++        if (ci->attrs.count(id_X_LUT_AS_DRAM) || ci->attrs.count(id_X_LUT_AS_SRL))
++            return false;
++        if (ci->getPort(id_A6) != nullptr || ci->getPort(id_O5) != nullptr || ci->getPort(id_O6) == nullptr)
++            return false;
++        return true;
++    };
++    auto inputs_of = [&](CellInfo *ci) {
++        std::vector<NetInfo *> nets;
++        for (IdString a : {id_A1, id_A2, id_A3, id_A4, id_A5}) {
++            NetInfo *n = ci->getPort(a);
++            if (n != nullptr && std::find(nets.begin(), nets.end(), n) == nets.end())
++                nets.push_back(n);
++        }
++        return nets;
++    };
++    const int max_fanout_scanned = 64;
++    pool<IdString> paired;
++    int pairs = 0;
++    std::vector<CellInfo *> luts;
++    for (auto &cell : ctx->cells)
++        if (pairable(cell.second.get()))
++            luts.push_back(cell.second.get());
++    for (CellInfo *a : luts) {
++        if (paired.count(a->name) || !pairable(a))
++            continue;
++        std::vector<NetInfo *> ia = inputs_of(a);
++        dict<IdString, int> shared;
++        for (NetInfo *n : ia) {
++            if (n->users.entries() > max_fanout_scanned)
++                continue;
++            for (auto &usr : n->users)
++                if (usr.cell != a && usr.cell->type == id_SLICE_LUTX)
++                    shared[usr.cell->name]++;
++        }
++        CellInfo *best = nullptr;
++        int best_shared = 0, best_union = 6;
++        for (auto &s : shared) {
++            if (s.second < min_shared || paired.count(s.first))
++                continue;
++            CellInfo *b = ctx->cells.at(s.first).get();
++            if (!pairable(b))
++                continue;
++            std::vector<NetInfo *> u = ia;
++            for (NetInfo *n : inputs_of(b))
++                if (std::find(u.begin(), u.end(), n) == u.end())
++                    u.push_back(n);
++            const int n_union = int(u.size());
++            if (n_union > 5)
++                continue;
++            const bool better = s.second > best_shared || (s.second == best_shared && n_union < best_union) ||
++                                (s.second == best_shared && n_union == best_union && best != nullptr && b->name < best->name);
++            if (better) {
++                best = b;
++                best_shared = s.second;
++                best_union = n_union;
++            }
++        }
++        if (best == nullptr)
++            continue;
++        auto drives_lone_ff = [&](CellInfo *ci) {
++            NetInfo *o = ci->getPort(id_O6);
++            return o->users.entries() == 1 && (*o->users.begin()).cell->type == id_SLICE_FFX &&
++                   (*o->users.begin()).port == id_D;
++        };
++        CellInfo *lut6 = a, *lut5 = best;
++        if (drives_lone_ff(best) && !drives_lone_ff(a))
++            std::swap(lut6, lut5);
++        lut5->renamePort(id_O6, id_O5);
++        lut5->attrs.erase(ctx->id("X_ORIG_PORT_O6"));
++        lut5->attrs[ctx->id("X_ORIG_PORT_O5")] = std::string("O");
++        lut6->cluster = lut6->name;
++        lut5->cluster = lut6->name;
++        lut6->constr_children.push_back(lut5);
++        lut5->constr_x = 0;
++        lut5->constr_y = 0;
++        lut5->constr_abs_z = false;
++        lut5->constr_z = BEL_5LUT - BEL_6LUT;
++        paired.insert(a->name);
++        paired.insert(best->name);
++        ++pairs;
++    }
++    log_info("Paired %d LUTs sharing at least %d inputs into dual-output LUT sites.\n", pairs, min_shared);
++}
++
+ void XilinxPacker::pack_lutffs()
+ {
+     int pairs = 0;
+@@ -1586,6 +1681,10 @@
+     packer.pack_dsps();
+     packer.pack_ffs();
+     packer.finalise_muxfs();
++    if (args.options.count("lut-pair")) {
++        const std::string v = args.options.at("lut-pair").as<std::string>();
++        packer.pair_luts((v.empty() || v == "1" || v == "on") ? 2 : std::stoi(v));
++    }
+     packer.pack_lutffs();
+ 
+     // Now that LUT-FF clusters exist, keep the sinks of every placed regional
+--- a/himbaechel/uarch/xilinx/pack.h
++++ b/himbaechel/uarch/xilinx/pack.h
+@@ -124,6 +124,7 @@
+     void pack_ffs();
+     bool can_add_ff_to_cluster(const CellInfo *lut, const CellInfo *ff);
+     void pack_lutffs();
++    void pair_luts(int min_shared);
+ 
+     bool is_constrained(const CellInfo *cell);
+     void pack_muxfs();
+--- a/himbaechel/uarch/xilinx/pack_carry.cc
++++ b/himbaechel/uarch/xilinx/pack_carry.cc
+@@ -212,8 +212,16 @@
+     // N.B. LUT6 is not a valid type here, as CARRY requires dual outputs
+     pool<IdString> lut_types{id_LUT1, id_LUT2, id_LUT3, id_LUT4, id_LUT5};
+ 
++
++
++
++
++
++
++    const bool di_bypass = ctx->args.options.count("carry-di-bypass");
++
+     pool<IdString> folded_nets;
+-    int moved = 0, duplicated = 0;
++    int moved = 0, duplicated = 0, bypassed = 0;
+ 
+     for (auto &grp : groups) {
+         std::vector<CellInfo *> carry4s;
+@@ -283,12 +291,15 @@
+             // is free, or duplicated there when it is already clustered (see below)
+             CellInfo *s_dup_source = nullptr;
+             pool<IdString> s_dup_inputs;
++            const bool di_may_bypass = di_bypass && (z != 0 || c4->getPort(id_CYINIT) == nullptr);
+             if (c4_s) {
+-                const bool s_driven_by_lut = c4_s->driver.cell != nullptr && lut_types.count(c4_s->driver.cell->type);
++                const bool s_driver_is_lut6 = c4_s->driver.cell != nullptr && c4_s->driver.cell->type == id_LUT6;
++                const bool s_driven_by_lut = c4_s->driver.cell != nullptr &&
++                                             (lut_types.count(c4_s->driver.cell->type) || (di_may_bypass && s_driver_is_lut6));
+                 const bool s_is_only_load = c4_s->users.entries() == 1;
+                 if (s_driven_by_lut && s_is_only_load) {
+                     s_lut = c4_s->driver.cell;
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < 6; j++) {
+                         NetInfo *ix = s_lut->getPort(ctx->idf("I%d", j));
+                         if (ix) {
+                             unique_lut_inputs.insert(ix->name);
+@@ -297,7 +308,7 @@
+                     }
+                 } else if (s_driven_by_lut) {
+                     s_dup_source = c4_s->driver.cell;
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < 6; j++) {
+                         NetInfo *ix = s_dup_source->getPort(ctx->idf("I%d", j));
+                         if (ix)
+                             s_dup_inputs.insert(ix->name);
+@@ -332,7 +343,7 @@
+                 for (IdString ix : s_dup_inputs)
+                     shared_inputs.insert(ix);
+                 const int shared_input_count = int(shared_inputs.size()) + (di_lut ? 0 : 1);
+-                const bool duplicate_fits = shared_input_count <= 5;
++                const bool duplicate_fits = shared_input_count <= 5 || di_may_bypass;
+                 const bool source_is_free = s_dup_source->cluster == ClusterId();
+                 if (duplicate_fits && source_is_free) {
+                     s_lut = s_dup_source;
+@@ -343,7 +354,7 @@
+                     CellInfo *dup = ctx->createCell(ctx->idf("%s$S_DUP%d", s_dup_source->name.c_str(ctx), ++autoidx),
+                                                     s_dup_source->type);
+                     NetInfo *dup_out = ctx->createNet(ctx->idf("%s$S_DUP%d", c4_s->name.c_str(ctx), ++autoidx));
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < 6; j++) {
+                         IdString ip = ctx->idf("I%d", j);
+                         const bool source_has_input = s_dup_source->ports.count(ip);
+                         if (!source_has_input)
+@@ -362,12 +373,20 @@
+                     ++duplicated;
+                 }
+             }
++            if (di_may_bypass) {
++                const int pair_inputs = int(unique_lut_inputs.size()) + (s_lut ? 0 : 1);
++                const bool di_lut_fits_beside_s = s_inputs <= 5 && pair_inputs <= 5;
++                if (di_lut && !di_lut_fits_beside_s)
++                    di_lut = nullptr;
++                if (!di_lut && c4_di)
++                    ++bypassed;
++            }
+             int lut_inp_count = int(unique_lut_inputs.size());
+             if (!s_lut)
+                 ++lut_inp_count; // for feedthrough
+             if (!di_lut)
+                 ++lut_inp_count; // for feedthrough
+-            if (lut_inp_count > 5) {
++            if (lut_inp_count > 5 && !di_may_bypass) {
+                 // Must use feedthrough for at least one LUT
+                 di_lut = nullptr;
+                 if (s_inputs > 4)
+@@ -381,7 +400,7 @@
+                 auto s_feed = feed_through_lut(c4_s, {pr});
+                 s_lut = s_feed;
+             }
+-            if (!di_lut && c4_di) {
++            if (!di_lut && c4_di && !di_may_bypass) {
+                 PortRef pr;
+                 pr.cell = c4;
+                 pr.port = ctx->idf("DI[%d]", z);
+@@ -412,6 +431,8 @@
+         log_info("   Moved %d shared LUTs driving carry S inputs into the carry site.\n", moved);
+     if (duplicated > 0)
+         log_info("   Duplicated %d shared LUTs driving carry S inputs.\n", duplicated);
++    if (bypassed > 0)
++        log_info("   Routed %d carry DI inputs through the bypass pin instead of a feed-through LUT.\n", bypassed);
+ 
+     for (auto net : folded_nets)
+         ctx->nets.erase(net);
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -107,6 +107,12 @@
+     specific.add_options()("dsp-cascade-place", po::value<std::string>()->implicit_value(""),
+                            "place a DSP48E1 cascade chain along the chipdb's PCOUT -> PCIN wires, so that it can "
+                            "cross an HCLK or BRKH row (off by default: a fixed 5-row step per DSP tile)");
++    specific.add_options()("carry-di-bypass", po::value<std::string>()->implicit_value(""),
++                           "route a CARRY4 DI input that no LUT of its own position drives through the AX..DX bypass "
++                           "pin instead of a feed-through LUT (off by default); see pack_carry.cc");
++    specific.add_options()("lut-pair", po::value<std::string>()->implicit_value(""),
++                           "put two LUTs that share at least N inputs (default 2) and use at most five inputs together "
++                           "into one LUT6 site as O6 and O5 (off by default); see pair_luts() in pack.cc");
+     specific.add_options()("hold-detour-max", po::value<double>(),
+                            "hold deficit (ns) up to which a routing detour is used instead of a feedthrough LUT "
+                            "(default 0.5)");
+@@ -194,6 +200,8 @@
+     h.init(ctx);
+     HimbaechelAPI::init(ctx);
+     dsp_cascade_place = ctx->args.options.count("dsp-cascade-place");
++    carry_di_bypass = ctx->args.options.count("carry-di-bypass");
++    lut_pair = ctx->args.options.count("lut-pair");
+ 
+     // Resolve the repeated-name bel types once (the placer looks buckets up per
+     // cell); everything else buckets as its own type.
+@@ -1485,6 +1493,13 @@
+                 ct.lut.output_sigs[0]->users.entries() == 1 &&
+                 (*ct.lut.output_sigs[0]->users.begin()).cell->type == id_CARRY4)
+                 ct.lut.only_drives_carry = true;
++
++
++
++            const bool carry_load_may_be_remote = carry_di_bypass || lut_pair;
++            if (ct.lut.only_drives_carry && carry_load_may_be_remote &&
++                (*ct.lut.output_sigs[0]->users.begin()).cell->cluster != ci->cluster)
++                ct.lut.only_drives_carry = false;
+ 
+             const IdString addr_msb_sigs[] = {id_WA7, id_WA8, id_WA9};
+             for (int i = 0; i < 3; i++)
+@@ -1517,6 +1532,19 @@
+                 ct.carry.x_sigs[i] = nullptr;
+             }
+             ct.carry.x_sigs[0] = ci->getPort(id_CYINIT);
++
++
++            for (int i = 0; carry_di_bypass && i < 4; i++) {
++                NetInfo *di = ci->getPort(ctx->idf("DI%d", i));
++                if (di == nullptr)
++                    continue;
++                const CellInfo *drv = di->driver.cell;
++                const bool from_own_5lut = drv != nullptr && drv->type == id_SLICE_LUTX && ci->cluster != ClusterId() &&
++                                           drv->cluster == ci->cluster && drv->constr_z == ((i << 4) | BEL_5LUT) &&
++                                           drv->constr_y == ci->constr_y;
++                if (!from_own_5lut)
++                    ct.carry.x_sigs[i] = di;
++            }
+         } else if (ci->type == id_RAMB18E1_RAMB18E1 || ci->type == id_RAMB36E1_RAMB36E1) {
+             bool read_sdp = ((ci->type == id_RAMB18E1_RAMB18E1 &&
+                               int_or_default(ci->params, ctx->id("READ_WIDTH_B"), 0) == 36) ||
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -162,6 +162,10 @@
+     BelId dsp_cascade_next(BelId bel) const;
+     BelId cascade_next(BelId bel, IdString cascade_out, IdString cascade_in, IdString bel_type) const;
+     bool dsp_cascade_place = false;
++
++    bool carry_di_bypass = false;
++
++    bool lut_pair = false;
+ 
+     // Pips
+     // Lazily-built copy of fasm.cc's pseudo-pip table, so is_pip_unavail can

@@ -1,0 +1,10 @@
+[project]
+name = "blinky_s25"
+top = "blinky_s25"
+board = "arty-s7-25"
+sources = ["src/blinky_s25.v"]
+constraints = ["constraints/blinky_s25.xdc"]
+seed = 1
+
+[clocks]
+clk = 83.333

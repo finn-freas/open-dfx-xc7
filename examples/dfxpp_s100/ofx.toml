@@ -1,0 +1,24 @@
+[project]
+name = "dfxpp_s100"
+top = "dfxpp_s100"
+part = "xc7s100fgga484-1"
+sources = ["src/dfxpp_s100.v"]
+constraints = ["constraints/dfxpp_s100.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0
+
+[dfx]
+partpins = "auto"
+rar = false
+compress = false
+decoupler = false
+
+[[dfx.partition]]
+name = "rp0"
+inst = "u_rm"
+region = "SLICE_X12Y100:SLICE_X15Y149"
+ports = "rm/ports.json"
+register = ["ready"]
+rms = { xor = "rm/rm_core_xor.v", andn = "rm/rm_core_andn.v" }

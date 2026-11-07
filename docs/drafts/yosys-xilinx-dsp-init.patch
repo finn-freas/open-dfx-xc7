@@ -1,0 +1,167 @@
+diff --git a/techlibs/xilinx/xilinx_dsp.cc b/techlibs/xilinx/xilinx_dsp.cc
+index a2ab554e7..963e4c579 100644
+--- a/techlibs/xilinx/xilinx_dsp.cc
++++ b/techlibs/xilinx/xilinx_dsp.cc
+@@ -370,7 +370,7 @@ void xilinx_dsp_pack(xilinx_dsp_pm &pm)
+ 	{
+ 		cell->setPort(ID::CLK, st.clock);
+ 
+-		auto f = [&pm,cell](SigSpec &A, Cell* ff, IdString ceport, IdString rstport) {
++		auto f = [&pm,cell](SigSpec &A, Cell* ff, IdString ceport, IdString rstport, SigSpec absorbed) {
+ 			SigSpec D = ff->getPort(ID::D);
+ 			SigSpec Q = pm.sigmap(ff->getPort(ID::Q));
+ 			if (!A.empty())
+@@ -392,7 +392,7 @@ void xilinx_dsp_pack(xilinx_dsp_pm &pm)
+ 			else
+ 				cell->setPort(ceport, State::S1);
+ 
+-			for (auto c : Q.chunks()) {
++			for (auto c : Q.extract(pm.sigmap(absorbed)).chunks()) {
+ 				auto it = c.wire->attributes.find(ID::init);
+ 				if (it == c.wire->attributes.end())
+ 					continue;
+@@ -405,9 +405,9 @@ void xilinx_dsp_pack(xilinx_dsp_pm &pm)
+ 
+ 		if (st.ffA2) {
+ 			SigSpec A = cell->getPort(ID::A);
+-			f(A, st.ffA2, ID(CEA2), ID(RSTA));
++			f(A, st.ffA2, ID(CEA2), ID(RSTA), A);
+ 			if (st.ffA1) {
+-				f(A, st.ffA1, ID(CEA1), IdString::Null);
++				f(A, st.ffA1, ID(CEA1), IdString::Null, A);
+ 				cell->setParam(ID(AREG), 2);
+ 				cell->setParam(ID(ACASCREG), 2);
+ 			}
+@@ -420,9 +420,9 @@ void xilinx_dsp_pack(xilinx_dsp_pm &pm)
+ 		}
+ 		if (st.ffB2) {
+ 			SigSpec B = cell->getPort(ID::B);
+-			f(B, st.ffB2, ID(CEB2), ID(RSTB));
++			f(B, st.ffB2, ID(CEB2), ID(RSTB), B);
+ 			if (st.ffB1) {
+-				f(B, st.ffB1, ID(CEB1), IdString::Null);
++				f(B, st.ffB1, ID(CEB1), IdString::Null, B);
+ 				cell->setParam(ID(BREG), 2);
+ 				cell->setParam(ID(BCASCREG), 2);
+ 			}
+@@ -435,20 +435,20 @@ void xilinx_dsp_pack(xilinx_dsp_pm &pm)
+ 		}
+ 		if (st.ffD) {
+ 			SigSpec D = cell->getPort(ID::D);
+-			f(D, st.ffD, ID(CED), ID(RSTD));
++			f(D, st.ffD, ID(CED), ID(RSTD), D);
+ 			pm.add_siguser(D, cell);
+ 			cell->setPort(ID::D, D);
+ 			cell->setParam(ID(DREG), 1);
+ 		}
+ 		if (st.ffM) {
+ 			SigSpec M; // unused
+-			f(M, st.ffM, ID(CEM), ID(RSTM));
++			f(M, st.ffM, ID(CEM), ID(RSTM), st.sigM);
+ 			st.ffM->connections_.at(ID::Q).replace(st.sigM, pm.module->addWire(NEW_ID, GetSize(st.sigM)));
+ 			cell->setParam(ID(MREG), State::S1);
+ 		}
+ 		if (st.ffP) {
+ 			SigSpec P; // unused
+-			f(P, st.ffP, ID(CEP), ID(RSTP));
++			f(P, st.ffP, ID(CEP), ID(RSTP), st.sigP);
+ 			st.ffP->connections_.at(ID::Q).replace(st.sigP, pm.module->addWire(NEW_ID, GetSize(st.sigP)));
+ 			cell->setParam(ID(PREG), State::S1);
+ 		}
+@@ -557,7 +557,7 @@ void xilinx_dsp48a_pack(xilinx_dsp48a_pm &pm)
+ 	{
+ 		cell->setPort(ID::CLK, st.clock);
+ 
+-		auto f = [&pm,cell](SigSpec &A, Cell* ff, IdString ceport, IdString rstport) {
++		auto f = [&pm,cell](SigSpec &A, Cell* ff, IdString ceport, IdString rstport, SigSpec absorbed) {
+ 			SigSpec D = ff->getPort(ID::D);
+ 			SigSpec Q = pm.sigmap(ff->getPort(ID::Q));
+ 			if (!A.empty())
+@@ -579,7 +579,7 @@ void xilinx_dsp48a_pack(xilinx_dsp48a_pm &pm)
+ 			else
+ 				cell->setPort(ceport, State::S1);
+ 
+-			for (auto c : Q.chunks()) {
++			for (auto c : Q.extract(pm.sigmap(absorbed)).chunks()) {
+ 				auto it = c.wire->attributes.find(ID::init);
+ 				if (it == c.wire->attributes.end())
+ 					continue;
+@@ -593,11 +593,11 @@ void xilinx_dsp48a_pack(xilinx_dsp48a_pm &pm)
+ 		if (st.ffA0 || st.ffA1) {
+ 			SigSpec A = cell->getPort(ID::A);
+ 			if (st.ffA1) {
+-				f(A, st.ffA1, ID(CEA), ID(RSTA));
++				f(A, st.ffA1, ID(CEA), ID(RSTA), A);
+ 				cell->setParam(ID(A1REG), 1);
+ 			}
+ 			if (st.ffA0) {
+-				f(A, st.ffA0, ID(CEA), ID(RSTA));
++				f(A, st.ffA0, ID(CEA), ID(RSTA), A);
+ 				cell->setParam(ID(A0REG), 1);
+ 			}
+ 			pm.add_siguser(A, cell);
+@@ -606,11 +606,11 @@ void xilinx_dsp48a_pack(xilinx_dsp48a_pm &pm)
+ 		if (st.ffB0 || st.ffB1) {
+ 			SigSpec B = cell->getPort(ID::B);
+ 			if (st.ffB1) {
+-				f(B, st.ffB1, ID(CEB), ID(RSTB));
++				f(B, st.ffB1, ID(CEB), ID(RSTB), B);
+ 				cell->setParam(ID(B1REG), 1);
+ 			}
+ 			if (st.ffB0) {
+-				f(B, st.ffB0, ID(CEB), ID(RSTB));
++				f(B, st.ffB0, ID(CEB), ID(RSTB), B);
+ 				cell->setParam(ID(B0REG), 1);
+ 			}
+ 			pm.add_siguser(B, cell);
+@@ -618,20 +618,20 @@ void xilinx_dsp48a_pack(xilinx_dsp48a_pm &pm)
+ 		}
+ 		if (st.ffD) {
+ 			SigSpec D = cell->getPort(ID::D);
+-			f(D, st.ffD, ID(CED), ID(RSTD));
++			f(D, st.ffD, ID(CED), ID(RSTD), D);
+ 			pm.add_siguser(D, cell);
+ 			cell->setPort(ID::D, D);
+ 			cell->setParam(ID(DREG), 1);
+ 		}
+ 		if (st.ffM) {
+ 			SigSpec M; // unused
+-			f(M, st.ffM, ID(CEM), ID(RSTM));
++			f(M, st.ffM, ID(CEM), ID(RSTM), st.sigM);
+ 			st.ffM->connections_.at(ID::Q).replace(st.sigM, pm.module->addWire(NEW_ID, GetSize(st.sigM)));
+ 			cell->setParam(ID(MREG), State::S1);
+ 		}
+ 		if (st.ffP) {
+ 			SigSpec P; // unused
+-			f(P, st.ffP, ID(CEP), ID(RSTP));
++			f(P, st.ffP, ID(CEP), ID(RSTP), st.sigP);
+ 			st.ffP->connections_.at(ID::Q).replace(st.sigP, pm.module->addWire(NEW_ID, GetSize(st.sigP)));
+ 			cell->setParam(ID(PREG), State::S1);
+ 		}
+@@ -681,7 +681,7 @@ void xilinx_dsp_packC(xilinx_dsp_CREG_pm &pm)
+ 	{
+ 		cell->setPort(ID::CLK, st.clock);
+ 
+-		auto f = [&pm,cell](SigSpec &A, Cell* ff, IdString ceport, IdString rstport) {
++		auto f = [&pm,cell](SigSpec &A, Cell* ff, IdString ceport, IdString rstport, SigSpec absorbed) {
+ 			SigSpec D = ff->getPort(ID::D);
+ 			SigSpec Q = pm.sigmap(ff->getPort(ID::Q));
+ 			if (!A.empty())
+@@ -703,7 +703,7 @@ void xilinx_dsp_packC(xilinx_dsp_CREG_pm &pm)
+ 			else
+ 				cell->setPort(ceport, State::S1);
+ 
+-			for (auto c : Q.chunks()) {
++			for (auto c : Q.extract(pm.sigmap(absorbed)).chunks()) {
+ 				auto it = c.wire->attributes.find(ID::init);
+ 				if (it == c.wire->attributes.end())
+ 					continue;
+@@ -716,7 +716,7 @@ void xilinx_dsp_packC(xilinx_dsp_CREG_pm &pm)
+ 
+ 		if (st.ffC) {
+ 			SigSpec C = cell->getPort(ID::C);
+-			f(C, st.ffC, ID(CEC), ID(RSTC));
++			f(C, st.ffC, ID(CEC), ID(RSTC), C);
+ 			pm.add_siguser(C, cell);
+ 			cell->setPort(ID::C, C);
+ 			cell->setParam(ID(CREG), 1);

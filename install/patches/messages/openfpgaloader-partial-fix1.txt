@@ -1,0 +1,8 @@
+xilinx: check --partial before the SPI flash path
+
+The guard that refuses --partial outside an SRAM load of a 7-series
+device sat in the non-SPI branch of Xilinx::program(), so -f --partial
+went on into program_spi(), which loads the SPI-over-JTAG bridge (a full
+bitstream) through program_mem() and would have done so without
+JPROGRAM.  Check before the mode branch, and free the secondary
+bitstream on that error too.

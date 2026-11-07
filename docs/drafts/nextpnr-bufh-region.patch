@@ -1,0 +1,35 @@
+diff --git a/himbaechel/uarch/xilinx/pack.cc b/himbaechel/uarch/xilinx/pack.cc
+index cdb8d2a0..cb1bc7e9 100644
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -1587,14 +1657,14 @@ void XilinxImpl::pack()
+     apply_pblocks_after_packing();
+ 
+     // Now that LUT-FF clusters exist, keep the sinks of every placed regional
+-    // buffer (BUFIO/BUFR) inside the clock region that buffer drives.  The
++
+     // placer positions a cluster by its root, so the region must land on the
+     // root -- walked inside constrain_regional_clock_sinks -- not on the
+     // pre-cluster FF, which is why this runs after pack_lutffs() rather than
+     // in constrain_bufios() alongside the bel binding.
+     for (auto &cell : ctx->cells) {
+         CellInfo *ci = cell.second.get();
+-        const bool is_regional_buffer = ci->type == id_BUFIO_BUFIO || ci->type == id_BUFR_BUFR;
++        const bool is_regional_buffer = ci->type.in(id_BUFIO_BUFIO, id_BUFR_BUFR, id_BUFHCE_BUFHCE);
+         const bool buffer_is_placed = ci->bel != BelId();
+         if (is_regional_buffer && buffer_is_placed)
+             packer.constrain_regional_clock_sinks(ci);
+diff --git a/himbaechel/uarch/xilinx/pack_clocking.cc b/himbaechel/uarch/xilinx/pack_clocking.cc
+index ec3e9545..5f2b31f4 100644
+--- a/himbaechel/uarch/xilinx/pack_clocking.cc
++++ b/himbaechel/uarch/xilinx/pack_clocking.cc
+@@ -596,7 +596,8 @@ void XilinxImpl::route_clocks()
+                                  (*clk_net->users.begin()).cell->type == id_BUFR_BUFR &&
+                                  (*clk_net->users.begin()).port == id_I;
+         bool is_global = false;
+-        if ((clk_net->driver.cell->type.in(id_BUFGCTRL, id_BUFCE_BUFG_PS, id_BUFCE_BUFCE, id_BUFGCE_DIV_BUFGCE_DIV)) &&
++        if ((clk_net->driver.cell->type.in(id_BUFGCTRL, id_BUFCE_BUFG_PS, id_BUFCE_BUFCE, id_BUFGCE_DIV_BUFGCE_DIV,
++                                           id_BUFHCE_BUFHCE)) &&
+             clk_net->driver.port == id_O)
+             is_global = true;
+         else if (driven_by_bufr)

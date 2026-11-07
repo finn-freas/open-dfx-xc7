@@ -1,0 +1,109 @@
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index 2f60cdab..a93f1040 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -3483,6 +3483,24 @@ struct FasmBackend
+         }
+     }
+ 
++
++
++    void write_xadc()
++    {
++        for (auto &cell : ctx->cells) {
++            CellInfo *ci = cell.second.get();
++            if (ci->bel == BelId() || ci->type.str(ctx) != "XADC_XADC")
++                continue;
++            push(uarch->tile_name(ci->bel.tile));
++            push("XADC");
++            for (int reg = 0x40; reg < 0x60; reg++) {
++                const std::string name = stringf("INIT_%02X", reg);
++                write_int_vector(name + "[15:0]", int_or_default(ci->params, ctx->id(name), 0), 16);
++            }
++            pop(2);
++        }
++    }
++
+     void write_ibufds_gte2(CellInfo * ci)
+     {
+         const std::string tile_name = uarch->tile_name(ci->bel.tile);
+@@ -5617,6 +5635,7 @@ struct FasmBackend
+         populate_bufgctrl_bound_slots(); // must run before any pip emission
+         write_logic();
+         write_cfg();
++        write_xadc();
+         write_io();
+         write_routing();
+         // After write_routing: it is write_pip that fills pips_by_tile, and
+diff --git a/himbaechel/uarch/xilinx/pack.h b/himbaechel/uarch/xilinx/pack.h
+index 21236693..cc883389 100644
+--- a/himbaechel/uarch/xilinx/pack.h
++++ b/himbaechel/uarch/xilinx/pack.h
+@@ -236,6 +236,7 @@ struct XC7Packer : public XilinxPacker
+     void pack_clocking();
+ 
+     // BRAM
++    void untie_xadc_clocks(CellInfo *ci);
+     void pack_bram();
+     void pack_fifos();
+     void constrain_bram_cascades();
+diff --git a/himbaechel/uarch/xilinx/pack_io.cc b/himbaechel/uarch/xilinx/pack_io.cc
+index bdfa7663..4be1eeed 100644
+--- a/himbaechel/uarch/xilinx/pack_io.cc
++++ b/himbaechel/uarch/xilinx/pack_io.cc
+@@ -1481,6 +1481,26 @@ dict<int, BelId> XC7Packer::bscan_bels_by_chain()
+     return by_chain;
+ }
+ 
++
++
++
++void XC7Packer::untie_xadc_clocks(CellInfo *ci)
++{
++    for (IdString pin : {id_DCLK, id_CONVSTCLK}) {
++        const IdString inverted = ctx->idf("IS_%s_INVERTED", pin.c_str(ctx));
++        NetInfo *net = ci->getPort(pin);
++        const bool tied_by_inversion = net != nullptr && net->name == ctx->id("$PACKER_VCC_NET") &&
++                                       bool_or_default(ci->params, inverted, false);
++        if (tied_by_inversion) {
++            ci->disconnectPort(pin);
++            ci->connectPort(pin, ctx->nets.at(ctx->id("$PACKER_GND_NET")).get());
++            ci->params.erase(inverted);
++        }
++        if (bool_or_default(ci->params, inverted, false))
++            log_error("%s: %s inverted is not supported on the XADC\n", ctx->nameOf(ci), pin.c_str(ctx));
++    }
++}
++
+ void XC7Packer::pack_cfg()
+ {
+     log_info("Packing cfg...\n");
+@@ -1493,6 +1513,12 @@ void XC7Packer::pack_cfg()
+     cfg_rules[id_FRAME_ECCE2].new_type = id_FRAME_ECC_FRAME_ECC;
+     cfg_rules[id_STARTUPE2].new_type = id_STARTUP_STARTUP;
+     cfg_rules[id_USR_ACCESSE2].new_type = id_USR_ACCESS_USR_ACCESS;
++
++
++    const bool has_xadc = std::any_of(ctx->cells.begin(), ctx->cells.end(),
++                                      [](const auto &cell) { return cell.second->type == id_XADC; });
++    if (has_xadc)
++        cfg_rules[id_XADC].new_type = ctx->id("XADC_XADC");
+     generic_xform(cfg_rules);
+ 
+     // Read once: which site serves which chain is a property of the device,
+@@ -1531,9 +1557,13 @@ void XC7Packer::pack_cfg()
+         // A BSCAN is not one of them: it is bound to the site its JTAG_CHAIN
+         // selects, above -- leaving it to take any free BSCAN site is the bug
+         // that binding exists to prevent.
++        const bool is_xadc = has_xadc && ci->type == ctx->id("XADC_XADC");
++        if (is_xadc)
++            untie_xadc_clocks(ci);
+         bool is_single_site_config_primitive =
+-                ci->type.in(id_DCIRESET_DCIRESET, id_DNA_PORT_DNA_PORT, id_EFUSE_USR_EFUSE_USR, id_ICAP_ICAP,
+-                            id_FRAME_ECC_FRAME_ECC, id_STARTUP_STARTUP, id_USR_ACCESS_USR_ACCESS);
++                is_xadc || ci->type.in(id_DCIRESET_DCIRESET, id_DNA_PORT_DNA_PORT, id_EFUSE_USR_EFUSE_USR,
++                                       id_ICAP_ICAP, id_FRAME_ECC_FRAME_ECC, id_STARTUP_STARTUP,
++                                       id_USR_ACCESS_USR_ACCESS);
+         if (is_single_site_config_primitive)
+             preplace_unique(ci);
+     }

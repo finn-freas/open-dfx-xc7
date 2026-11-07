@@ -1,0 +1,10 @@
+[project]
+name = "blinky_a50"
+top = "blinky_a50"
+board = "nexys-a7-50t"
+sources = ["src/blinky_a50.v"]
+constraints = ["constraints/blinky_a50.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

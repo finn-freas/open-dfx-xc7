@@ -1,0 +1,10 @@
+[project]
+name = "blinky100"
+top = "blinky100"
+board = "arty-a7-100t"
+sources = ["src/blinky100.v"]
+constraints = ["constraints/blinky100.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

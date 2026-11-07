@@ -1,0 +1,23 @@
+[board]
+name = "Digilent Zybo Z7-10 (programmable logic only)"
+part = "xc7z010clg400-1"
+openfpgaloader_board = "zybo_z7_10"
+iostandard = "LVCMOS33"
+pins_verified = true
+pin_source = "Digilent Zybo-Z7-Master.xdc ('for the Zybo Z7 Rev. B', 'compatible with the Zybo Z7-20 and Zybo Z7-10', github.com/Digilent/digilent-xdc master c8644a9f, sha256 63a84335...d478, read 2026-11-06); part from Digilent vivado-boards master d8d43ed9 new/board_files/zybo-z7-10/A.0/board.xml (sha256 42719beb...fd25)"
+notes = "PL pins only. The PS (ARM cores, DDR, MIO) is not configured by ofx; see docs/ofx.md, Zynq. Digilent's file has no PL pins for the USB-UART, so there is no [uart]. The xc7z010 has slices X0..X43, Y0..Y99."
+
+[clock]
+port = "clk"
+pin = "K17"
+period_ns = 8.0
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "M14"
+"led[1]" = "M15"
+"led[2]" = "G14"
+"led[3]" = "D18"
+
+[dfx]
+example_region = "SLICE_X28Y50:SLICE_X31Y99"

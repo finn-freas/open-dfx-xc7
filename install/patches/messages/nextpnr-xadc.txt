@@ -1,0 +1,7 @@
+xilinx: XADC
+
+Pack XADC onto XADC_XADC, place it on its single site, return a constant
+tie on DCLK/CONVSTCLK to GND, and write INIT_40..INIT_5F.  The rule is
+only made when the design has an XADC.  Needs a chipdb made with
+nextpnr-xilinx-meta's site_type_XADC.json and the prjxray-db
+MONITOR_BOT pseudo-pips and INIT features.

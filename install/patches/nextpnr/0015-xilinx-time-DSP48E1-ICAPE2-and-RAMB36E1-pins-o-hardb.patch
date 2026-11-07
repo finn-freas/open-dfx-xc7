@@ -1,0 +1,1181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: time DSP48E1, ICAPE2 and RAMB36E1 pins (-o
+ hardblock-timing)
+
+The chipdb has no cell timing for DSP48E1 and ICAPE2, so every path into
+or out of them was untimed, and the RAMB36E1 arcs name CLKARDCLK/
+CLKBWRCLK, which a packed RAMB36E1 does not have (it has the L/U
+halves), so its read and address/data setup paths were untimed too.
+
+gen/hardblock_timing.py turns prjxray-db's DSP_L.sdf and
+CFG_CENTER_MID.sdf into hardblock_timing.inc.  With -o hardblock-timing,
+a DSP48E1 gets the SDF rows whose parameter condition it meets, ICAPE2
+its arcs, and a RAMB36E1 arc whose clock is missing moves to the L (or
+U) half.  The chipdb is not changed.  Off by default.
+---
+ himbaechel/uarch/xilinx/CMakeLists.txt        |   2 +
+ .../uarch/xilinx/gen/hardblock_timing.py      |  77 ++
+ himbaechel/uarch/xilinx/hardblock_timing.cc   | 247 ++++++
+ himbaechel/uarch/xilinx/hardblock_timing.inc  | 719 ++++++++++++++++++
+ himbaechel/uarch/xilinx/xilinx.cc             |   7 +-
+ himbaechel/uarch/xilinx/xilinx.h              |  22 +-
+ 6 files changed, 1071 insertions(+), 3 deletions(-)
+ create mode 100644 himbaechel/uarch/xilinx/gen/hardblock_timing.py
+ create mode 100644 himbaechel/uarch/xilinx/hardblock_timing.cc
+ create mode 100644 himbaechel/uarch/xilinx/hardblock_timing.inc
+
+diff --git a/himbaechel/uarch/xilinx/CMakeLists.txt b/himbaechel/uarch/xilinx/CMakeLists.txt
+index 07185b63..a10d35db 100644
+--- a/himbaechel/uarch/xilinx/CMakeLists.txt
++++ b/himbaechel/uarch/xilinx/CMakeLists.txt
+@@ -6,6 +6,8 @@ set(SOURCES
+     delay_matrix.cc
+     extra_data.h
+     fasm.cc
++    hardblock_timing.cc
++    hardblock_timing.inc
+     hold_fix.cc
+     mmcm_tables.cc
+     pack_carry.cc
+diff --git a/himbaechel/uarch/xilinx/gen/hardblock_timing.py b/himbaechel/uarch/xilinx/gen/hardblock_timing.py
+new file mode 100644
+index 00000000..87f472e1
+--- /dev/null
++++ b/himbaechel/uarch/xilinx/gen/hardblock_timing.py
+@@ -0,0 +1,77 @@
++"""
++Writes hardblock_timing.inc: the DSP48E1 and ICAPE2 timing of the prjxray-db
++SDF files as a C++ table for hardblock_timing.cc.
++
++The DSP SDF is conditional: each CELLTYPE names the parameter values under
++which its arcs hold (DSP48E1_AREG_1_MREG_0_..., an empty condition for ICAP),
++and the arcs of every CELLTYPE whose condition a cell meets apply together.
++"""
++import argparse
++from os import path
++
++import parse_sdf
++
++DSP_PARAMS = ["ACASCREG", "ADREG", "ALUMODEREG", "AREG", "A_INPUT", "BCASCREG", "BREG", "B_INPUT", "CARRYINREG",
++              "CARRYINSELREG", "CREG", "DREG", "INMODEREG", "MREG", "OPMODEREG", "PREG", "USE_DPORT", "USE_MULT",
++              "USE_PATTERN_DETECT"]
++
++
++def split_condition(celltype, prefix):
++    rest = celltype[len(prefix):].lstrip("_")
++    conds = []
++    while rest:
++        name = max((p for p in DSP_PARAMS if rest.startswith(p + "_")), key=len, default=None)
++        assert name is not None, f"cannot parse {celltype} at {rest}"
++        rest = rest[len(name) + 1:]
++        value = rest.split("_")[0]
++        if name == "USE_PATTERN_DETECT" and rest.startswith("NO_PATDET"):
++            value = "NO_PATDET"
++        rest = rest[len(value):].lstrip("_")
++        conds.append((name, value))
++    return conds
++
++
++def ps(v):
++    return int(round(v * 1000))
++
++
++def arcs_of(cell):
++    out = []
++    for e in cell.entries:
++        if isinstance(e, parse_sdf.IOPath):
++            lo = min(e.rising.minv, e.falling.minv)
++            hi = max(e.rising.maxv, e.falling.maxv)
++            out.append(("IOPATH", e.from_pin, e.to_pin, ps(lo), ps(hi)))
++        elif isinstance(e, parse_sdf.SetupHoldCheck):
++            out.append(("SETUP", e.pin, e.clock, ps(e.setup.minv), ps(e.setup.maxv)))
++            out.append(("HOLD", e.pin, e.clock, ps(e.hold.minv), ps(e.hold.maxv)))
++    return out
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--xray", required=True, help="prjxray-db family directory, e.g. .../artix7")
++    ap.add_argument("--out", required=True)
++    a = ap.parse_args()
++    rows = []
++    dsp = parse_sdf.parse_sdf_file(path.join(a.xray, "timings", "DSP_L.sdf"))
++    for (celltype, _), cell in sorted(dsp.cells.items()):
++        conds = split_condition(celltype, "DSP48E1")
++        cond = ",".join(f"{k}={v}" for k, v in conds)
++        for kind, frm, to, lo, hi in arcs_of(cell):
++            rows.append(("DSP48E1_DSP48E1", cond, kind, frm, to, lo, hi))
++    cfg = parse_sdf.parse_sdf_file(path.join(a.xray, "timings", "CFG_CENTER_MID.sdf"))
++    for (celltype, _), cell in sorted(cfg.cells.items()):
++        if celltype != "ICAP":
++            continue
++        for kind, frm, to, lo, hi in arcs_of(cell):
++            rows.append(("ICAP_ICAP", "", kind, frm, to, lo, hi))
++    with open(a.out, "w") as f:
++        f.write("// Generated by gen/hardblock_timing.py from the prjxray-db SDF files (DSP_L.sdf, CFG_CENTER_MID.sdf).\n")
++        for r in rows:
++            f.write('{"%s", "%s", HardblockArc::%s, "%s", "%s", %d, %d},\n' % r)
++    print(f"{len(rows)} arcs")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/himbaechel/uarch/xilinx/hardblock_timing.cc b/himbaechel/uarch/xilinx/hardblock_timing.cc
+new file mode 100644
+index 00000000..78eecb89
+--- /dev/null
++++ b/himbaechel/uarch/xilinx/hardblock_timing.cc
+@@ -0,0 +1,247 @@
++/*
++ *  nextpnr -- Next Generation Place and Route
++ *
++ *  Permission to use, copy, modify, and/or distribute this software for any
++ *  purpose with or without fee is hereby granted, provided that the above
++ *  copyright notice and this permission notice appear in all copies.
++ *
++ *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++
++
++
++
++
++
++
++
++#include <cctype>
++
++#include "log.h"
++#include "nextpnr.h"
++#include "util.h"
++#include "xilinx.h"
++
++#define HIMBAECHEL_CONSTIDS "uarch/xilinx/constids.inc"
++#include "himbaechel_constids.h"
++
++NEXTPNR_NAMESPACE_BEGIN
++
++namespace {
++struct HardblockArc
++{
++    enum Kind
++    {
++        IOPATH,
++        SETUP,
++        HOLD
++    };
++    const char *cell_type;
++    const char *cond;
++    Kind kind;
++    const char *from;
++    const char *to;
++    int32_t min_ps, max_ps;
++};
++
++const HardblockArc hardblock_arcs[] = {
++#include "hardblock_timing.inc"
++};
++
++
++const char *dsp_param_default(const std::string &name)
++{
++    static const dict<std::string, const char *> defaults = {
++            {"ACASCREG", "1"},     {"ADREG", "1"},       {"ALUMODEREG", "1"},        {"AREG", "1"},
++            {"A_INPUT", "DIRECT"}, {"BCASCREG", "1"},    {"BREG", "1"},              {"B_INPUT", "DIRECT"},
++            {"CARRYINREG", "1"},   {"CARRYINSELREG", "1"}, {"CREG", "1"},            {"DREG", "1"},
++            {"INMODEREG", "1"},    {"MREG", "1"},        {"OPMODEREG", "1"},         {"PREG", "1"},
++            {"USE_DPORT", "FALSE"}, {"USE_MULT", "MULTIPLY"}, {"USE_PATTERN_DETECT", "NO_PATDET"},
++    };
++    auto found = defaults.find(name);
++    return found == defaults.end() ? "" : found->second;
++}
++
++bool param_matches(Context *ctx, const CellInfo *ci, const std::string &name, const std::string &value)
++{
++    const char *def = dsp_param_default(name);
++    bool numeric = !value.empty() && std::isdigit(static_cast<unsigned char>(value[0]));
++    if (numeric)
++        return int_or_default(ci->params, ctx->id(name), std::atoi(def)) == std::atoi(value.c_str());
++    return str_or_default(ci->params, ctx->id(name), def) == value;
++}
++
++bool cond_holds(Context *ctx, const CellInfo *ci, const char *cond)
++{
++    std::string c(cond);
++    size_t pos = 0;
++    while (pos < c.size()) {
++        size_t comma = c.find(',', pos);
++        std::string term = c.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
++        size_t eq = term.find('=');
++        NPNR_ASSERT(eq != std::string::npos);
++        if (!param_matches(ctx, ci, term.substr(0, eq), term.substr(eq + 1)))
++            return false;
++        if (comma == std::string::npos)
++            break;
++        pos = comma + 1;
++    }
++    return true;
++}
++
++void widen(dict<IdString, DelayPair> &m, IdString key, DelayPair d)
++{
++    auto found = m.find(key);
++    if (found == m.end()) {
++        m.emplace(key, d);
++        return;
++    }
++    found->second.min_delay = std::min(found->second.min_delay, d.min_delay);
++    found->second.max_delay = std::max(found->second.max_delay, d.max_delay);
++}
++}
++
++
++
++
++
++IdString XilinxImpl::ramb36_clock_half(const CellInfo *cell, IdString port, IdString clock) const
++{
++    const std::string &p = port.str(ctx);
++    IdString upper = ctx->id(clock.str(ctx) + "U"), lower = ctx->id(clock.str(ctx) + "L");
++    if (!p.empty() && p.back() == 'U' && cell->ports.count(upper))
++        return upper;
++    return cell->ports.count(lower) ? lower : clock;
++}
++
++IdString XilinxImpl::hardblock_bus(IdString port) const
++{
++    if (port.in(id_CEA1, id_CEA2, id_CEB1, id_CEB2))
++        return port;
++    const std::string &s = port.str(ctx);
++    size_t end = s.size();
++    while (end > 0 && std::isdigit(static_cast<unsigned char>(s[end - 1])))
++        end--;
++    return end == s.size() ? port : ctx->id(s.substr(0, end));
++}
++
++void XilinxImpl::init_hardblock_timing()
++{
++    hardblock_timing.clear();
++    hardblock_timing_on = ctx->args.options.count("hardblock-timing");
++    if (!hardblock_timing_on)
++        return;
++    int cells = 0;
++    for (auto &cell : ctx->cells) {
++        CellInfo *ci = cell.second.get();
++        if (!ci->type.in(id_DSP48E1_DSP48E1, id_ICAP_ICAP))
++            continue;
++        HardblockTiming t;
++        const std::string &type = ci->type.str(ctx);
++        for (const auto &arc : hardblock_arcs) {
++            if (type != arc.cell_type || !cond_holds(ctx, ci, arc.cond))
++                continue;
++            DelayPair d(ctx->getDelayFromNS(arc.min_ps / 1000.0), ctx->getDelayFromNS(arc.max_ps / 1000.0));
++            IdString from = ctx->id(arc.from), to = ctx->id(arc.to);
++            if (arc.kind == HardblockArc::SETUP)
++                widen(t.setup, from, d);
++            else if (arc.kind == HardblockArc::HOLD)
++                widen(t.hold, from, d);
++            else if (from == id_CLK)
++                widen(t.clk_q, to, d);
++            else {
++                auto key = std::make_pair(from, to);
++                auto found = t.comb.find(key);
++                if (found == t.comb.end())
++                    t.comb.emplace(key, d);
++                else
++                    found->second = DelayPair(std::min(found->second.min_delay, d.min_delay),
++                                              std::max(found->second.max_delay, d.max_delay));
++            }
++        }
++        for (auto &c : t.comb) {
++            t.comb_in.insert(c.first.first);
++            t.comb_out.insert(c.first.second);
++        }
++        hardblock_timing.emplace(ci->name, std::move(t));
++        cells++;
++    }
++    log_info("hardblock-timing: SDF timing on %d DSP48E1/ICAPE2 cell(s)\n", cells);
++}
++
++const XilinxImpl::HardblockTiming *XilinxImpl::hardblock_timing_of(const CellInfo *cell) const
++{
++    if (hardblock_timing.empty())
++        return nullptr;
++    auto found = hardblock_timing.find(cell->name);
++    return found == hardblock_timing.end() ? nullptr : &found->second;
++}
++
++bool XilinxImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
++{
++    const HardblockTiming *t = hardblock_timing_of(cell);
++    if (t == nullptr)
++        return buffer_cell_delay(cell, fromPort, toPort, delay);
++    auto found = t->comb.find(std::make_pair(hardblock_bus(fromPort), hardblock_bus(toPort)));
++    if (found == t->comb.end())
++        return false;
++    delay = DelayQuad(found->second.min_delay, found->second.max_delay);
++    return true;
++}
++
++TimingPortClass XilinxImpl::getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const
++{
++    const HardblockTiming *t = hardblock_timing_of(cell);
++    if (t == nullptr)
++        return ctx->get_port_timing_class_default(cell, port, clockInfoCount);
++    clockInfoCount = 0;
++    IdString bus = hardblock_bus(port);
++    if (bus == id_CLK)
++        return TMG_CLOCK_INPUT;
++    if (cell->ports.at(port).type == PORT_IN) {
++        if (t->setup.count(bus)) {
++            clockInfoCount = 1;
++            return TMG_REGISTER_INPUT;
++        }
++        return t->comb_in.count(bus) ? TMG_COMB_INPUT : TMG_IGNORE;
++    }
++    if (t->clk_q.count(bus)) {
++        clockInfoCount = 1;
++        return TMG_REGISTER_OUTPUT;
++    }
++    return t->comb_out.count(bus) ? TMG_COMB_OUTPUT : TMG_IGNORE;
++}
++
++TimingClockingInfo XilinxImpl::getPortClockingInfo(const CellInfo *cell, IdString port, int index) const
++{
++    const HardblockTiming *t = hardblock_timing_of(cell);
++    if (t == nullptr) {
++        TimingClockingInfo info = ctx->get_port_clocking_info_default(cell, port, index);
++        if (hardblock_timing_on && cell->type == id_RAMB36E1_RAMB36E1 && !cell->ports.count(info.clock_port))
++            info.clock_port = ramb36_clock_half(cell, port, info.clock_port);
++        return info;
++    }
++    TimingClockingInfo info;
++    IdString bus = hardblock_bus(port);
++    info.clock_port = id_CLK;
++    info.edge = RISING_EDGE;
++    auto s = t->setup.find(bus);
++    if (s != t->setup.end()) {
++        info.setup = s->second;
++        auto h = t->hold.find(bus);
++        info.hold = h == t->hold.end() ? DelayPair(0) : h->second;
++    }
++    auto q = t->clk_q.find(bus);
++    if (q != t->clk_q.end())
++        info.clockToQ = DelayQuad(q->second.min_delay, q->second.max_delay);
++    return info;
++}
++
++NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/hardblock_timing.inc b/himbaechel/uarch/xilinx/hardblock_timing.inc
+new file mode 100644
+index 00000000..b79af17e
+--- /dev/null
++++ b/himbaechel/uarch/xilinx/hardblock_timing.inc
+@@ -0,0 +1,719 @@
++
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 705, 5650},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 688, 5297},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 700, 5279},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 696, 5320},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 736, 5885},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 736, 5885},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 717, 5515},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 705, 5650},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 688, 5297},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 700, 5279},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 696, 5320},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 736, 5885},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 736, 5885},
++{"DSP48E1_DSP48E1", "DREG=1,ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 717, 5515},
++{"DSP48E1_DSP48E1", "ACASCREG=0,A_INPUT=CASCADE", HardblockArc::IOPATH, "ACIN", "ACOUT", 132, 521},
++{"DSP48E1_DSP48E1", "ACASCREG=0,A_INPUT=DIRECT", HardblockArc::IOPATH, "A", "ACOUT", 219, 723},
++{"DSP48E1_DSP48E1", "ACASCREG=1,AREG=1", HardblockArc::IOPATH, "CLK", "ACOUT", 493, 864},
++{"DSP48E1_DSP48E1", "ACASCREG=2,AREG=2", HardblockArc::IOPATH, "CLK", "ACOUT", 493, 864},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "CARRYCASCOUT", 328, 5329},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "CARRYOUT", 313, 4975},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "MULTSIGNOUT", 324, 4958},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "P", 320, 4998},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "PATTERNBDETECT", 360, 5564},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "PATTERNDETECT", 360, 5564},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "PCOUT", 341, 5194},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "CARRYCASCOUT", 565, 5329},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "CARRYOUT", 550, 4975},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "MULTSIGNOUT", 562, 4958},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "P", 556, 4998},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "PATTERNBDETECT", 598, 5564},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "PATTERNDETECT", 598, 5564},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "PCOUT", 579, 5194},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "ACIN", "CLK", 401, 4881},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "ACIN", "CLK", -4881, -401},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "ACIN", "CLK", 471, 5272},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "ACIN", "CLK", -5272, -471},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "ACIN", "CLK", 977, 4881},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "ACIN", "CLK", -4881, -977},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "ACIN", "CLK", 1047, 5272},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "ACIN", "CLK", -5272, -1047},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::SETUP, "ACIN", "CLK", 232, 3087},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::HOLD, "ACIN", "CLK", -3087, -232},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::SETUP, "ACIN", "CLK", 232, 3087},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=CASCADE,MREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::HOLD, "ACIN", "CLK", -3087, -232},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "CARRYCASCOUT", 414, 5531},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "CARRYOUT", 397, 5177},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "MULTSIGNOUT", 410, 5159},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "P", 404, 5201},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "PATTERNBDETECT", 445, 5767},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "PATTERNDETECT", 445, 5767},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "PCOUT", 426, 5396},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "CARRYCASCOUT", 653, 5531},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "CARRYOUT", 637, 5177},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "MULTSIGNOUT", 649, 5159},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "P", 643, 5201},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "PATTERNBDETECT", 685, 5767},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "PATTERNDETECT", 685, 5767},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "PCOUT", 666, 5396},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "A", "CLK", 558, 5081},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "A", "CLK", -5081, -558},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "A", "CLK", 627, 5474},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "A", "CLK", -5474, -627},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "A", "CLK", 1134, 5081},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "A", "CLK", -5081, -1134},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "A", "CLK", 1203, 5474},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "A", "CLK", -5474, -1203},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::SETUP, "A", "CLK", 388, 3288},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::HOLD, "A", "CLK", -3288, -388},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::SETUP, "A", "CLK", 388, 3288},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=0,A_INPUT=DIRECT,MREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::HOLD, "A", "CLK", -3288, -388},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 498, 5700},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 483, 5346},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 493, 5329},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 490, 5368},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 530, 5934},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 530, 5934},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 511, 5565},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 718, 5700},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 703, 5346},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 713, 5329},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 709, 5368},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 750, 5934},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 750, 5934},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 731, 5565},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 498, 5700},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 483, 5346},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 493, 5329},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 490, 5368},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 530, 5934},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 530, 5934},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 511, 5565},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 718, 5700},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 703, 5346},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 713, 5329},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 709, 5368},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 750, 5934},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 750, 5934},
++{"DSP48E1_DSP48E1", "ADREG=0,AREG=2,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 731, 5565},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "D", "CARRYCASCOUT", 596, 5400},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "D", "CARRYOUT", 580, 5046},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "D", "MULTSIGNOUT", 592, 5029},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "D", "P", 587, 5070},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "D", "PATTERNBDETECT", 628, 5636},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "D", "PATTERNDETECT", 628, 5636},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "D", "PCOUT", 580, 5046},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "D", "CARRYCASCOUT", 596, 5400},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "D", "CARRYOUT", 580, 5046},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "D", "MULTSIGNOUT", 592, 5029},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "D", "P", 587, 5070},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "D", "PATTERNBDETECT", 628, 5636},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "D", "PATTERNDETECT", 628, 5636},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "D", "PCOUT", 580, 5046},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "D", "CLK", 994, 4951},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "D", "CLK", -4951, -994},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "D", "CLK", 1063, 5342},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "D", "CLK", -5342, -1063},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "D", "CLK", 994, 4951},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "D", "CLK", -4951, -994},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "D", "CLK", 1063, 5342},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "D", "CLK", -5342, -1063},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::SETUP, "D", "CLK", 249, 3158},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::HOLD, "D", "CLK", -3158, -249},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::SETUP, "D", "CLK", 249, 3158},
++{"DSP48E1_DSP48E1", "ADREG=0,DREG=0,MREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::HOLD, "D", "CLK", -3158, -249},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "CARRYCASCOUT", 589, 5615},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "CARRYOUT", 573, 5261},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "MULTSIGNOUT", 586, 5243},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "P", 580, 5283},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PATTERNBDETECT", 621, 5849},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PATTERNDETECT", 621, 5849},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PCOUT", 602, 5480},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "CARRYCASCOUT", 589, 5615},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "CARRYOUT", 573, 5261},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "MULTSIGNOUT", 586, 5243},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "P", 580, 5283},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PATTERNBDETECT", 621, 5849},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PATTERNDETECT", 621, 5849},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PCOUT", 602, 5480},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "INMODE", "CLK", 980, 5165},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "INMODE", "CLK", -5165, -980},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "INMODE", "CLK", 1049, 5557},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "INMODE", "CLK", -5557, -1049},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "INMODE", "CLK", 980, 5165},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "INMODE", "CLK", -5165, -980},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "INMODE", "CLK", 1049, 5557},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=0,PREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "INMODE", "CLK", -5557, -1049},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::SETUP, "INMODE", "CLK", 236, 3372},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=1,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::HOLD, "INMODE", "CLK", -3372, -236},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::SETUP, "INMODE", "CLK", 236, 3372},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=0,MREG=1,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::HOLD, "INMODE", "CLK", -3372, -236},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 676, 5801},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 660, 5448},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 672, 5429},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 667, 5470},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 708, 6035},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 708, 6035},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 688, 5666},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 676, 5801},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 660, 5448},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 672, 5429},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 667, 5470},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 708, 6035},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 708, 6035},
++{"DSP48E1_DSP48E1", "ADREG=0,INMODEREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 688, 5666},
++{"DSP48E1_DSP48E1", "ADREG=1", HardblockArc::SETUP, "CEAD", "CLK", 38, 426},
++{"DSP48E1_DSP48E1", "ADREG=1", HardblockArc::HOLD, "CEAD", "CLK", -426, -38},
++{"DSP48E1_DSP48E1", "ADREG=1", HardblockArc::SETUP, "RSTD", "CLK", -83, 589},
++{"DSP48E1_DSP48E1", "ADREG=1", HardblockArc::HOLD, "RSTD", "CLK", -589, 83},
++{"DSP48E1_DSP48E1", "ADREG=1,AREG=0,A_INPUT=CASCADE", HardblockArc::SETUP, "ACIN", "CLK", 34, 1555},
++{"DSP48E1_DSP48E1", "ADREG=1,AREG=0,A_INPUT=CASCADE", HardblockArc::HOLD, "ACIN", "CLK", -1555, -34},
++{"DSP48E1_DSP48E1", "ADREG=1,AREG=0,A_INPUT=DIRECT", HardblockArc::SETUP, "A", "CLK", 191, 1756},
++{"DSP48E1_DSP48E1", "ADREG=1,AREG=0,A_INPUT=DIRECT", HardblockArc::HOLD, "A", "CLK", -1756, -191},
++{"DSP48E1_DSP48E1", "ADREG=1,DREG=0", HardblockArc::SETUP, "D", "CLK", 51, 1626},
++{"DSP48E1_DSP48E1", "ADREG=1,DREG=0", HardblockArc::HOLD, "D", "CLK", -1626, -51},
++{"DSP48E1_DSP48E1", "ADREG=1,INMODEREG=0", HardblockArc::SETUP, "INMODE", "CLK", 36, 2089},
++{"DSP48E1_DSP48E1", "ADREG=1,INMODEREG=0", HardblockArc::HOLD, "INMODE", "CLK", -2089, -36},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 581, 4014},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 565, 3661},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 578, 3643},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 572, 3684},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 612, 4249},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 612, 4249},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 593, 3879},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 581, 4014},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 565, 3661},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 578, 3643},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 572, 3684},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 612, 4249},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 612, 4249},
++{"DSP48E1_DSP48E1", "ADREG=1,MREG=0,PREG=0,USE_DPORT=TRUE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 593, 3879},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=0", HardblockArc::IOPATH, "ALUMODE", "CARRYCASCOUT", 417, 2427},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=0", HardblockArc::IOPATH, "ALUMODE", "CARRYOUT", 401, 2074},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=0", HardblockArc::IOPATH, "ALUMODE", "MULTSIGNOUT", 413, 2055},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=0", HardblockArc::IOPATH, "ALUMODE", "P", 407, 2098},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=0", HardblockArc::IOPATH, "ALUMODE", "PATTERNBDETECT", 395, 2423},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=0", HardblockArc::IOPATH, "ALUMODE", "PATTERNDETECT", 395, 2423},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=0", HardblockArc::IOPATH, "ALUMODE", "PCOUT", 429, 2292},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "ALUMODE", "CLK", 566, 1978},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "ALUMODE", "CLK", -1978, -566},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "ALUMODE", "CLK", 635, 2369},
++{"DSP48E1_DSP48E1", "ALUMODEREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "ALUMODE", "CLK", -2369, -635},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1", HardblockArc::SETUP, "ALUMODE", "CLK", -208, 246},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1", HardblockArc::HOLD, "ALUMODE", "CLK", -246, 208},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1", HardblockArc::SETUP, "CEALUMODE", "CLK", -121, 411},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1", HardblockArc::HOLD, "CEALUMODE", "CLK", -411, 121},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1", HardblockArc::SETUP, "RSTALUMODE", "CLK", -74, 411},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1", HardblockArc::HOLD, "RSTALUMODE", "CLK", -411, 74},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 473, 2385},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYOUT", 458, 2031},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 470, 2013},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "P", 465, 2054},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 506, 2620},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 506, 2620},
++{"DSP48E1_DSP48E1", "ALUMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PCOUT", 486, 2251},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "CARRYCASCOUT", 328, 3969},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "CARRYOUT", 313, 3615},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "MULTSIGNOUT", 324, 3598},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "P", 320, 3639},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "PATTERNBDETECT", 360, 4205},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "PATTERNDETECT", 360, 4205},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "ACIN", "PCOUT", 341, 3833},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "CARRYCASCOUT", 531, 3969},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "CARRYOUT", 516, 3615},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "MULTSIGNOUT", 527, 3598},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "P", 521, 3639},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "PATTERNBDETECT", 563, 4205},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "PATTERNDETECT", 563, 4205},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "ACIN", "PCOUT", 543, 3833},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "ACIN", "CLK", 401, 3520},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "ACIN", "CLK", -3520, -401},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "ACIN", "CLK", 471, 3912},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "ACIN", "CLK", -3912, -471},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "ACIN", "CLK", 883, 3520},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "ACIN", "CLK", -3520, -883},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "ACIN", "CLK", 952, 3912},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "ACIN", "CLK", -3912, -952},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::SETUP, "ACIN", "CLK", 138, 1727},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::HOLD, "ACIN", "CLK", -1727, -138},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::SETUP, "ACIN", "CLK", 138, 1727},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,MREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::HOLD, "ACIN", "CLK", -1727, -138},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "ACIN", "CARRYCASCOUT", 328, 2205},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "ACIN", "CARRYOUT", 313, 1852},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "ACIN", "MULTSIGNOUT", 324, 1834},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "ACIN", "P", 320, 1874},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "ACIN", "PATTERNBDETECT", 360, 2440},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "ACIN", "PATTERNDETECT", 360, 2440},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "ACIN", "PCOUT", 341, 2071},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "ACIN", "CLK", 401, 1755},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "ACIN", "CLK", -1755, -401},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "ACIN", "CLK", 471, 2148},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=CASCADE,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "ACIN", "CLK", -2148, -471},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "CARRYCASCOUT", 414, 4171},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "CARRYOUT", 397, 3818},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "MULTSIGNOUT", 410, 3799},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "P", 404, 3841},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "PATTERNBDETECT", 445, 4406},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "PATTERNDETECT", 445, 4406},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "A", "PCOUT", 426, 4036},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "CARRYCASCOUT", 618, 4171},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "CARRYOUT", 603, 3818},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "MULTSIGNOUT", 614, 3799},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "P", 609, 3841},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "PATTERNBDETECT", 650, 4406},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "PATTERNDETECT", 650, 4406},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "A", "PCOUT", 631, 4036},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "A", "CLK", 558, 3722},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "A", "CLK", -3722, -558},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "A", "CLK", 627, 4114},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "A", "CLK", -4114, -627},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "A", "CLK", 1040, 3722},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "A", "CLK", -3722, -1040},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "A", "CLK", 1109, 4114},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "A", "CLK", -4114, -1109},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::SETUP, "A", "CLK", 294, 1928},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::HOLD, "A", "CLK", -1928, -294},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::SETUP, "A", "CLK", 294, 1928},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,MREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::HOLD, "A", "CLK", -1928, -294},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "A", "CARRYCASCOUT", 414, 2407},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "A", "CARRYOUT", 397, 2053},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "A", "MULTSIGNOUT", 410, 2036},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "A", "P", 404, 2077},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "A", "PATTERNBDETECT", 445, 2643},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "A", "PATTERNDETECT", 445, 2643},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "A", "PCOUT", 426, 2271},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "A", "CLK", 558, 1958},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "A", "CLK", -1958, -558},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "A", "CLK", 627, 2349},
++{"DSP48E1_DSP48E1", "AREG=0,A_INPUT=DIRECT,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "A", "CLK", -2349, -627},
++{"DSP48E1_DSP48E1", "AREG=1", HardblockArc::SETUP, "CEA1", "CLK", -35, 497},
++{"DSP48E1_DSP48E1", "AREG=1", HardblockArc::HOLD, "CEA1", "CLK", -497, 35},
++{"DSP48E1_DSP48E1", "AREG=1", HardblockArc::SETUP, "CEA2", "CLK", -35, 497},
++{"DSP48E1_DSP48E1", "AREG=1", HardblockArc::HOLD, "CEA2", "CLK", -497, 35},
++{"DSP48E1_DSP48E1", "AREG=1", HardblockArc::SETUP, "RSTA", "CLK", -112, 507},
++{"DSP48E1_DSP48E1", "AREG=1", HardblockArc::HOLD, "RSTA", "CLK", -507, 112},
++{"DSP48E1_DSP48E1", "AREG=1,A_INPUT=CASCADE", HardblockArc::SETUP, "ACIN", "CLK", -139, 319},
++{"DSP48E1_DSP48E1", "AREG=1,A_INPUT=CASCADE", HardblockArc::HOLD, "ACIN", "CLK", -319, 139},
++{"DSP48E1_DSP48E1", "AREG=1,A_INPUT=DIRECT", HardblockArc::SETUP, "A", "CLK", -139, 362},
++{"DSP48E1_DSP48E1", "AREG=1,A_INPUT=DIRECT", HardblockArc::HOLD, "A", "CLK", -362, 139},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 498, 4339},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 483, 3986},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 493, 3969},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 490, 4009},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 530, 4575},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 530, 4575},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 511, 4206},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 684, 4339},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 667, 3986},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 680, 3969},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 674, 4009},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 715, 4575},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 715, 4575},
++{"DSP48E1_DSP48E1", "AREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 696, 4206},
++{"DSP48E1_DSP48E1", "AREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 498, 2545},
++{"DSP48E1_DSP48E1", "AREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "CARRYOUT", 483, 2191},
++{"DSP48E1_DSP48E1", "AREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 493, 2175},
++{"DSP48E1_DSP48E1", "AREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "P", 490, 2215},
++{"DSP48E1_DSP48E1", "AREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 530, 2781},
++{"DSP48E1_DSP48E1", "AREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 530, 2781},
++{"DSP48E1_DSP48E1", "AREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PCOUT", 511, 2411},
++{"DSP48E1_DSP48E1", "AREG=2", HardblockArc::SETUP, "CEA1", "CLK", -35, 497},
++{"DSP48E1_DSP48E1", "AREG=2", HardblockArc::HOLD, "CEA1", "CLK", -497, 35},
++{"DSP48E1_DSP48E1", "AREG=2", HardblockArc::SETUP, "CEA2", "CLK", -35, 497},
++{"DSP48E1_DSP48E1", "AREG=2", HardblockArc::HOLD, "CEA2", "CLK", -497, 35},
++{"DSP48E1_DSP48E1", "AREG=2", HardblockArc::SETUP, "RSTA", "CLK", -112, 507},
++{"DSP48E1_DSP48E1", "AREG=2", HardblockArc::HOLD, "RSTA", "CLK", -507, 112},
++{"DSP48E1_DSP48E1", "AREG=2,A_INPUT=CASCADE", HardblockArc::SETUP, "ACIN", "CLK", -139, 319},
++{"DSP48E1_DSP48E1", "AREG=2,A_INPUT=CASCADE", HardblockArc::HOLD, "ACIN", "CLK", -319, 139},
++{"DSP48E1_DSP48E1", "AREG=2,A_INPUT=DIRECT", HardblockArc::SETUP, "A", "CLK", -139, 362},
++{"DSP48E1_DSP48E1", "AREG=2,A_INPUT=DIRECT", HardblockArc::HOLD, "A", "CLK", -362, 139},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 498, 4339},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 483, 3986},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 493, 3969},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 490, 4009},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 530, 4575},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 530, 4575},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 511, 4206},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 684, 4339},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 667, 3986},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 680, 3969},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 674, 4009},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 715, 4575},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 715, 4575},
++{"DSP48E1_DSP48E1", "AREG=2,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 696, 4206},
++{"DSP48E1_DSP48E1", "AREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 498, 2545},
++{"DSP48E1_DSP48E1", "AREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "CARRYOUT", 483, 2191},
++{"DSP48E1_DSP48E1", "AREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 493, 2175},
++{"DSP48E1_DSP48E1", "AREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "P", 490, 2215},
++{"DSP48E1_DSP48E1", "AREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 530, 2781},
++{"DSP48E1_DSP48E1", "AREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 530, 2781},
++{"DSP48E1_DSP48E1", "AREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PCOUT", 511, 2411},
++{"DSP48E1_DSP48E1", "BCASCREG=0,B_INPUT=CASCADE", HardblockArc::IOPATH, "BCIN", "BCOUT", 146, 490},
++{"DSP48E1_DSP48E1", "BCASCREG=0,B_INPUT=DIRECT", HardblockArc::IOPATH, "B", "BCOUT", 235, 735},
++{"DSP48E1_DSP48E1", "BCASCREG=1,BREG=1", HardblockArc::IOPATH, "CLK", "BCOUT", 505, 833},
++{"DSP48E1_DSP48E1", "BCASCREG=2,BREG=2", HardblockArc::IOPATH, "CLK", "BCOUT", 505, 833},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "BCIN", "CARRYCASCOUT", 325, 3741},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "BCIN", "CARRYOUT", 309, 3387},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "BCIN", "MULTSIGNOUT", 322, 3369},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "BCIN", "P", 316, 3410},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "BCIN", "PATTERNBDETECT", 358, 3976},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "BCIN", "PATTERNDETECT", 358, 3976},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "BCIN", "PCOUT", 339, 3606},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "BCIN", "CARRYCASCOUT", 491, 3741},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "BCIN", "CARRYOUT", 476, 3387},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "BCIN", "MULTSIGNOUT", 487, 3369},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "BCIN", "P", 481, 3410},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "BCIN", "PATTERNBDETECT", 523, 3976},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "BCIN", "PATTERNDETECT", 523, 3976},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "BCIN", "PCOUT", 504, 3606},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=1,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "BCIN", "CLK", 399, 3290},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=1,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "BCIN", "CLK", -3290, -399},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=1,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "BCIN", "CLK", 468, 3684},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=1,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "BCIN", "CLK", -3684, -468},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=1,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "BCIN", "CLK", 794, 3290},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=1,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "BCIN", "CLK", -3290, -794},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=1,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "BCIN", "CLK", 863, 3684},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=0,PREG=1,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "BCIN", "CLK", -3684, -863},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=1,USE_MULT=DYNAMIC", HardblockArc::SETUP, "BCIN", "CLK", 49, 1498},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=1,USE_MULT=DYNAMIC", HardblockArc::HOLD, "BCIN", "CLK", -1498, -49},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=1,USE_MULT=MULTIPLY", HardblockArc::SETUP, "BCIN", "CLK", 49, 1498},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,MREG=1,USE_MULT=MULTIPLY", HardblockArc::HOLD, "BCIN", "CLK", -1498, -49},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "BCIN", "CARRYCASCOUT", 325, 2141},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "BCIN", "CARRYOUT", 309, 1788},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "BCIN", "MULTSIGNOUT", 322, 1771},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "BCIN", "P", 316, 1812},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "BCIN", "PATTERNBDETECT", 358, 2377},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "BCIN", "PATTERNDETECT", 358, 2377},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "BCIN", "PCOUT", 339, 2006},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "BCIN", "CLK", 399, 1692},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "BCIN", "CLK", -1692, -399},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "BCIN", "CLK", 468, 2085},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=CASCADE,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "BCIN", "CLK", -2085, -468},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "B", "CARRYCASCOUT", 415, 3986},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "B", "CARRYOUT", 400, 3633},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "B", "MULTSIGNOUT", 411, 3615},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "B", "P", 405, 3656},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "B", "PATTERNBDETECT", 447, 4221},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "B", "PATTERNDETECT", 447, 4221},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "B", "PCOUT", 428, 3851},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "B", "CARRYCASCOUT", 580, 3986},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "B", "CARRYOUT", 565, 3633},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "B", "MULTSIGNOUT", 577, 3615},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "B", "P", 571, 3656},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "B", "PATTERNBDETECT", 612, 4221},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "B", "PATTERNDETECT", 612, 4221},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "B", "PCOUT", 593, 3851},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=1,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "B", "CLK", 564, 3536},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=1,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "B", "CLK", -3536, -564},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=1,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "B", "CLK", 633, 3929},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=1,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "B", "CLK", -3929, -633},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=1,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "B", "CLK", 959, 3536},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=1,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "B", "CLK", -3536, -959},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=1,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "B", "CLK", 1028, 3929},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=0,PREG=1,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "B", "CLK", -3929, -1028},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=1,USE_MULT=DYNAMIC", HardblockArc::SETUP, "B", "CLK", 214, 1743},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=1,USE_MULT=DYNAMIC", HardblockArc::HOLD, "B", "CLK", -1743, -214},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=1,USE_MULT=MULTIPLY", HardblockArc::SETUP, "B", "CLK", 214, 1743},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,MREG=1,USE_MULT=MULTIPLY", HardblockArc::HOLD, "B", "CLK", -1743, -214},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "B", "CARRYCASCOUT", 415, 2387},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "B", "CARRYOUT", 400, 2033},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "B", "MULTSIGNOUT", 411, 2017},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "B", "P", 405, 2057},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "B", "PATTERNBDETECT", 447, 2623},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "B", "PATTERNDETECT", 447, 2623},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "B", "PCOUT", 428, 2252},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "B", "CLK", 564, 1938},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "B", "CLK", -1938, -564},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "B", "CLK", 633, 2331},
++{"DSP48E1_DSP48E1", "BREG=0,B_INPUT=DIRECT,PREG=1,USE_MULT=NONE,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "B", "CLK", -2331, -633},
++{"DSP48E1_DSP48E1", "BREG=1", HardblockArc::SETUP, "CEB1", "CLK", -102, 514},
++{"DSP48E1_DSP48E1", "BREG=1", HardblockArc::HOLD, "CEB1", "CLK", -514, 102},
++{"DSP48E1_DSP48E1", "BREG=1", HardblockArc::SETUP, "CEB2", "CLK", -102, 514},
++{"DSP48E1_DSP48E1", "BREG=1", HardblockArc::HOLD, "CEB2", "CLK", -514, 102},
++{"DSP48E1_DSP48E1", "BREG=1", HardblockArc::SETUP, "RSTB", "CLK", -144, 543},
++{"DSP48E1_DSP48E1", "BREG=1", HardblockArc::HOLD, "RSTB", "CLK", -543, 144},
++{"DSP48E1_DSP48E1", "BREG=1,B_INPUT=CASCADE", HardblockArc::SETUP, "BCIN", "CLK", -178, 352},
++{"DSP48E1_DSP48E1", "BREG=1,B_INPUT=CASCADE", HardblockArc::HOLD, "BCIN", "CLK", -352, 178},
++{"DSP48E1_DSP48E1", "BREG=1,B_INPUT=DIRECT", HardblockArc::SETUP, "B", "CLK", -178, 450},
++{"DSP48E1_DSP48E1", "BREG=1,B_INPUT=DIRECT", HardblockArc::HOLD, "B", "CLK", -450, 178},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 496, 4143},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 481, 3790},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 492, 3772},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 487, 3813},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 529, 4378},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 529, 4378},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 510, 4008},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 639, 4143},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 623, 3790},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 635, 3772},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 630, 3813},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 671, 4378},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 671, 4378},
++{"DSP48E1_DSP48E1", "BREG=1,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 651, 4008},
++{"DSP48E1_DSP48E1", "BREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 496, 2522},
++{"DSP48E1_DSP48E1", "BREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "CARRYOUT", 481, 2168},
++{"DSP48E1_DSP48E1", "BREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 492, 2150},
++{"DSP48E1_DSP48E1", "BREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "P", 487, 2191},
++{"DSP48E1_DSP48E1", "BREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 529, 2756},
++{"DSP48E1_DSP48E1", "BREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 529, 2756},
++{"DSP48E1_DSP48E1", "BREG=1,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PCOUT", 510, 2387},
++{"DSP48E1_DSP48E1", "BREG=2", HardblockArc::SETUP, "CEB1", "CLK", -102, 514},
++{"DSP48E1_DSP48E1", "BREG=2", HardblockArc::HOLD, "CEB1", "CLK", -514, 102},
++{"DSP48E1_DSP48E1", "BREG=2", HardblockArc::SETUP, "CEB2", "CLK", -102, 514},
++{"DSP48E1_DSP48E1", "BREG=2", HardblockArc::HOLD, "CEB2", "CLK", -514, 102},
++{"DSP48E1_DSP48E1", "BREG=2", HardblockArc::SETUP, "RSTB", "CLK", -144, 543},
++{"DSP48E1_DSP48E1", "BREG=2", HardblockArc::HOLD, "RSTB", "CLK", -543, 144},
++{"DSP48E1_DSP48E1", "BREG=2,B_INPUT=CASCADE", HardblockArc::SETUP, "BCIN", "CLK", -178, 352},
++{"DSP48E1_DSP48E1", "BREG=2,B_INPUT=CASCADE", HardblockArc::HOLD, "BCIN", "CLK", -352, 178},
++{"DSP48E1_DSP48E1", "BREG=2,B_INPUT=DIRECT", HardblockArc::SETUP, "B", "CLK", -178, 450},
++{"DSP48E1_DSP48E1", "BREG=2,B_INPUT=DIRECT", HardblockArc::HOLD, "B", "CLK", -450, 178},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 496, 4143},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 481, 3790},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 492, 3772},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 487, 3813},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 529, 4378},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 529, 4378},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 510, 4008},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 639, 4143},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 623, 3790},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 635, 3772},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 630, 3813},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 671, 4378},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 671, 4378},
++{"DSP48E1_DSP48E1", "BREG=2,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 651, 4008},
++{"DSP48E1_DSP48E1", "BREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 496, 2522},
++{"DSP48E1_DSP48E1", "BREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "CARRYOUT", 481, 2168},
++{"DSP48E1_DSP48E1", "BREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 492, 2150},
++{"DSP48E1_DSP48E1", "BREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "P", 487, 2191},
++{"DSP48E1_DSP48E1", "BREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 529, 2756},
++{"DSP48E1_DSP48E1", "BREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 529, 2756},
++{"DSP48E1_DSP48E1", "BREG=2,PREG=0,USE_MULT=NONE", HardblockArc::IOPATH, "CLK", "PCOUT", 510, 2387},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=0", HardblockArc::IOPATH, "CARRYIN", "CARRYCASCOUT", 361, 1746},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=0", HardblockArc::IOPATH, "CARRYIN", "CARRYOUT", 346, 1393},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=0", HardblockArc::IOPATH, "CARRYIN", "MULTSIGNOUT", 358, 1376},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=0", HardblockArc::IOPATH, "CARRYIN", "P", 352, 1416},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=0", HardblockArc::IOPATH, "CARRYIN", "PATTERNBDETECT", 395, 1982},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=0", HardblockArc::IOPATH, "CARRYIN", "PATTERNDETECT", 395, 1982},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=0", HardblockArc::IOPATH, "CARRYIN", "PCOUT", 375, 1613},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "CARRYIN", "CLK", 480, 1298},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "CARRYIN", "CLK", -1298, -480},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "CARRYIN", "CLK", 549, 1690},
++{"DSP48E1_DSP48E1", "CARRYINREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "CARRYIN", "CLK", -1690, -549},
++{"DSP48E1_DSP48E1", "CARRYINREG=1", HardblockArc::SETUP, "CARRYIN", "CLK", -151, 299},
++{"DSP48E1_DSP48E1", "CARRYINREG=1", HardblockArc::HOLD, "CARRYIN", "CLK", -299, 151},
++{"DSP48E1_DSP48E1", "CARRYINREG=1", HardblockArc::SETUP, "CECARRYIN", "CLK", 49, 665},
++{"DSP48E1_DSP48E1", "CARRYINREG=1", HardblockArc::HOLD, "CECARRYIN", "CLK", -665, -49},
++{"DSP48E1_DSP48E1", "CARRYINREG=1", HardblockArc::SETUP, "RSTALLCARRYIN", "CLK", -123, 284},
++{"DSP48E1_DSP48E1", "CARRYINREG=1", HardblockArc::HOLD, "RSTALLCARRYIN", "CLK", -284, 123},
++{"DSP48E1_DSP48E1", "CARRYINREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 461, 2094},
++{"DSP48E1_DSP48E1", "CARRYINREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYOUT", 445, 1740},
++{"DSP48E1_DSP48E1", "CARRYINREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 458, 1723},
++{"DSP48E1_DSP48E1", "CARRYINREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "P", 452, 1764},
++{"DSP48E1_DSP48E1", "CARRYINREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 492, 2330},
++{"DSP48E1_DSP48E1", "CARRYINREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 492, 2330},
++{"DSP48E1_DSP48E1", "CARRYINREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PCOUT", 473, 1958},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=0", HardblockArc::IOPATH, "CARRYINSEL", "CARRYCASCOUT", 384, 2241},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=0", HardblockArc::IOPATH, "CARRYINSEL", "CARRYOUT", 369, 1888},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=0", HardblockArc::IOPATH, "CARRYINSEL", "MULTSIGNOUT", 379, 1870},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=0", HardblockArc::IOPATH, "CARRYINSEL", "P", 375, 1910},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=0", HardblockArc::IOPATH, "CARRYINSEL", "PATTERNBDETECT", 416, 2476},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=0", HardblockArc::IOPATH, "CARRYINSEL", "PATTERNDETECT", 416, 2476},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=0", HardblockArc::IOPATH, "CARRYINSEL", "PCOUT", 396, 2106},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "CARRYINSEL", "CLK", 506, 1793},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "CARRYINSEL", "CLK", -1793, -506},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "CARRYINSEL", "CLK", 575, 2184},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "CARRYINSEL", "CLK", -2184, -575},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1", HardblockArc::SETUP, "CARRYINSEL", "CLK", -174, 208},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1", HardblockArc::HOLD, "CARRYINSEL", "CLK", -208, 174},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1", HardblockArc::SETUP, "CECTRL", "CLK", -123, 421},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1", HardblockArc::HOLD, "CECTRL", "CLK", -421, 123},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1", HardblockArc::SETUP, "RSTCTRL", "CLK", -76, 469},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1", HardblockArc::HOLD, "RSTCTRL", "CLK", -469, 76},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 455, 2257},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYOUT", 440, 1903},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 452, 1884},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "P", 446, 1927},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 487, 2493},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 487, 2493},
++{"DSP48E1_DSP48E1", "CARRYINSELREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PCOUT", 468, 2122},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=0", HardblockArc::IOPATH, "C", "CARRYCASCOUT", 317, 2150},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=0", HardblockArc::IOPATH, "C", "CARRYOUT", 302, 1797},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=0", HardblockArc::IOPATH, "C", "MULTSIGNOUT", 314, 1779},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=0", HardblockArc::IOPATH, "C", "P", 308, 1820},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=0", HardblockArc::IOPATH, "C", "PATTERNBDETECT", 350, 2386},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=0", HardblockArc::IOPATH, "C", "PATTERNDETECT", 350, 2386},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=0", HardblockArc::IOPATH, "C", "PCOUT", 331, 2016},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "C", "CLK", 355, 1701},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "C", "CLK", -1701, -355},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "C", "CLK", 424, 2093},
++{"DSP48E1_DSP48E1", "CREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "C", "CLK", -2093, -424},
++{"DSP48E1_DSP48E1", "CREG=1", HardblockArc::SETUP, "C", "CLK", -210, 233},
++{"DSP48E1_DSP48E1", "CREG=1", HardblockArc::HOLD, "C", "CLK", -233, 210},
++{"DSP48E1_DSP48E1", "CREG=1", HardblockArc::SETUP, "CEC", "CLK", -124, 414},
++{"DSP48E1_DSP48E1", "CREG=1", HardblockArc::HOLD, "CEC", "CLK", -414, 124},
++{"DSP48E1_DSP48E1", "CREG=1", HardblockArc::SETUP, "RSTC", "CLK", -119, 84},
++{"DSP48E1_DSP48E1", "CREG=1", HardblockArc::HOLD, "RSTC", "CLK", -84, 119},
++{"DSP48E1_DSP48E1", "CREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 487, 2621},
++{"DSP48E1_DSP48E1", "CREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYOUT", 472, 2268},
++{"DSP48E1_DSP48E1", "CREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 484, 2251},
++{"DSP48E1_DSP48E1", "CREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "P", 478, 2291},
++{"DSP48E1_DSP48E1", "CREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 520, 2857},
++{"DSP48E1_DSP48E1", "CREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 520, 2857},
++{"DSP48E1_DSP48E1", "CREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PCOUT", 501, 2488},
++{"DSP48E1_DSP48E1", "DREG=1", HardblockArc::SETUP, "CED", "CLK", 54, 513},
++{"DSP48E1_DSP48E1", "DREG=1", HardblockArc::HOLD, "CED", "CLK", -513, -54},
++{"DSP48E1_DSP48E1", "DREG=1", HardblockArc::SETUP, "D", "CLK", -265, 413},
++{"DSP48E1_DSP48E1", "DREG=1", HardblockArc::HOLD, "D", "CLK", -413, 265},
++{"DSP48E1_DSP48E1", "DREG=1", HardblockArc::SETUP, "RSTD", "CLK", -83, 587},
++{"DSP48E1_DSP48E1", "DREG=1", HardblockArc::HOLD, "RSTD", "CLK", -587, 83},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "CARRYCASCOUT", 606, 4254},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "CARRYOUT", 591, 3900},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "MULTSIGNOUT", 603, 3883},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "P", 597, 3923},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PATTERNBDETECT", 639, 4489},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PATTERNDETECT", 639, 4489},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PCOUT", 619, 4119},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "CARRYCASCOUT", 606, 4254},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "CARRYOUT", 591, 3900},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "MULTSIGNOUT", 603, 3883},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "P", 597, 3923},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PATTERNBDETECT", 639, 4489},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PATTERNDETECT", 639, 4489},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PCOUT", 619, 4119},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "CARRYCASCOUT", 592, 4085},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "CARRYOUT", 577, 3732},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "MULTSIGNOUT", 588, 3715},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "P", 584, 3755},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PATTERNBDETECT", 624, 4321},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PATTERNDETECT", 624, 4321},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "INMODE", "PCOUT", 605, 3950},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "CARRYCASCOUT", 592, 4085},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "CARRYOUT", 577, 3732},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "MULTSIGNOUT", 588, 3715},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "P", 584, 3755},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PATTERNBDETECT", 624, 4321},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PATTERNDETECT", 624, 4321},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=0,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "INMODE", "PCOUT", 605, 3950},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "INMODE", "CLK", 991, 3805},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "INMODE", "CLK", -3805, -991},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "INMODE", "CLK", 1061, 4196},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "INMODE", "CLK", -4196, -1061},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "INMODE", "CLK", 991, 3805},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "INMODE", "CLK", -3805, -991},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "INMODE", "CLK", 1061, 4196},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=0,PREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "INMODE", "CLK", -4196, -1061},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::SETUP, "INMODE", "CLK", 245, 2012},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=1,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::HOLD, "INMODE", "CLK", -2012, -245},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::SETUP, "INMODE", "CLK", 245, 2012},
++{"DSP48E1_DSP48E1", "INMODEREG=0,MREG=1,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::HOLD, "INMODE", "CLK", -2012, -245},
++{"DSP48E1_DSP48E1", "INMODEREG=1", HardblockArc::SETUP, "CEINMODE", "CLK", -205, 603},
++{"DSP48E1_DSP48E1", "INMODEREG=1", HardblockArc::HOLD, "CEINMODE", "CLK", -603, 205},
++{"DSP48E1_DSP48E1", "INMODEREG=1", HardblockArc::SETUP, "INMODE", "CLK", -186, 449},
++{"DSP48E1_DSP48E1", "INMODEREG=1", HardblockArc::HOLD, "INMODE", "CLK", -449, 186},
++{"DSP48E1_DSP48E1", "INMODEREG=1", HardblockArc::SETUP, "RSTINMODE", "CLK", -74, 686},
++{"DSP48E1_DSP48E1", "INMODEREG=1", HardblockArc::HOLD, "RSTINMODE", "CLK", -686, 74},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 687, 4441},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "CARRYOUT", 672, 4088},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 684, 4070},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "P", 679, 4111},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 719, 4676},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 719, 4676},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=DYNAMIC", HardblockArc::IOPATH, "CLK", "PCOUT", 700, 4307},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 687, 4441},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "CARRYOUT", 672, 4088},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 684, 4070},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "P", 679, 4111},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 719, 4676},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 719, 4676},
++{"DSP48E1_DSP48E1", "INMODEREG=1,MREG=0,PREG=0,USE_DPORT=FALSE,USE_MULT=MULTIPLY", HardblockArc::IOPATH, "CLK", "PCOUT", 700, 4307},
++{"DSP48E1_DSP48E1", "MREG=1", HardblockArc::SETUP, "CEM", "CLK", -224, 266},
++{"DSP48E1_DSP48E1", "MREG=1", HardblockArc::HOLD, "CEM", "CLK", -266, 224},
++{"DSP48E1_DSP48E1", "MREG=1", HardblockArc::SETUP, "RSTALLCARRYIN", "CLK", -120, 287},
++{"DSP48E1_DSP48E1", "MREG=1", HardblockArc::HOLD, "RSTALLCARRYIN", "CLK", -287, 120},
++{"DSP48E1_DSP48E1", "MREG=1", HardblockArc::SETUP, "RSTM", "CLK", -274, 270},
++{"DSP48E1_DSP48E1", "MREG=1", HardblockArc::HOLD, "RSTM", "CLK", -270, 274},
++{"DSP48E1_DSP48E1", "MREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 473, 2634},
++{"DSP48E1_DSP48E1", "MREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYOUT", 458, 2282},
++{"DSP48E1_DSP48E1", "MREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 470, 2263},
++{"DSP48E1_DSP48E1", "MREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "P", 465, 2305},
++{"DSP48E1_DSP48E1", "MREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 505, 2870},
++{"DSP48E1_DSP48E1", "MREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 505, 2870},
++{"DSP48E1_DSP48E1", "MREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PCOUT", 486, 2500},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=0", HardblockArc::IOPATH, "OPMODE", "CARRYCASCOUT", 446, 2657},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=0", HardblockArc::IOPATH, "OPMODE", "CARRYOUT", 432, 2304},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=0", HardblockArc::IOPATH, "OPMODE", "MULTSIGNOUT", 443, 2286},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=0", HardblockArc::IOPATH, "OPMODE", "P", 437, 2326},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=0", HardblockArc::IOPATH, "OPMODE", "PATTERNBDETECT", 479, 2892},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=0", HardblockArc::IOPATH, "OPMODE", "PATTERNDETECT", 479, 2892},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=0", HardblockArc::IOPATH, "OPMODE", "PCOUT", 460, 2522},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "OPMODE", "CLK", 640, 2209},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "OPMODE", "CLK", -2209, -640},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "OPMODE", "CLK", 710, 2600},
++{"DSP48E1_DSP48E1", "OPMODEREG=0,PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "OPMODE", "CLK", -2600, -710},
++{"DSP48E1_DSP48E1", "OPMODEREG=1", HardblockArc::SETUP, "CECTRL", "CLK", -123, 421},
++{"DSP48E1_DSP48E1", "OPMODEREG=1", HardblockArc::HOLD, "CECTRL", "CLK", -421, 123},
++{"DSP48E1_DSP48E1", "OPMODEREG=1", HardblockArc::SETUP, "OPMODE", "CLK", -223, 449},
++{"DSP48E1_DSP48E1", "OPMODEREG=1", HardblockArc::HOLD, "OPMODE", "CLK", -449, 223},
++{"DSP48E1_DSP48E1", "OPMODEREG=1", HardblockArc::SETUP, "RSTCTRL", "CLK", -76, 469},
++{"DSP48E1_DSP48E1", "OPMODEREG=1", HardblockArc::HOLD, "RSTCTRL", "CLK", -469, 76},
++{"DSP48E1_DSP48E1", "OPMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 492, 2562},
++{"DSP48E1_DSP48E1", "OPMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "CARRYOUT", 477, 2208},
++{"DSP48E1_DSP48E1", "OPMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 489, 2189},
++{"DSP48E1_DSP48E1", "OPMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "P", 483, 2231},
++{"DSP48E1_DSP48E1", "OPMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 524, 2796},
++{"DSP48E1_DSP48E1", "OPMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 524, 2796},
++{"DSP48E1_DSP48E1", "OPMODEREG=1,PREG=0", HardblockArc::IOPATH, "CLK", "PCOUT", 505, 2426},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "CARRYCASCIN", "CARRYCASCOUT", 271, 1478},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "CARRYCASCIN", "CARRYOUT", 255, 1124},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "CARRYCASCIN", "MULTSIGNOUT", 267, 1106},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "CARRYCASCIN", "P", 262, 1147},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "CARRYCASCIN", "PATTERNBDETECT", 302, 1712},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "CARRYCASCIN", "PATTERNDETECT", 302, 1712},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "CARRYCASCIN", "PCOUT", 283, 1343},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "MULTSIGNIN", "CARRYCASCOUT", 255, 1848},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "MULTSIGNIN", "CARRYOUT", 239, 1494},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "MULTSIGNIN", "MULTSIGNOUT", 252, 1478},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "MULTSIGNIN", "P", 246, 1518},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "MULTSIGNIN", "PATTERNBDETECT", 287, 2084},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "MULTSIGNIN", "PATTERNDETECT", 287, 2084},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "MULTSIGNIN", "PCOUT", 267, 1713},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "PCIN", "CARRYCASCOUT", 255, 1848},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "PCIN", "CARRYOUT", 239, 1494},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "PCIN", "MULTSIGNOUT", 252, 1478},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "PCIN", "P", 246, 1518},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "PCIN", "PATTERNBDETECT", 287, 2084},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "PCIN", "PATTERNDETECT", 287, 2084},
++{"DSP48E1_DSP48E1", "PREG=0", HardblockArc::IOPATH, "PCIN", "PCOUT", 267, 1713},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "CARRYCASCOUT", 383, 688},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "CARRYOUT", 126, 415},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "MULTSIGNOUT", 356, 478},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "OVERFLOW", 144, 700},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "P", 126, 434},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "PATTERNBDETECT", 132, 662},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "PATTERNDETECT", 132, 662},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "PCOUT", 400, 478},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::IOPATH, "CLK", "UNDERFLOW", 136, 525},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::SETUP, "CEP", "CLK", -5, 524},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::HOLD, "CEP", "CLK", -524, 5},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::SETUP, "RSTP", "CLK", -6, 347},
++{"DSP48E1_DSP48E1", "PREG=1", HardblockArc::HOLD, "RSTP", "CLK", -347, 6},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "CARRYCASCIN", "CLK", 256, 1028},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "CARRYCASCIN", "CLK", -1028, -256},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "MULTSIGNIN", "CLK", 215, 1400},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "MULTSIGNIN", "CLK", -1400, -215},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::SETUP, "PCIN", "CLK", 215, 1400},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=NO_PATDET", HardblockArc::HOLD, "PCIN", "CLK", -1400, -215},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "CARRYCASCIN", "CLK", 325, 1420},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "CARRYCASCIN", "CLK", -1420, -325},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "MULTSIGNIN", "CLK", 285, 1792},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "MULTSIGNIN", "CLK", -1792, -285},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::SETUP, "PCIN", "CLK", 285, 1792},
++{"DSP48E1_DSP48E1", "PREG=1,USE_PATTERN_DETECT=PATDET", HardblockArc::HOLD, "PCIN", "CLK", -1792, -285},
++{"ICAP_ICAP", "", HardblockArc::IOPATH, "CLK", "O", 3616, 5200},
++{"ICAP_ICAP", "", HardblockArc::SETUP, "CSIB", "CLK", 3390, 3900},
++{"ICAP_ICAP", "", HardblockArc::HOLD, "CSIB", "CLK", 0, 0},
++{"ICAP_ICAP", "", HardblockArc::SETUP, "I", "CLK", 2237, 2574},
++{"ICAP_ICAP", "", HardblockArc::HOLD, "I", "CLK", 0, 0},
++{"ICAP_ICAP", "", HardblockArc::SETUP, "RDWRB", "CLK", 5587, 6427},
++{"ICAP_ICAP", "", HardblockArc::HOLD, "RDWRB", "CLK", 0, 0},
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 9dc9a79c..ca36c6a4 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -109,6 +109,9 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("timing-opt", po::value<std::string>(),
+                            "after placing, the timing-driven placement optimisation on the critical paths: R[,N] moves a "
+                            "cell up to R tiles, N rounds (default 30); off unless given");
++    specific.add_options()("hardblock-timing", po::value<std::string>()->implicit_value(""),
++                           "time the DSP48E1 and ICAPE2 pins with the prjxray-db SDF arcs (off by default: they are "
++                           "untimed); see hardblock_timing.cc");
+     specific.add_options()("hold-detour-max", po::value<double>(),
+                            "hold deficit (ns) up to which a routing detour is used instead of a feedthrough LUT "
+                            "(default 0.5)");
+@@ -956,6 +959,7 @@ void XilinxImpl::prePlace()
+     init_clock_tree();
+     assign_cell_tags();
+     index_control_sets();
++    init_hardblock_timing();
+     cell_tags_set = true;
+     for (auto &cell : ctx->cells) {
+         CellInfo *ci = cell.second.get();
+@@ -1080,7 +1084,7 @@ void XilinxImpl::check_clock_placement()
+ 
+ 
+ 
+-bool XilinxImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
++bool XilinxImpl::buffer_cell_delay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
+ {
+     if (HimbaechelAPI::getCellDelay(cell, fromPort, toPort, delay))
+         return true;
+@@ -1301,6 +1305,7 @@ void XilinxImpl::preRoute()
+         // We loaded a pre-placed design. Need to set tags and update bel-cell map
+         assign_cell_tags();
+         index_control_sets();
++        init_hardblock_timing();
+         cell_tags_set = true;
+         for (auto &cell : ctx->cells) {
+             CellInfo *ci = cell.second.get();
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 47c944cd..78dc5886 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -243,8 +243,9 @@ struct XilinxImpl : HimbaechelAPI
+     std::vector<XdcClockSetting> xdc_clock_settings;
+ 
+     void check_clock_placement();
+-
+-    bool getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const override;
++
++
++    bool buffer_cell_delay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const;
+     mutable pool<std::string> warned_pad_buffers;
+     void add_pblock_routing_tiles(Region *pb_region);
+     void pack() override;
+@@ -361,6 +362,23 @@ struct XilinxImpl : HimbaechelAPI
+     delay_t predict_clock_tree_delay(BelId src_bel, BelId dst_bel) const;
+     bool getArcDelayOverride(const NetInfo *net_info, const PortRef &sink, DelayQuad &delay) const override;
+ 
++
++    struct HardblockTiming
++    {
++        dict<std::pair<IdString, IdString>, DelayPair> comb;
++        dict<IdString, DelayPair> setup, hold, clk_q;
++        pool<IdString> comb_in, comb_out;
++    };
++    dict<IdString, HardblockTiming> hardblock_timing;
++    bool hardblock_timing_on = false;
++    IdString ramb36_clock_half(const CellInfo *cell, IdString port, IdString clock) const;
++    void init_hardblock_timing();
++    IdString hardblock_bus(IdString port) const;
++    const HardblockTiming *hardblock_timing_of(const CellInfo *cell) const;
++    bool getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const override;
++    TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const override;
++    TimingClockingInfo getPortClockingInfo(const CellInfo *cell, IdString port, int index) const override;
++
+     // Block RAMs placed by read-mux group, then everything else around them;
+     // see bram_place.cc
+     bool is_movable_bram(const CellInfo *ci) const;

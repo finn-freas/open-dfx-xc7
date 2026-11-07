@@ -1,0 +1,10 @@
+[project]
+name = "blinky_cora"
+top = "blinky_cora"
+board = "cora-z7-07s"
+sources = ["src/blinky_cora.v"]
+constraints = ["constraints/blinky_cora.xdc"]
+seed = 1
+
+[clocks]
+clk = 8.0

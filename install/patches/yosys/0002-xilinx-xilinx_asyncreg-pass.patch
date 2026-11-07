@@ -1,0 +1,387 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: xilinx_asyncreg pass
+
+Flip-flops with ASYNC_REG = TRUE (on the wire or the cell, or from an
+XDC with -xdc) get keep, so shregmap no longer turns a synchronizer into
+an SRL and the stages stay separate flip-flops.  synth_xilinx runs it
+after flatten.
+---
+ techlibs/xilinx/CMakeLists.txt     |   4 +
+ techlibs/xilinx/synth_xilinx.cc    |   1 +
+ techlibs/xilinx/xilinx_asyncreg.cc | 334 +++++++++++++++++++++++++++++
+ 3 files changed, 339 insertions(+)
+ create mode 100755 techlibs/xilinx/xilinx_asyncreg.cc
+
+diff --git a/techlibs/xilinx/CMakeLists.txt b/techlibs/xilinx/CMakeLists.txt
+index 6fab77495..ce7697e7b 100644
+--- a/techlibs/xilinx/CMakeLists.txt
++++ b/techlibs/xilinx/CMakeLists.txt
+@@ -1,3 +1,6 @@
++yosys_pass(xilinx_asyncreg
++	xilinx_asyncreg.cc
++)
+ yosys_pass(xilinx_dffopt
+ 	xilinx_dffopt.cc
+ )
+@@ -38,6 +41,7 @@ yosys_pass(synth_xilinx
+ 		chtype
+ 		clean
+ 		clkbufmap
++		xilinx_asyncreg
+ 		deminout
+ 		dfflegalize
+ 		extractinv
+diff --git a/techlibs/xilinx/synth_xilinx.cc b/techlibs/xilinx/synth_xilinx.cc
+index 564fd718b..e6fc1bb94 100644
+--- a/techlibs/xilinx/synth_xilinx.cc
++++ b/techlibs/xilinx/synth_xilinx.cc
+@@ -365,6 +365,7 @@ struct SynthXilinxPass : public ScriptPass
+ 				run("check");
+ 				run("flatten", "(with '-flatten')");
+ 			}
++			run("xilinx_asyncreg");
+ 			if (active_design)
+ 				active_design->scratchpad_unset("tribuf.added_something");
+ 			run("tribuf -logic");
+diff --git a/techlibs/xilinx/xilinx_asyncreg.cc b/techlibs/xilinx/xilinx_asyncreg.cc
+new file mode 100755
+index 000000000..89bfae235
+--- /dev/null
++++ b/techlibs/xilinx/xilinx_asyncreg.cc
+@@ -0,0 +1,334 @@
++/*
++ *  yosys -- Yosys Open SYnthesis Suite
++ *
++ *  Permission to use, copy, modify, and/or distribute this software for any
++ *  purpose with or without fee is hereby granted, provided that the above
++ *  copyright notice and this permission notice appear in all copies.
++ *
++ *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++
++#include "kernel/yosys.h"
++#include "kernel/sigtools.h"
++#include "kernel/newcelltypes.h"
++#include <fstream>
++
++USING_YOSYS_NAMESPACE
++PRIVATE_NAMESPACE_BEGIN
++
++static bool is_true_value(const Const &value)
++{
++	if (value.flags & RTLIL::CONST_FLAG_STRING) {
++		std::string s = value.decode_string();
++		std::transform(s.begin(), s.end(), s.begin(), ::tolower);
++		return s == "true" || s == "yes" || s == "1";
++	}
++	return value.as_bool();
++}
++
++static bool has_async_reg(const RTLIL::Design *design, const RTLIL::AttrObject *obj)
++{
++	for (auto &attr : obj->attributes) {
++		std::string name = design->twines().str(attr.first);
++		std::transform(name.begin(), name.end(), name.begin(), ::tolower);
++		if (name == "\\async_reg")
++			return is_true_value(attr.second);
++	}
++	return false;
++}
++
++
++static std::vector<std::string> tcl_words(const std::string &text)
++{
++	std::vector<std::string> words;
++	std::string word;
++	int braces = 0, brackets = 0;
++	bool quoted = false;
++	for (char c : text) {
++		if (c == '"' && braces == 0 && brackets == 0)
++			quoted = !quoted;
++		else if (c == '{' && !quoted)
++			braces++;
++		else if (c == '}' && !quoted)
++			braces--;
++		else if (c == '[' && !quoted && braces == 0)
++			brackets++;
++		else if (c == ']' && !quoted && braces == 0)
++			brackets--;
++		if (isspace(c) && braces == 0 && brackets == 0 && !quoted) {
++			if (!word.empty())
++				words.push_back(word);
++			word.clear();
++		} else {
++			word += c;
++		}
++	}
++	if (!word.empty())
++		words.push_back(word);
++	return words;
++}
++
++static std::string unwrap(const std::string &word)
++{
++	if (word.size() >= 2 && ((word.front() == '{' && word.back() == '}') || (word.front() == '"' && word.back() == '"')))
++		return word.substr(1, word.size() - 2);
++	return word;
++}
++
++struct XdcCellQuery
++{
++	std::vector<std::string> patterns;
++	bool hier = false;
++	int lineno = 0;
++};
++
++
++static std::vector<XdcCellQuery> read_xdc_async_reg(const std::string &filename)
++{
++	std::vector<XdcCellQuery> queries;
++	std::ifstream in(filename);
++	if (!in)
++		log_cmd_error("Can't open XDC file `%s'.\n", filename.c_str());
++	std::string line, buffer;
++	int lineno = 0, first_line = 0;
++	while (std::getline(in, line)) {
++		lineno++;
++		size_t hash = line.find('#');
++		if (hash != std::string::npos)
++			line = line.substr(0, hash);
++		size_t last = line.find_last_not_of(" \t\r");
++		if (buffer.empty())
++			first_line = lineno;
++		if (last != std::string::npos && line.at(last) == '\\') {
++			buffer += line.substr(0, last) + " ";
++			continue;
++		}
++		line = buffer + line;
++		buffer.clear();
++		std::vector<std::string> words = tcl_words(line);
++		if (words.size() < 3 || words.at(0) != "set_property")
++			continue;
++		bool is_async_reg = false;
++		std::string target;
++		if (words.at(1) == "-dict" && words.size() >= 4) {
++			std::vector<std::string> dict = tcl_words(unwrap(words.at(2)));
++			for (size_t i = 0; i + 1 < dict.size(); i += 2)
++				if (dict.at(i) == "ASYNC_REG")
++					is_async_reg = is_true_value(Const(unwrap(dict.at(i + 1))));
++			target = words.at(3);
++		} else if (words.size() >= 4 && words.at(1) == "ASYNC_REG") {
++			is_async_reg = is_true_value(Const(unwrap(words.at(2))));
++			target = words.at(3);
++		}
++		if (!is_async_reg)
++			continue;
++		if (target.size() < 2 || target.front() != '[' || target.back() != ']') {
++			log_warning("%s:%d: ASYNC_REG target `%s' is not a [get_cells ...] query, ignored.\n", filename.c_str(),
++				    first_line, target.c_str());
++			continue;
++		}
++		std::vector<std::string> query = tcl_words(target.substr(1, target.size() - 2));
++		if (query.empty() || query.front() != "get_cells") {
++			log_warning("%s:%d: ASYNC_REG is only taken on [get_cells ...], ignored.\n", filename.c_str(), first_line);
++			continue;
++		}
++		XdcCellQuery q;
++		q.lineno = first_line;
++		bool supported = true;
++		for (size_t i = 1; i < query.size(); i++) {
++			const std::string &w = query.at(i);
++			if (w == "-hier" || w == "-hierarchical") {
++				q.hier = true;
++			} else if (w == "-quiet") {
++				continue;
++			} else if (w == "-filter" && i + 1 < query.size()) {
++				std::vector<std::string> expr = tcl_words(unwrap(query.at(++i)));
++				if (expr.size() == 3 && expr.at(0) == "NAME" && (expr.at(1) == "=~" || expr.at(1) == "=="))
++					q.patterns.push_back(unwrap(expr.at(2)));
++				else
++					supported = false;
++			} else if (!w.empty() && w.front() == '-') {
++				supported = false;
++			} else {
++				for (auto &name : tcl_words(unwrap(w)))
++					q.patterns.push_back(unwrap(name));
++			}
++		}
++		if (!supported) {
++			log_warning("%s:%d: unsupported get_cells form `%s', ignored.\n", filename.c_str(), first_line,
++				    target.c_str());
++			continue;
++		}
++		queries.push_back(q);
++	}
++	return queries;
++}
++
++
++
++static std::string vivado_reg_name(const std::string &prefix, RTLIL::Wire *wire, int offset)
++{
++	std::string name = prefix + RTLIL::unescape_id(wire->name.str());
++	std::replace(name.begin(), name.end(), '.', '/');
++	name += "_reg";
++	if (wire->width > 1 || wire->start_offset != 0) {
++		int index = wire->upto ? wire->start_offset + wire->width - 1 - offset : wire->start_offset + offset;
++		name += stringf("[%d]", index);
++	}
++	return name;
++}
++
++struct XilinxAsyncRegPass : public Pass {
++	XilinxAsyncRegPass() : Pass("xilinx_asyncreg", "keep ASYNC_REG synchronizer flip-flops apart") { }
++	void help() override
++	{
++
++		log("\n");
++		log("    xilinx_asyncreg [options] [selection]\n");
++		log("\n");
++		log("Find the registers that carry ASYNC_REG = TRUE, either as an attribute on the\n");
++		log("register (wire) or the flip-flop cell, or through 'set_property ASYNC_REG TRUE\n");
++		log("[get_cells ...]' in an XDC file. Every such wire gets ASYNC_REG = \"TRUE\" and\n");
++		log("the flip-flops that drive it get ASYNC_REG = \"TRUE\" and 'keep', so that\n");
++		log("shregmap does not turn a synchronizer chain into a shift register and no other\n");
++		log("pass merges or removes one of its stages. The attribute stays on the netlist for\n");
++		log("place and route.\n");
++		log("\n");
++		log("    -xdc <file>\n");
++		log("        also take the ASYNC_REG properties of this XDC file. Register names are\n");
++		log("        Vivado's: <reg>_reg, <reg>_reg[<bit>] and <inst>/<reg>_reg; globs and\n");
++		log("        -hier and -filter {NAME =~ <glob>} are taken. Can be given more than once.\n");
++		log("\n");
++	}
++	void execute(std::vector<std::string> args, RTLIL::Design *design) override
++	{
++		log_header(design, "Executing XILINX_ASYNCREG pass (keep synchronizer flip-flops).\n");
++
++		std::vector<std::string> xdc_files;
++		size_t argidx;
++		for (argidx = 1; argidx < args.size(); argidx++) {
++			if (args[argidx] == "-xdc" && argidx + 1 < args.size()) {
++				xdc_files.push_back(args[++argidx]);
++				continue;
++			}
++			break;
++		}
++		extra_args(args, argidx, design);
++
++
++		IdString id_async_reg;
++		auto async_reg_id = [&]() {
++			if (id_async_reg == IdString::Null)
++				id_async_reg = design->twines().add("\\ASYNC_REG");
++			return id_async_reg;
++		};
++		pool<IdString> xilinx_ffs;
++		for (auto type : {"\\FDRE", "\\FDSE", "\\FDCE", "\\FDPE"}) {
++			IdString id = design->twines().find(type);
++			if (id != IdString::Null)
++				xilinx_ffs.insert(id);
++		}
++
++		std::vector<XdcCellQuery> queries;
++		for (auto &f : xdc_files)
++			for (auto &q : read_xdc_async_reg(f))
++				queries.push_back(q);
++		std::vector<int> query_hits(queries.size(), 0);
++
++
++		std::vector<std::pair<std::string, RTLIL::Module *>> scopes;
++		RTLIL::Module *top = design->top_module();
++		if (top != nullptr) {
++			std::vector<std::pair<std::string, RTLIL::Module *>> todo = {{"", top}};
++			pool<std::string> visited;
++			while (!todo.empty()) {
++				auto scope = todo.back();
++				todo.pop_back();
++				if (!visited.insert(scope.first + "@" + scope.second->name.str()).second)
++					continue;
++				scopes.push_back(scope);
++				for (auto cell : scope.second->cells()) {
++					RTLIL::Module *sub = design->module(cell->type);
++					if (sub != nullptr && !sub->get_blackbox_attribute())
++						todo.push_back({scope.first + RTLIL::unescape_id(cell->name.str()) + "/", sub});
++				}
++			}
++		}
++
++		int from_xdc = 0;
++		for (auto &scope : scopes) {
++			if (queries.empty())
++				break;
++			for (auto wire : scope.second->wires()) {
++				if (!wire->name.isPublic())
++					continue;
++				bool hit = false;
++				for (int i = 0; i < wire->width && !hit; i++) {
++					std::string name = vivado_reg_name(scope.first, wire, i);
++					size_t slash = name.rfind('/');
++					std::string leaf = slash == std::string::npos ? name : name.substr(slash + 1);
++					for (size_t q = 0; q < queries.size(); q++)
++						for (auto &pat : queries.at(q).patterns) {
++							bool any_level = queries.at(q).hier && pat.find('/') == std::string::npos;
++							if (patmatch(pat.c_str(), name.c_str()) ||
++							    (any_level && patmatch(pat.c_str(), leaf.c_str()))) {
++								query_hits.at(q)++;
++								hit = true;
++							}
++						}
++				}
++				if (hit && !has_async_reg(design, wire)) {
++					wire->set_string_attribute(async_reg_id(), "TRUE");
++					from_xdc++;
++				}
++			}
++		}
++		for (size_t q = 0; q < queries.size(); q++)
++			if (query_hits.at(q) == 0)
++				log_warning("XDC line %d: ASYNC_REG target matches no register.\n", queries.at(q).lineno);
++
++		int wires = 0, cells = 0;
++		for (auto module : design->selected_modules()) {
++			SigMap sigmap(module);
++			pool<SigBit> async_bits;
++			for (auto wire : module->wires())
++				if (has_async_reg(design, wire)) {
++					wire->set_string_attribute(async_reg_id(), "TRUE");
++					for (auto bit : sigmap(wire))
++						async_bits.insert(bit);
++					wires++;
++				}
++			for (auto cell : module->selected_cells()) {
++				if (!StaticCellTypes::categories.is_ff(cell->type) && !xilinx_ffs.count(cell->type))
++					continue;
++				IdString q_port = cell->hasPort(ID::Q) ? ID::Q : IdString();
++				if (q_port == IdString())
++					continue;
++				bool drives_async = has_async_reg(design, cell);
++				for (auto bit : sigmap(cell->getPort(q_port)))
++					if (async_bits.count(bit))
++						drives_async = true;
++				if (!drives_async)
++					continue;
++				cell->set_string_attribute(async_reg_id(), "TRUE");
++				cell->set_bool_attribute(ID::keep);
++				for (auto bit : cell->getPort(q_port))
++					if (bit.wire != nullptr && bit.wire->name.isPublic() && !has_async_reg(design, bit.wire)) {
++						bit.wire->set_string_attribute(async_reg_id(), "TRUE");
++						wires++;
++					}
++				cells++;
++			}
++		}
++		log("ASYNC_REG on %d wire(s) (%d from the XDC), %d flip-flop cell(s) kept.\n", wires, from_xdc, cells);
++	}
++} XilinxAsyncRegPass;
++
++PRIVATE_NAMESPACE_END

@@ -1,0 +1,6 @@
+xilinx: write DSP48E1 MASK[47:0] and AREG/BREG=1 like Vivado
+
+Write AREG_1 and BREG_1 for AREG/BREG=1 instead of no bit, and write all
+48 MASK bits with MASK[47:46] cleared by default instead of truncating the
+mask to MASK[45:0], so that the DSP48E1 FASM features match what
+Vivado's bitstreams decode to.

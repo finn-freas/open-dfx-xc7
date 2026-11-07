@@ -1,0 +1,10 @@
+[project]
+name = "blinky_cms7"
+top = "blinky_cms7"
+board = "cmod-s7-25"
+sources = ["src/blinky_cms7.v"]
+constraints = ["constraints/blinky_cms7.xdc"]
+seed = 1
+
+[clocks]
+clk = 83.333

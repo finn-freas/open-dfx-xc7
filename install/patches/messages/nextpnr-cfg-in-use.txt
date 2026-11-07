@@ -1,0 +1,5 @@
+xilinx: write the ICAPE2 and DNA_PORT enable bits
+
+CFG_CENTER_MID.ICAP.IN_USE for an ICAPE2 on ICAP_X0Y0 (a warning for the
+other site) and CFG_CENTER_MID.DNA_PORT.IN_USE for a placed DNA_PORT, as
+Vivado sets them.  Needs the two prjxray-db features.

@@ -1,0 +1,10 @@
+placer: opt-in placement options for the static placer and placer1
+
+- Context::setting_or reads a setting without interning its name.
+- --tmg-crit-target/--tmg-crit-floor: criticality from the slack
+  against a fraction of the clock period.
+- --placer-static-{timingweight,critexp,target-util,ip-wait,overlap-stop}
+- --placer1-{critexp,timing-tradeoff}
+- xilinx: -o static-hpwl-x=N, -o static-ff-area=A
+
+Every option is off by default and an unset option changes nothing.

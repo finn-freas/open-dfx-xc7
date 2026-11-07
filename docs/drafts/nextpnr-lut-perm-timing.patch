@@ -1,0 +1,71 @@
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -107,6 +107,9 @@
+     specific.add_options()("dsp-cascade-place", po::value<std::string>()->implicit_value(""),
+                            "place a DSP48E1 cascade chain along the chipdb's PCOUT -> PCIN wires, so that it can "
+                            "cross an HCLK or BRKH row (off by default: a fixed 5-row step per DSP tile)");
++    specific.add_options()("lut-perm-timing", po::value<std::string>()->implicit_value(""),
++                           "after routing, end each permuted LUT input's route on its physical pin wire, so the "
++                           "timing report and SDF use the routed delay of that arc (off by default: predicted)");
+     specific.add_options()("hold-detour-max", po::value<double>(),
+                            "hold deficit (ns) up to which a routing detour is used instead of a feedthrough LUT "
+                            "(default 0.5)");
+--- a/himbaechel/uarch/xilinx/xilinx_place.cc
++++ b/himbaechel/uarch/xilinx/xilinx_place.cc
+@@ -959,6 +959,7 @@
+      * and Vivado happy, preserving the original logical netlist
+      */
+     dict<int, std::vector<int>> used_perm_pips; // tile -> [extra_data] for LUT perm pips
++    std::vector<std::pair<NetInfo *, PipId>> perm_binds;
+ 
+     for (auto &net : ctx->nets) {
+         NetInfo *ni = net.second.get();
+@@ -971,6 +972,7 @@
+                 continue;
+             const auto &extra_data = *reinterpret_cast<const XlnxPipExtraDataPOD *>(pd.extra_data.get());
+             used_perm_pips[pip.tile].push_back(extra_data.pip_config);
++            perm_binds.emplace_back(ni, pip);
+         }
+     }
+ 
+@@ -1067,6 +1069,40 @@
+         }
+     }
+ 
++    if (ctx->args.options.count("lut-perm-timing")) {
++        auto is_identity = [&](PipId p) {
++            const auto &ed = *reinterpret_cast<const XlnxPipExtraDataPOD *>(
++                    chip_pip_info(ctx->chip_info, p).extra_data.get());
++            return ((ed.pip_config >> 4) & 0xF) == (ed.pip_config & 0xF);
++        };
++        std::vector<std::tuple<NetInfo *, WireId, PlaceStrength>> moves;
++        for (auto &pb : perm_binds) {
++            if (is_identity(pb.second))
++                continue;
++            WireId dst = ctx->getPipDstWire(pb.second);
++            moves.emplace_back(pb.first, ctx->getPipSrcWire(pb.second), pb.first->wires.at(dst).strength);
++            ctx->unbindWire(dst);
++        }
++        int rebound = 0, failed = 0;
++        for (auto &mv : moves) {
++            PipId direct;
++            for (PipId p : ctx->getPipsDownhill(std::get<1>(mv))) {
++                if (chip_pip_info(ctx->chip_info, p).flags == PIP_LUT_PERMUTATION && is_identity(p)) {
++                    direct = p;
++                    break;
++                }
++            }
++            if (direct == PipId() || !ctx->checkWireAvail(ctx->getPipDstWire(direct))) {
++                failed++;
++                continue;
++            }
++            ctx->bindPip(direct, std::get<0>(mv), std::get<2>(mv));
++            rebound++;
++        }
++        log_info("lut-perm-timing: %d permuted LUT input hop(s) moved onto the physical pin wire, %d not\n", rebound,
++                 failed);
++    }
++
+     /*
+      * Legalise route through OSERDESE3s
+      */

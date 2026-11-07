@@ -1,0 +1,10 @@
+[project]
+name = "blinky_s75"
+top = "blinky_s75"
+part = "xc7s75fgga484-1"
+sources = ["src/blinky_s75.v"]
+constraints = ["constraints/blinky_s75.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

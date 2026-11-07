@@ -1,0 +1,22 @@
+diff --git a/litex/tools/litex_sim.py b/litex/tools/litex_sim.py
+index 0ec226f4..6cbd0e03 100755
+--- a/litex/tools/litex_sim.py
++++ b/litex/tools/litex_sim.py
+@@ -421,7 +421,7 @@ class SimSoC(SoCCore):
+             self.analyzer = LiteScopeAnalyzer(analyzer_signals,
+                 depth        = 512,
+                 clock_domain = "sys",
+-                csr_csv      = "analyzer.csv")
++                csr_csv      = os.path.abspath("analyzer.csv"))
+ 
+ # Build --------------------------------------------------------------------------------------------
+ 
+@@ -718,6 +718,8 @@ def main():
+ 
+     def pre_run_callback(vns):
+         nonlocal qemu_proc
++        if args.with_analyzer:
++            soc.analyzer.export_csv(vns, soc.analyzer.csr_csv)
+         if args.trace:
+             generate_gtkw_savefile(builder, vns, args.trace_fst)
+         if qemu_enabled and not args.qemu_no_run:

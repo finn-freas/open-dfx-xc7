@@ -1,0 +1,28 @@
+[board]
+name = "Digilent Nexys Video"
+part = "xc7a200tsbg484-1"
+openfpgaloader_board = "nexysVideo"
+iostandard = "LVCMOS33"
+led_iostandard = "LVCMOS25"
+pins_verified = true
+pin_source = "Digilent Nexys-Video-Master.xdc ('for the Nexys Video Rev. A', github.com/Digilent/digilent-xdc master c8644a9f, sha256 2debf0af...86cc, read 2026-11-06); part from Digilent vivado-boards new/board_files/nexys_video/A.0/1.2/board.xml (sha256 5fe56998...4a58)"
+notes = "The LEDs are in bank 13 with IOSTANDARD LVCMOS25 in Digilent's file. Only led[0..3] of the eight LEDs are in the preset (the ofx templates drive four)."
+
+[clock]
+port = "clk"
+pin = "R4"
+period_ns = 10.0
+iostandard = "LVCMOS33"
+
+[leds]
+"led[0]" = "T14"
+"led[1]" = "T15"
+"led[2]" = "T16"
+"led[3]" = "U16"
+
+[uart]
+uart_txd_in = "V18"
+uart_rxd_out = "AA19"
+
+[dfx]
+example_region = "SLICE_X12Y100:SLICE_X15Y149"

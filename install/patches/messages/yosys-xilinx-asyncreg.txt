@@ -1,0 +1,6 @@
+xilinx: xilinx_asyncreg pass
+
+Flip-flops with ASYNC_REG = TRUE (on the wire or the cell, or from an
+XDC with -xdc) get keep, so shregmap no longer turns a synchronizer into
+an SRL and the stages stay separate flip-flops.  synth_xilinx runs it
+after flatten.

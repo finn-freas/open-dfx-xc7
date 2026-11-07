@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: keep a MUXF7 that also feeds fabric in its MUXF8 tree
+
+pack_muxfs took a MUXF7 (or MUXF8) as the root of its own tree unless
+its output had exactly one user, the parent mux, so a MUXF7 that drives
+both a MUXF8 and fabric logic broke the MUXF8 tree.  Treat it as part of
+the tree when it feeds exactly one parent mux on a data input, whatever
+else its output drives.
+---
+ himbaechel/uarch/xilinx/pack.cc | 22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/pack.cc b/himbaechel/uarch/xilinx/pack.cc
+index 6676d7e5..cdb8d2a0 100644
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -624,6 +624,20 @@ void XilinxPacker::constrain_muxf_tree(CellInfo *curr, CellInfo *base, int zoffs
+ void XilinxPacker::pack_muxfs()
+ {
+     log_info("Packing MUX[789]s..\n");
++    auto feeds_one_parent_mux = [&](CellInfo *ci, IdString parent_type) {
++        NetInfo *o = ci->getPort(id_O);
++        if (o == nullptr)
++            return false;
++        int parents = 0;
++        for (auto &usr : o->users) {
++            if (usr.cell->type != parent_type)
++                continue;
++            if (is_constrained(usr.cell) || usr.port == id_S)
++                return false;
++            parents++;
++        }
++        return parents == 1;
++    };
+     std::vector<CellInfo *> mux_roots;
+     for (auto &cell : ctx->cells) {
+         CellInfo *ci = cell.second.get();
+@@ -631,14 +645,10 @@ void XilinxPacker::pack_muxfs()
+         if (ci->type == id_MUXF9) {
+             log_error("MUXF9 is not supported on xc7!\n");
+         } else if (ci->type == id_MUXF8) {
+-            NetInfo *o = ci->getPort(id_O);
+-            if (o == nullptr || o->users.entries() != 1 || (*o->users.begin()).cell->type != id_MUXF9 ||
+-                is_constrained((*o->users.begin()).cell) || (*o->users.begin()).port == id_S)
++            if (!feeds_one_parent_mux(ci, id_MUXF9))
+                 mux_roots.push_back(ci);
+         } else if (ci->type == id_MUXF7) {
+-            NetInfo *o = ci->getPort(id_O);
+-            if (o == nullptr || o->users.entries() != 1 || (*o->users.begin()).cell->type != id_MUXF8 ||
+-                is_constrained((*o->users.begin()).cell) || (*o->users.begin()).port == id_S)
++            if (!feeds_one_parent_mux(ci, id_MUXF8))
+                 mux_roots.push_back(ci);
+         }
+     }

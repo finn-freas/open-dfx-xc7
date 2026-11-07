@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] router2: --router2-region-keep-out-crit C
+
+With --router2-region-keep-out, an arc that would be kept out of the
+regions but whose criticality is at least C in router2's first timing
+analysis may cross them.  Decided once, so the rule an arc routes under
+does not change between iterations.  Without the option nothing changes.
+---
+ common/kernel/command.cc |  6 ++++++
+ common/route/router2.cc  | 38 ++++++++++++++++++++++++++++++++++++--
+ common/route/router2.h   |  3 +++
+ 3 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/common/kernel/command.cc b/common/kernel/command.cc
+index 1f23b661..16a34b61 100644
+--- a/common/kernel/command.cc
++++ b/common/kernel/command.cc
+@@ -431,6 +431,9 @@ po::options_description CommandHandler::getGeneralOptions()
+     general.add_options()("router2-region-keep-out",
+                           "keep arcs that are not held to a routing region out of it, unless the region holds "
+                           "their driver or sink (locked routing is left alone)");
++    general.add_options()("router2-region-keep-out-crit", po::value<float>(),
++                          "under --router2-region-keep-out, let the arcs whose criticality is at least this value when "
++                          "routing starts cross the regions (default: none)");
+ 
+     general.add_options()("report", po::value<std::string>(),
+                           "write timing and utilization report in JSON format to file");
+@@ -600,6 +603,9 @@ void CommandHandler::setupContext(Context *ctx)
+         ctx->settings[ctx->id("router2/slackOrder")] = true;
+     if (vm.count("router2-region-keep-out"))
+         ctx->settings[ctx->id("router2/regionKeepOut")] = true;
++    if (vm.count("router2-region-keep-out-crit"))
++        ctx->settings[ctx->id("router2/regionKeepOutCrit")] =
++                std::to_string(vm["router2-region-keep-out-crit"].as<float>());
+ 
+     if (vm.count("static-dump-density"))
+         ctx->settings[ctx->id("static/dump_density")] = true;
+diff --git a/common/route/router2.cc b/common/route/router2.cc
+index 07113c94..235874fb 100644
+--- a/common/route/router2.cc
++++ b/common/route/router2.cc
+@@ -73,6 +73,9 @@ struct Router2
+ 
+         WireId part_pin;
+         bool part_pin_is_source = false;
++
++
++        bool keep_out_exempt = false;
+     };
+ 
+     // As we allow overlap at first; the nextpnr bind functions can't be used
+@@ -295,7 +298,7 @@ struct Router2
+             return true;
+         if (ad.contain_region != -1)
+             return hop_is_in_region(ad.contain_region, pip, wd);
+-        if (cfg.region_keep_out) {
++        if (cfg.region_keep_out && !ad.keep_out_exempt) {
+             int r = hop_region(pip, wd);
+             return r == -1 || r == ad.driver_region || r == ad.sink_region;
+         }
+@@ -842,7 +845,7 @@ struct Router2
+         if (route_regions.empty())
+             return false;
+         auto &ad = nets.at(net->udata).arcs.at(usr.idx()).at(phys_pin);
+-        const bool arc_has_region_rules = ad.contain_region != -1 || cfg.region_keep_out;
++        const bool arc_has_region_rules = ad.contain_region != -1 || (cfg.region_keep_out && !ad.keep_out_exempt);
+         if (!arc_has_region_rules)
+             return false;
+ 
+@@ -916,6 +919,35 @@ struct Router2
+             log_warning("%d locked arc(s) break their routing region\n", locked_breaking);
+     }
+ 
++
++
++
++
++
++    void exempt_critical_arcs()
++    {
++        if (route_regions.empty() || !cfg.region_keep_out || cfg.region_keep_out_crit >= 1.0f || !timing_driven)
++            return;
++        int exempt = 0, kept = 0;
++        for (auto net : nets_by_udata) {
++            auto &nd = nets.at(net->udata);
++            for (auto usr : net->users.enumerate()) {
++                float crit = tmg.get_criticality(CellPortKey(usr.value));
++                for (auto &ad : nd.arcs.at(usr.index.idx())) {
++                    if (ad.contain_region != -1)
++                        continue;
++                    ad.keep_out_exempt = crit >= cfg.region_keep_out_crit;
++                    if (ad.keep_out_exempt)
++                        ++exempt;
++                    else
++                        ++kept;
++                }
++            }
++        }
++        log_info("Routing regions: %d arc(s) at criticality %.2f or more may cross the regions, %d kept out\n", exempt,
++                 cfg.region_keep_out_crit, kept);
++    }
++
+     // Returns true if a wire contains no sink port
+     bool is_wire_unusable(WireId wire, const NetInfo *net, const pool<WireId> &sink_wires, int iter_count = 0)
+     {
+@@ -2676,6 +2708,7 @@ struct Router2
+         log_info("Running main router loop...\n");
+         if (timing_driven)
+             tmg.run(true);
++        exempt_critical_arcs();
+         do {
+             ctx->sorted_shuffle(route_queue);
+ 
+@@ -2844,6 +2877,7 @@ Router2Cfg::Router2Cfg(Context *ctx)
+ 
+     region_contain_constants = ctx->setting<bool>("router2/regionContainConstants", true);
+     region_keep_out = ctx->setting<bool>("router2/regionKeepOut", false);
++    region_keep_out_crit = ctx->setting<float>("router2/regionKeepOutCrit", 1.1f);
+     ipin_cost_adder = ctx->setting<float>("router2/ipinCostAdder", 0.0f);
+     bias_cost_factor = ctx->setting<float>("router2/biasCostFactor", 0.25f);
+     if (ctx->settings.count(ctx->id("router2/alt-weights"))) {
+diff --git a/common/route/router2.h b/common/route/router2.h
+index b2f33c5c..c5bbeac3 100644
+--- a/common/route/router2.h
++++ b/common/route/router2.h
+@@ -90,6 +90,9 @@ struct Router2Cfg
+ 
+     bool region_contain_constants;
+     bool region_keep_out;
++
++
++    float region_keep_out_crit;
+ 
+     // Print additional performance profiling information
+     bool perf_profile = false;

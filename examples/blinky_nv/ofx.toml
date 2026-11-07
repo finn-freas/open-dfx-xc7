@@ -1,0 +1,10 @@
+[project]
+name = "blinky_nv"
+top = "blinky_nv"
+board = "nexys-video"
+sources = ["src/blinky_nv.v"]
+constraints = ["constraints/blinky_nv.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0

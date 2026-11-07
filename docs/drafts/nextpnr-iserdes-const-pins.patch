@@ -1,0 +1,17 @@
+diff --git a/himbaechel/uarch/xilinx/pack_io.cc b/himbaechel/uarch/xilinx/pack_io.cc
+index 4e2fdc01..d4d24def 100644
+--- a/himbaechel/uarch/xilinx/pack_io.cc
++++ b/himbaechel/uarch/xilinx/pack_io.cc
+@@ -1142,6 +1142,12 @@ void XC7Packer::pack_iologic()
+             fold_inverter(ci, "CLKB");
+             fold_inverter(ci, "OCLKB");
+ 
++            for (IdString port : {id_SHIFTIN1, id_SHIFTIN2, id_OFB, id_DDLY, id_OCLK, id_OCLKB, id_CLKDIVP}) {
++                NetInfo *net = ci->getPort(port);
++                if (net && (net->name == ctx->id("$PACKER_GND_NET") || net->name == ctx->id("$PACKER_VCC_NET")))
++                    ci->disconnectPort(port);
++            }
++
+             // OFB loopback: the data path is the partner OSERDESE2's OFB
+             // output, so the cell has no IOB / IDELAYE2 to anchor on and is
+             // bound next to its OSERDESE2 in the unconstrained pass below.

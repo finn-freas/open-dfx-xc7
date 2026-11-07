@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: add --partial option for 7-series partial bitstream
+ SRAM load
+
+program_mem() always shifts JPROGRAM before CFG_IN, which clears the
+whole configuration memory and makes partial reconfiguration impossible.
+With --partial (7-series, SRAM/MEM mode only) JPROGRAM, the INIT_B poll
+and the following 10000-cycle wait are skipped, and JSTART is not sent
+after the data load. The final IR capture / STAT readout is kept.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/main.cpp   |  9 +++++++--
+ src/xilinx.cpp | 49 ++++++++++++++++++++++++++++++++++++-------------
+ src/xilinx.hpp |  3 ++-
+ 3 files changed, 45 insertions(+), 16 deletions(-)
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 2fed5fb..a585a93 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -132,6 +132,7 @@ struct arguments {
+ 	bool read_xadc;
+ 	std::string read_register;
+ 	std::string user_flash;
++	bool partial;
+ };
+ 
+ int run_xvc_server(const struct arguments &args, const cable_t &cable,
+@@ -172,7 +173,8 @@ int main(int argc, char **argv)
+ 			false, 3721, "-",
+ 			"", false, {},  // mcufw conmcu, user_misc_dev_list
+ 			false, false, "", // read_dna, read_xadc, read_register
+-			"" // user_flash
++			"",
++			false,
+ 	};
+ 	/* parse arguments */
+ 	int ret = parse_opt(argc, argv, &args, &pins_config);
+@@ -545,7 +547,7 @@ int main(int argc, char **argv)
+ 			fpga = new Xilinx(jtag, args.bit_file, args.secondary_bit_file,
+ 				args.file_type, args.prg_type, args.fpga_part, args.spi_flash_type, args.bridge_path,
+ 				args.target_flash, args.verify, args.verbose, args.skip_load_bridge, args.skip_reset,
+-				args.read_dna, args.read_xadc);
++				args.read_dna, args.read_xadc, args.partial);
+ #else
+ 			printError("Support for Xilinx FPGAs was not enabled at compile time");
+ 			delete(jtag);
+@@ -1022,6 +1024,9 @@ int parse_opt(int argc, char **argv, struct arguments *args,
+ 				cxxopts::value<unsigned int>(args->offset))
+ 			("pins", "pin config TDI:TDO:TCK:TMS or MOSI:MISO:SCK:CS[:HOLDN:WPN]",
+ 				cxxopts::value<std::vector<std::string>>(pins))
++			("partial", "load a partial bitstream to SRAM without "
++				"clearing the device (Xilinx 7-series only)",
++				cxxopts::value<bool>(args->partial))
+ 			("probe-firmware", "firmware for JTAG probe (usbBlasterII/xilinxPlatformCableUsb)",
+ 				cxxopts::value<std::string>(args->probe_firmware))
+ 			("protect-flash",   "protect SPI flash area",
+diff --git a/src/xilinx.cpp b/src/xilinx.cpp
+index 276531c..5b166ef 100644
+--- a/src/xilinx.cpp
++++ b/src/xilinx.cpp
+@@ -326,13 +326,14 @@ Xilinx::Xilinx(Jtag *jtag, const std::string &filename,
+ 	const std::string &spiOverJtagPath,
+ 	const std::string &target_flash,
+ 	bool verify, int8_t verbose,
+-	bool skip_load_bridge, bool skip_reset, bool read_dna, bool read_xadc):
++	bool skip_load_bridge, bool skip_reset, bool read_dna, bool read_xadc,
++	bool partial):
+ 	Device(jtag, filename, file_type, verify, verbose),
+ 	FlashInterface(filename, verbose, 256, verify, skip_load_bridge,
+ 				 skip_reset),
+ 	_device_package(device_package), _spiOverJtagPath(spiOverJtagPath),
+ 	_irlen(6), _secondary_filename(secondary_filename), _soj_is_v2(false),
+-	_jtag_chain_len(1), _is_bpi_board(!spi_flash_type)
++	_jtag_chain_len(1), _is_bpi_board(!spi_flash_type), _partial(partial)
+ {
+ 	if (prg_type == Device::RD_FLASH) {
+ 		_mode = Device::READ_MODE;
+@@ -727,6 +728,15 @@ void Xilinx::program(unsigned int offset, bool unprotect_flash)
+ 			}
+ 		}
+ 	} else {
++		if (_partial && (_mode != Device::MEM_MODE ||
++				(_fpga_family != ARTIX_FAMILY &&
++				_fpga_family != SPARTAN7_FAMILY &&
++				_fpga_family != KINTEX_FAMILY &&
++				_fpga_family != ZYNQ_FAMILY))) {
++			delete bit;
++			throw std::runtime_error("Error: --partial is only supported "
++				"for SRAM load of Xilinx 7-series devices");
++		}
+ 		if (_fpga_family == SPARTAN3_FAMILY)
+ 			xc3s_flow_program(bit);
+ 		else
+@@ -975,17 +985,26 @@ void Xilinx::program_mem(ConfigBitstreamParser *bitfile)
+ 	 *    TCK five times. This ensures starting in        X     1   5
+ 	 *    the TLR (Test-Logic-Reset) state.
+ 	 */
+-	_jtag->shiftIR(get_ircode(_ircode_map, "JPROGRAM"), NULL, _irlen);
+-	/* Poll INIT_B (bit 4 of IR capture) until config memory is cleared */
+ 	tx_buf = get_ircode(_ircode_map, "BYPASS");
+-	do {
+-		_jtag->shiftIR(tx_buf, rx_buf, _irlen);
+-	} while (!(rx_buf[0] & 0x10));
+-	/*
+-	 * 8: Move into the RTI state.                        X     0   10,000(1)
+-	 */
+-	_jtag->set_state(Jtag::RUN_TEST_IDLE);
+-	_jtag->toggleClk(10000*12);
++	if (_partial) {
++
++
++
++
++		printInfo("Partial bitstream: skip JPROGRAM");
++		_jtag->set_state(Jtag::RUN_TEST_IDLE);
++	} else {
++		_jtag->shiftIR(get_ircode(_ircode_map, "JPROGRAM"), NULL, _irlen);
++
++		do {
++			_jtag->shiftIR(tx_buf, rx_buf, _irlen);
++		} while (!(rx_buf[0] & 0x10));
++
++
++
++		_jtag->set_state(Jtag::RUN_TEST_IDLE);
++		_jtag->toggleClk(10000*12);
++	}
+ 	/*
+ 	 * 9: Start loading the CFG_IN instruction,
+ 	 *    LSB first:                                    00101   0   5
+@@ -1064,7 +1083,11 @@ void Xilinx::program_mem(ConfigBitstreamParser *bitfile)
+ 		* 20: Load the last bit of the JSTART instruction.   0     1   1
+ 		* 21: Move to the UPDATE-IR state.                   X     1   1
+ 		*/
+-		_jtag->shiftIR(get_ircode(_ircode_map, "JSTART"), NULL, _irlen, Jtag::UPDATE_IR);
++
++
++
++		if (!_partial)
++			_jtag->shiftIR(get_ircode(_ircode_map, "JSTART"), NULL, _irlen, Jtag::UPDATE_IR);
+ 		/*
+ 		* 22: Move to the RTI state and clock the
+ 		*     startup sequence by applying a minimum         X     0   2000
+diff --git a/src/xilinx.hpp b/src/xilinx.hpp
+index 659494c..a1374cc 100644
+--- a/src/xilinx.hpp
++++ b/src/xilinx.hpp
+@@ -30,7 +30,7 @@ class Xilinx: public Device, FlashInterface {
+ 				const std::string &target_flash,
+ 				bool verify, int8_t verbose,
+ 				bool skip_load_bridge, bool skip_reset,
+-				bool read_dna, bool read_xadc);
++				bool read_dna, bool read_xadc, bool partial = false);
+ 		~Xilinx();
+ 
+ 		void program(unsigned int offset, bool unprotect_flash) override;
+@@ -279,6 +279,7 @@ class Xilinx: public Device, FlashInterface {
+ 		bool _soj_is_v2; /* SpiOverJtag version (1.0 or 2.0) */
+ 		uint32_t _jtag_chain_len; /* Jtag Chain Length */
+ 		bool _is_bpi_board; /* true if board uses BPI parallel flash */
++		bool _partial;
+ 		std::unique_ptr<BPIFlash> _bpi_flash; /* BPI flash instance */
+ };
+ 

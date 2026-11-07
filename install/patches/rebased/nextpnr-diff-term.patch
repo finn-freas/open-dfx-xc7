@@ -1,0 +1,65 @@
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index cd9f0854..c8a2e6a9 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -1502,6 +1502,7 @@ struct FasmBackend
+                     fasm_ctx.back() = saved;
+                 }
+             }
++            bool terminated_receiver = false;
+             if (!is_diff) {
+                 if (iostandard == "LVCMOS33" || iostandard == "LVTTL" || iostandard == "LVCMOS25") {
+                     if (!is_riob18)
+@@ -1625,12 +1626,33 @@ struct FasmBackend
+                     write_bit("LVDS_25_SSTL135_SSTL15.IN_DIFF");
+                 }
+ 
++
++
++
++
++
++
++
++                const std::string diff_term = str_or_default(pad->attrs, ctx->id("DIFF_TERM"), "FALSE");
++                const bool wants_diff_term = diff_term == "TRUE" || diff_term == "true" || diff_term == "1";
++                if (wants_diff_term) {
++                    const bool termination_known = is_lvds25 && !is_hp_bank;
++                    if (!termination_known)
++                        log_error("DIFF_TERM on %s (%s, tile %s) is not supported\n", ctx->nameOf(pad),
++                                  iostandard.c_str(), tile.c_str());
++                    terminated_receiver = is_master_half && !is_output;
++                }
++
+                 if (pad->attrs.count(id_IN_TERM))
+                     write_bit("IN_TERM." + pad->attrs.at(id_IN_TERM).as_string());
+             }
+ 
+-            // IN_ONLY
+-            if (!is_output) {
++
++
++
++            if (terminated_receiver) {
++                write_bit("LVDS_25.IN_ONLY_DIFF_TERM");
++            } else if (!is_output) {
+                 if (is_riob18) {
+                     bool is_diff_master_half = is_diff && is_master_half;
+                     if (is_diff_master_half) {
+diff --git a/himbaechel/uarch/xilinx/xdc.cc b/himbaechel/uarch/xilinx/xdc.cc
+index 3de04e26..cb82718c 100644
+--- a/himbaechel/uarch/xilinx/xdc.cc
++++ b/himbaechel/uarch/xilinx/xdc.cc
+@@ -773,11 +773,10 @@ void XilinxImpl::parse_xdc(const std::string &filename)
+             // The properties place and route reads: the pad's site, standard, drive,
+             // slew, pull and termination, and the site or bel of a cell
+             const pool<std::string> applied = {"PACKAGE_PIN", "LOC", "BEL", "IOSTANDARD", "DRIVE",
+-                                               "SLEW", "PULLTYPE", "IN_TERM", "IOB", "ASYNC_REG"};
++                                               "SLEW", "PULLTYPE", "IN_TERM", "DIFF_TERM", "IOB", "ASYNC_REG"};
+             // Net properties place and route reads
+             const pool<std::string> net_applied = {"CLOCK_DEDICATED_ROUTE"};
+             const dict<std::string, std::string> why_not_applied = {
+-                    {"DIFF_TERM", "nothing writes the differential termination, so the input is left unterminated"},
+                     {"KEEP", "synthesis is over when the XDC is read; put it in the RTL for yosys"},
+                     {"DONT_TOUCH", "synthesis is over when the XDC is read; put it in the RTL for yosys"},
+                     {"KEEP_HIERARCHY", "the netlist is already flat when the XDC is read"},

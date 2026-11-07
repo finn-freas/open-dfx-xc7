@@ -1,0 +1,7 @@
+xilinx: no LUT route-through in a routing-contained pblock for a net that leaves it
+
+A LUT route-through in a logic tile of a pblock that contains its
+routing belongs to the pblock's own logic: a later module built for the
+same pblock may place a cell on that LUT.  Only a net whose driver and
+users are all members of the pblock may take one; checkPipAvailForNet
+refuses it for any other net.  No-op without pblocks.

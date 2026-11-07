@@ -1,0 +1,10 @@
+xilinx: a pblock member on its own pblock's bel is not new in a closed tile
+
+-o prerouted closes every tile that a reference route passes through, and
+isBelLocationValid then rejects a cell without a BEL attribute in such a
+tile.  In a partial-reconfiguration flow the static nets that feed a
+partition are replayed up to the partition's own cells, so their tiles are
+closed, and a module cell that the packer puts into the same slice is
+rejected.  A member of an EXCLUDE_PLACEMENT pblock that sits on one of
+that pblock's own bels is not counted as new: no static cell can use those
+bels anyway.

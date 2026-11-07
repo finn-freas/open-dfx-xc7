@@ -1,0 +1,125 @@
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index ca36c6a4..100a8d77 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -112,6 +112,9 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("hardblock-timing", po::value<std::string>()->implicit_value(""),
+                            "time the DSP48E1 and ICAPE2 pins with the prjxray-db SDF arcs (off by default: they are "
+                            "untimed); see hardblock_timing.cc");
++    specific.add_options()("dsp-cascade-place", po::value<std::string>()->implicit_value(""),
++                           "place a DSP48E1 cascade chain along the chipdb's PCOUT -> PCIN wires, so that it can "
++                           "cross an HCLK or BRKH row (off by default: a fixed 5-row step per DSP tile)");
+     specific.add_options()("hold-detour-max", po::value<double>(),
+                            "hold deficit (ns) up to which a routing detour is used instead of a feedthrough LUT "
+                            "(default 0.5)");
+@@ -198,6 +201,7 @@ void XilinxImpl::init(Context *ctx)
+ {
+     h.init(ctx);
+     HimbaechelAPI::init(ctx);
++    dsp_cascade_place = ctx->args.options.count("dsp-cascade-place");
+ 
+     // Resolve the repeated-name bel types once (the placer looks buckets up per
+     // cell); everything else buckets as its own type.
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 78dc5886..cc8c3442 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -158,6 +158,10 @@ struct XilinxImpl : HimbaechelAPI
+                              std::vector<std::pair<CellInfo *, BelId>> &placement) const override;
+     Loc getClusterOffset(const CellInfo *cell) const override;
+     BelId bram_cascade_next(BelId bel) const;
++
++    BelId dsp_cascade_next(BelId bel) const;
++    BelId cascade_next(BelId bel, IdString cascade_out, IdString cascade_in, IdString bel_type) const;
++    bool dsp_cascade_place = false;
+ 
+     // Pips
+     // Lazily-built copy of fasm.cc's pseudo-pip table, so is_pip_unavail can
+diff --git a/himbaechel/uarch/xilinx/xilinx_place.cc b/himbaechel/uarch/xilinx/xilinx_place.cc
+index 2c87e9af..8b3003fa 100644
+--- a/himbaechel/uarch/xilinx/xilinx_place.cc
++++ b/himbaechel/uarch/xilinx/xilinx_place.cc
+@@ -752,8 +752,20 @@ bool XilinxImpl::isBelLocationValid(BelId bel, bool explain_invalid) const
+ // above; BelId() at the top of a column.
+ BelId XilinxImpl::bram_cascade_next(BelId bel) const
+ {
+-    IdString cascade_in = ctx->id("CASCADEINA");
+-    std::vector<WireId> frontier{ctx->getBelPinWire(bel, ctx->id("CASCADEOUTA"))}, next;
++    return cascade_next(bel, ctx->id("CASCADEOUTA"), ctx->id("CASCADEINA"), id_RAMB36E1_RAMB36E1);
++}
++
++
++
++
++BelId XilinxImpl::dsp_cascade_next(BelId bel) const
++{
++    return cascade_next(bel, ctx->id("PCOUT0"), ctx->id("PCIN0"), id_DSP48E1_DSP48E1);
++}
++
++BelId XilinxImpl::cascade_next(BelId bel, IdString cascade_out, IdString cascade_in, IdString bel_type) const
++{
++    std::vector<WireId> frontier{ctx->getBelPinWire(bel, cascade_out)}, next;
+     for (int hop = 0; hop < 3; hop++) {
+         next.clear();
+         for (WireId wire : frontier) {
+@@ -766,7 +778,7 @@ BelId XilinxImpl::bram_cascade_next(BelId bel) const
+         for (WireId wire : next) {
+             for (auto bp : ctx->getWireBelPins(wire)) {
+                 const bool is_next_cascade_input =
+-                        bp.pin == cascade_in && bp.bel != bel && ctx->getBelType(bp.bel) == id_RAMB36E1_RAMB36E1;
++                        bp.pin == cascade_in && bp.bel != bel && ctx->getBelType(bp.bel) == bel_type;
+                 if (is_next_cascade_input)
+                     return bp.bel;
+             }
+@@ -781,6 +793,7 @@ bool XilinxImpl::getClusterPlacement(ClusterId cluster, BelId root_bel,
+ {
+     CellInfo *root = getClusterRootCell(cluster);
+     const bool is_a_bram_cascade = root->type == id_RAMB36E1_RAMB36E1;
++    const bool is_a_dsp_cascade = root->type == id_DSP48E1_DSP48E1 && dsp_cascade_place;
+     const bool is_a_synchronizer = root->attrs.count(ctx->id("X_ASYNC_REG_CHAIN")) > 0;
+     if (is_a_synchronizer) {
+         // every stage in the slice of the first, A to D
+@@ -794,8 +807,15 @@ bool XilinxImpl::getClusterPlacement(ClusterId cluster, BelId root_bel,
+         }
+         return true;
+     }
+-    if (!is_a_bram_cascade)
++    if (!is_a_bram_cascade && !is_a_dsp_cascade)
+         return HimbaechelAPI::getClusterPlacement(cluster, root_bel, placement);
++    if (is_a_dsp_cascade && root->constr_abs_z) {
++        Loc root_loc = ctx->getBelLocation(root_bel);
++        root_loc.z = root->constr_z;
++        root_bel = ctx->getBelByLocation(root_loc);
++        if (root_bel == BelId())
++            return false;
++    }
+     const bool root_bel_fits = ctx->isValidBelForCellType(root->type, root_bel);
+     if (!root_bel_fits)
+         return false;
+@@ -803,7 +823,7 @@ bool XilinxImpl::getClusterPlacement(ClusterId cluster, BelId root_bel,
+     placement.emplace_back(root, root_bel);
+     BelId bel = root_bel;
+     for (CellInfo *child : root->constr_children) {
+-        bel = bram_cascade_next(bel);
++        bel = is_a_dsp_cascade ? dsp_cascade_next(bel) : bram_cascade_next(bel);
+         const bool the_column_continues = bel != BelId();
+         if (!the_column_continues)
+             return false;
+@@ -820,14 +840,15 @@ Loc XilinxImpl::getClusterOffset(const CellInfo *cell) const
+ {
+     CellInfo *root = getClusterRootCell(cell->cluster);
+     const bool in_a_bram_cascade = root->type == id_RAMB36E1_RAMB36E1 && root != cell;
++    const bool in_a_dsp_cascade = root->type == id_DSP48E1_DSP48E1 && root != cell && dsp_cascade_place;
+     const bool root_is_placed = root->bel != BelId();
+-    const bool offset_follows_the_chipdb = in_a_bram_cascade && root_is_placed;
++    const bool offset_follows_the_chipdb = (in_a_bram_cascade || in_a_dsp_cascade) && root_is_placed;
+     if (!offset_follows_the_chipdb)
+         return HimbaechelAPI::getClusterOffset(cell);
+     Loc root_loc = ctx->getBelLocation(root->bel);
+     BelId bel = root->bel;
+     for (CellInfo *child : root->constr_children) {
+-        bel = bram_cascade_next(bel);
++        bel = in_a_dsp_cascade ? dsp_cascade_next(bel) : bram_cascade_next(bel);
+         const bool the_column_ends = bel == BelId();
+         if (the_column_ends)
+             break;

@@ -1,0 +1,24 @@
+[project]
+name = "dfxpp_z7"
+top = "dfxpp_z7"
+board = "zybo-z7-20"
+sources = ["src/dfxpp_z7.v"]
+constraints = ["constraints/dfxpp_z7.xdc"]
+seed = 1
+
+[clocks]
+clk = 8.0
+
+[dfx]
+partpins = "auto"
+rar = false
+compress = false
+decoupler = false
+
+[[dfx.partition]]
+name = "rp0"
+inst = "u_rm"
+region = "SLICE_X40Y50:SLICE_X43Y99"
+ports = "rm/ports.json"
+register = ["ready"]
+rms = { xor = "rm/rm_core_xor.v", andn = "rm/rm_core_andn.v" }

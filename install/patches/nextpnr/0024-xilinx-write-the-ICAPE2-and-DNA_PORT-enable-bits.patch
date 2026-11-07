@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx: write the ICAPE2 and DNA_PORT enable bits
+
+CFG_CENTER_MID.ICAP.IN_USE for an ICAPE2 on ICAP_X0Y0 (a warning for the
+other site) and CFG_CENTER_MID.DNA_PORT.IN_USE for a placed DNA_PORT, as
+Vivado sets them.  Needs the two prjxray-db features.
+---
+ himbaechel/uarch/xilinx/fasm.cc | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index c8a2e6a9..d4375c84 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -3283,6 +3283,7 @@ struct FasmBackend
+ 
+     void write_cfg()
+     {
++        bool dna_port_used = false;
+         for (auto &cell : ctx->cells) {
+             CellInfo *ci = cell.second.get();
+             if (ci->bel == BelId())
+@@ -3313,8 +3314,20 @@ struct FasmBackend
+                     write_bit("ICAP_WIDTH_X16");
+                 if (width == "X8")
+                     write_bit("ICAP_WIDTH_X8");
++
++
++                const bool is_first_icap = boost::contains(ctx->nameOfBel(ci->bel), "ICAP_X0Y0");
++                if (is_first_icap)
++                    write_bit("IN_USE");
++                else
++                    log_warning("%s: the enable bits of %s are not known; not written\n", ctx->nameOf(ci),
++                                ctx->nameOfBel(ci->bel));
+                 pop();
+             }
++
++
++            if (ci->type == id_DNA_PORT_DNA_PORT)
++                dna_port_used = true;
+             if (ci->type == id_STARTUP_STARTUP) {
+                 std::string prog_usr = str_or_default(ci->params, id_PROG_USR, "FALSE");
+                 bool invalid_prog_usr = prog_usr != "TRUE" && prog_usr != "FALSE";
+@@ -3330,6 +3343,16 @@ struct FasmBackend
+             }
+             pop();
+         }
++        if (!dna_port_used)
++            return;
++        for (int tile = 0; tile < ctx->chip_info->tile_insts.ssize(); tile++) {
++            const std::string tile_name = uarch->tile_name(tile);
++            if (!boost::starts_with(tile_name, "CFG_CENTER_MID_"))
++                continue;
++            push(tile_name);
++            write_bit("DNA_PORT.IN_USE");
++            pop();
++        }
+     }
+ 
+     void write_ibufds_gte2(CellInfo * ci)

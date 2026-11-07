@@ -1,0 +1,10 @@
+[project]
+name = "blinky_cma7"
+top = "blinky_cma7"
+board = "cmod-a7-35t"
+sources = ["src/blinky_cma7.v"]
+constraints = ["constraints/blinky_cma7.xdc"]
+seed = 1
+
+[clocks]
+clk = 83.333

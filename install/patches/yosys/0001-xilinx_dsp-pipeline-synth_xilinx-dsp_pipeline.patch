@@ -1,0 +1,567 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] xilinx_dsp: -pipeline (synth_xilinx -dsp_pipeline)
+
+Under -pipeline, for xc7:
+- input registers of one DSP A or B input that are split over several
+  register cells with the same clock and enable are merged (a reset
+  that not all bits share is moved into D), so A2REG/B2REG are packed;
+- an A/B cascade may pass through two registers (ACASCREG/BCASCREG=2);
+- a reset-free register after a fabric $add tree of DSP P outputs is
+  moved back onto those outputs and packed into PREG where PCOUT is
+  unused.
+Without the option the pass takes the old path.
+---
+ techlibs/xilinx/synth_xilinx.cc        |  15 +-
+ techlibs/xilinx/xilinx_dsp.cc          | 362 +++++++++++++++++++++++++
+ techlibs/xilinx/xilinx_dsp_cascade.pmg |  51 ++++
+ 3 files changed, 425 insertions(+), 3 deletions(-)
+
+diff --git a/techlibs/xilinx/synth_xilinx.cc b/techlibs/xilinx/synth_xilinx.cc
+index 0c53d2772..564fd718b 100644
+--- a/techlibs/xilinx/synth_xilinx.cc
++++ b/techlibs/xilinx/synth_xilinx.cc
+@@ -108,6 +108,10 @@ struct SynthXilinxPass : public ScriptPass
+ 		log("    -nodsp\n");
+ 		log("        do not use DSP48*s to implement multipliers and associated logic\n");
+ 		log("\n");
++		log("    -dsp_pipeline\n");
++		log("        pass '-pipeline' to xilinx_dsp (xc7 only): pack more DSP48E1 pipeline\n");
++		log("        registers, see 'help xilinx_dsp'\n");
++		log("\n");
+ 		log("    -noiopad\n");
+ 		log("        disable I/O buffer insertion (useful for hierarchical or \n");
+ 		log("        out-of-context flows)\n");
+@@ -145,7 +149,7 @@ struct SynthXilinxPass : public ScriptPass
+ 	}
+ 
+ 	std::string top_opt, edif_file, blif_file, json_file, family;
+-	bool flatten, ise, noiopad, noclkbuf, nobram, nolutram, nosrl, nocarry, nowidelut, nodsp, uram;
++	bool flatten, ise, noiopad, noclkbuf, nobram, nolutram, nosrl, nocarry, nowidelut, nodsp, dsp_pipeline, uram;
+ 	bool dff;
+ 	bool flatten_before_abc;
+ 	int widemux;
+@@ -169,6 +173,7 @@ struct SynthXilinxPass : public ScriptPass
+ 		nocarry = false;
+ 		nowidelut = false;
+ 		nodsp = false;
++		dsp_pipeline = false;
+ 		uram = false;
+ 		dff = false;
+ 		flatten_before_abc = false;
+@@ -272,6 +277,10 @@ struct SynthXilinxPass : public ScriptPass
+ 				nodsp = true;
+ 				continue;
+ 			}
++			if (args[argidx] == "-dsp_pipeline") {
++				dsp_pipeline = true;
++				continue;
++			}
+ 			if (args[argidx] == "-uram") {
+ 				uram = true;
+ 				continue;
+@@ -448,9 +457,9 @@ struct SynthXilinxPass : public ScriptPass
+ 				run("wreduce");
+ 				run("select -clear");
+ 				if (help_mode)
+-					run("xilinx_dsp -family <family>");
++					run("xilinx_dsp -family <family> [-pipeline]");
+ 				else
+-					run("xilinx_dsp -family " + family);
++					run("xilinx_dsp -family " + family + (dsp_pipeline ? " -pipeline" : ""));
+ 				run("chtype -set $mul t:$__soft_mul");
+ 			}
+ 		}
+diff --git a/techlibs/xilinx/xilinx_dsp.cc b/techlibs/xilinx/xilinx_dsp.cc
+index a2ab554e7..f5bd1a18c 100644
+--- a/techlibs/xilinx/xilinx_dsp.cc
++++ b/techlibs/xilinx/xilinx_dsp.cc
+@@ -20,6 +20,8 @@
+ 
+ #include "kernel/yosys.h"
+ #include "kernel/sigtools.h"
++#include "kernel/ff.h"
++#include "kernel/ffinit.h"
+ #include <deque>
+ 
+ USING_YOSYS_NAMESPACE
+@@ -732,6 +734,342 @@ void xilinx_dsp_packC(xilinx_dsp_CREG_pm &pm)
+ 	pm.blacklist(cell);
+ }
+ 
++static SigSpec dsp_unextend(const SigSpec &sig)
++{
++	int i;
++	for (i = GetSize(sig)-1; i > 0; i--)
++		if (sig[i] != sig[i-1])
++			break;
++
++	if (sig[i].wire)
++		++i;
++	return sig.extract(0, i);
++}
++
++
++
++
++
++
++static void xilinx_dsp_merge_input_ffs(Module *module)
++{
++	SigMap sigmap(module);
++	FfInitVals initvals(&sigmap, module);
++	dict<SigBit, Cell*> q2ff;
++	auto index_ff = [&](Cell *cell) {
++		if (cell && cell->type.in(ID($dff), ID($dffe), ID($sdff), ID($sdffe), ID($sdffce)))
++			for (auto bit : sigmap(cell->getPort(ID::Q)))
++				q2ff[bit] = cell;
++	};
++	for (auto cell : module->cells())
++		index_ff(cell);
++
++	std::vector<Cell*> dsps;
++	for (auto cell : module->selected_cells())
++		if (cell->type == ID(DSP48E1))
++			dsps.push_back(cell);
++
++	for (auto dsp : dsps)
++	for (auto port : {ID::A, ID::B}) {
++		SigSpec sig = dsp_unextend(sigmap(dsp->getPort(port)));
++		pool<SigBit> bits;
++		std::vector<Cell*> ffs;
++		bool ok = !sig.empty();
++		for (auto bit : sig) {
++			if (!bit.wire || bits.count(bit) || !q2ff.count(bit)) {
++				ok = false;
++				break;
++			}
++			bits.insert(bit);
++			Cell *ff = q2ff.at(bit);
++			if (std::find(ffs.begin(), ffs.end(), ff) == ffs.end())
++				ffs.push_back(ff);
++		}
++		if (!ok || GetSize(ffs) < 2)
++			continue;
++
++		std::vector<FfData> ffd;
++		for (auto ff : ffs)
++			ffd.emplace_back(&initvals, ff);
++		const FfData &ff0 = ffd.front();
++		bool same_srst = true;
++		for (auto &ff : ffd) {
++			if (ff.is_fine || !ff.has_clk || !ff.pol_clk || ff.has_arst || ff.has_aload || ff.has_sr || ff.sig_clk != ff0.sig_clk)
++				ok = false;
++			if (ff.has_srst != ff0.has_srst || (ff.has_srst && (ff.sig_srst != ff0.sig_srst || ff.pol_srst != ff0.pol_srst || ff.ce_over_srst != ff0.ce_over_srst)))
++				same_srst = false;
++			for (int i = 0; i < ff.width; i++)
++				if (bits.count(sigmap(ff.sig_q[i])) && ff.val_init[i] != State::Sx && ff.val_init[i] != State::S0)
++					ok = false;
++		}
++
++
++
++		auto keeps_ce = [&](const FfData &ff) {
++			return ff.has_ce && (same_srst || !ff.has_srst || ff.ce_over_srst);
++		};
++		for (auto &ff : ffd)
++			if (keeps_ce(ff) != keeps_ce(ff0) || (keeps_ce(ff) && (ff.sig_ce != ff0.sig_ce || ff.pol_ce != ff0.pol_ce)))
++				ok = false;
++		if (!ok)
++			continue;
++
++		std::vector<FfData> parts;
++		dict<SigBit, std::pair<int, int>> where;
++		for (auto &ff : ffd) {
++			std::vector<int> in, out;
++			for (int i = 0; i < ff.width; i++)
++				(bits.count(sigmap(ff.sig_q[i])) ? in : out).push_back(i);
++			FfData part = ff.slice(in);
++			FfData rest = ff.slice(out);
++			ff.remove();
++			if (!out.empty())
++				index_ff(rest.emit());
++			if (!same_srst)
++				part.unmap_srst();
++			for (int i = 0; i < part.width; i++)
++				where[sigmap(part.sig_q[i])] = std::make_pair(GetSize(parts), i);
++			parts.push_back(part);
++		}
++
++		FfData merged = parts.front();
++		SigSpec d, q;
++		std::vector<State> init, srst;
++		for (auto bit : sig) {
++			auto &w = where.at(bit);
++			const FfData &part = parts[w.first];
++			d.append(part.sig_d[w.second]);
++			q.append(part.sig_q[w.second]);
++			init.push_back(part.val_init[w.second]);
++			if (merged.has_srst)
++				srst.push_back(part.val_srst[w.second]);
++		}
++		merged.sig_d = d;
++		merged.sig_q = q;
++		merged.width = GetSize(q);
++		merged.val_init = Const(init);
++		if (merged.has_srst)
++			merged.val_srst = Const(srst);
++		Cell *cell = merged.emit();
++		index_ff(cell);
++		log("  merged %d registers driving %s.%s into %s\n", GetSize(ffs), dsp, port == ID::A ? "A" : "B", cell);
++	}
++}
++
++
++
++
++
++
++
++
++
++static void xilinx_dsp_retime_output_ffs(Module *module)
++{
++	SigMap sigmap(module);
++	FfInitVals initvals(&sigmap, module);
++	dict<SigBit, Cell*> driver;
++	dict<SigBit, pool<Cell*>> users;
++	pool<SigBit> port_bits;
++	auto index = [&]() {
++		driver.clear();
++		users.clear();
++		port_bits.clear();
++		for (auto wire : module->wires())
++			if (wire->port_output)
++				for (auto bit : sigmap(wire))
++					port_bits.insert(bit);
++		for (auto cell : module->cells())
++			for (auto &conn : cell->connections())
++				for (auto bit : sigmap(conn.second)) {
++					if (!bit.wire)
++						continue;
++					if (cell->output(conn.first))
++						driver[bit] = cell;
++					if (cell->input(conn.first))
++						users[bit].insert(cell);
++				}
++	};
++	index();
++
++	dict<SigBit, Cell*> pbit;
++	for (auto cell : module->cells())
++		if (cell->type == ID(DSP48E1) && cell->getParam(ID(PREG)).as_int() == 0)
++			for (auto bit : sigmap(cell->getPort(ID::P)))
++				if (bit.wire)
++					pbit[bit] = cell;
++
++	std::vector<Cell*> ffs;
++	for (auto cell : module->selected_cells())
++		if (cell->type.in(ID($dff), ID($dffe)))
++			ffs.push_back(cell);
++
++	pool<Cell*> retimed;
++	for (auto cell : ffs) {
++		FfData ff(&initvals, cell);
++		if (!ff.pol_clk || !ff.val_init.is_fully_undef())
++			continue;
++		SigSpec D = sigmap(ff.sig_d);
++
++		pool<Cell*> tree;
++		std::vector<SigBit> todo(D.begin(), D.end());
++		while (!todo.empty()) {
++			SigBit bit = todo.back();
++			todo.pop_back();
++			auto it = driver.find(bit);
++			if (it == driver.end() || it->second->type != ID($add) || tree.count(it->second))
++				continue;
++			tree.insert(it->second);
++			for (auto b : sigmap(it->second->getPort(ID::A)))
++				todo.push_back(b);
++			for (auto b : sigmap(it->second->getPort(ID::B)))
++				todo.push_back(b);
++		}
++		for (bool changed = true; changed;) {
++			changed = false;
++			for (auto c : std::vector<Cell*>(tree.begin(), tree.end())) {
++				bool other = false;
++				for (auto b : sigmap(c->getPort(ID::Y))) {
++					if (port_bits.count(b))
++						other = true;
++					auto it = users.find(b);
++					if (it != users.end())
++						for (auto u : it->second)
++							if (u != cell && !tree.count(u))
++								other = true;
++				}
++				if (other) {
++					tree.erase(c);
++					changed = true;
++				}
++			}
++		}
++		if (tree.empty())
++			continue;
++
++		pool<Cell*> adders;
++		pool<SigBit> seen;
++		SigSpec leaves;
++		todo.assign(D.begin(), D.end());
++		while (!todo.empty()) {
++			SigBit bit = todo.back();
++			todo.pop_back();
++			if (!bit.wire || seen.count(bit))
++				continue;
++			seen.insert(bit);
++			auto it = driver.find(bit);
++			if (it != driver.end() && tree.count(it->second)) {
++				if (adders.insert(it->second).second) {
++					for (auto b : sigmap(it->second->getPort(ID::A)))
++						todo.push_back(b);
++					for (auto b : sigmap(it->second->getPort(ID::B)))
++						todo.push_back(b);
++				}
++			}
++			else
++				leaves.append(bit);
++		}
++		if (adders.empty() || leaves.empty())
++			continue;
++		bool ok = true;
++		dict<Cell*, SigSpec> by_dsp;
++		for (auto bit : leaves) {
++			if (!pbit.count(bit)) {
++				ok = false;
++				break;
++			}
++			by_dsp[pbit.at(bit)].append(bit);
++		}
++		if (!ok)
++			continue;
++
++		dict<SigBit, SigBit> rmap;
++		for (auto &it : by_dsp) {
++			Wire *w = module->addWire(NEW_ID, GetSize(it.second));
++			FfData nff = ff.slice({});
++			nff.sig_d = it.second;
++			nff.sig_q = w;
++			nff.width = GetSize(w);
++			nff.val_init = Const(State::Sx, nff.width);
++			for (int i = 0; i < GetSize(w); i++)
++				rmap[it.second[i]] = SigBit(w, i);
++			retimed.insert(nff.emit());
++		}
++		for (auto c : adders)
++			for (auto p : {ID::A, ID::B}) {
++				SigSpec s = sigmap(c->getPort(p));
++				s.replace(rmap);
++				c->setPort(p, s);
++			}
++		SigSpec newD = D;
++		newD.replace(rmap);
++		SigSpec Q = ff.sig_q;
++		for (auto bit : sigmap(Q))
++			driver.erase(bit);
++		ff.remove();
++		module->connect(Q, newD);
++		log("  moved register %s behind %d adder(s), onto the outputs of %d DSP48E1(s)\n", log_signal(Q), GetSize(adders), GetSize(by_dsp));
++	}
++	if (retimed.empty())
++		return;
++
++	sigmap.set(module);
++	index();
++	std::vector<Cell*> dsps;
++	for (auto cell : module->cells())
++		if (cell->type == ID(DSP48E1) && cell->getParam(ID(PREG)).as_int() == 0)
++			dsps.push_back(cell);
++	for (auto dsp : dsps) {
++		bool ok = true;
++		for (auto bit : sigmap(dsp->hasPort(ID(PCOUT)) ? dsp->getPort(ID(PCOUT)) : SigSpec()))
++			if (bit.wire && (users.count(bit) || port_bits.count(bit)))
++				ok = false;
++		SigSpec P = sigmap(dsp->getPort(ID::P));
++		dict<SigBit, int> ppos;
++		Cell *pff = nullptr;
++		for (int i = 0; i < GetSize(P); i++) {
++			if (!P[i].wire)
++				continue;
++			ppos[P[i]] = i;
++			if (port_bits.count(P[i]))
++				ok = false;
++			auto it = users.find(P[i]);
++			if (it == users.end())
++				continue;
++			for (auto u : it->second) {
++				if (!retimed.count(u) || (pff && pff != u))
++					ok = false;
++				pff = u;
++			}
++		}
++		if (!ok || !pff)
++			continue;
++		FfData ff(&initvals, pff);
++		SigSpec clk = sigmap(dsp->hasPort(ID::CLK) ? dsp->getPort(ID::CLK) : SigSpec());
++		if (GetSize(clk) == 1 && clk[0].wire && clk[0] != sigmap(ff.sig_clk[0]))
++			continue;
++		SigSpec newP = dsp->getPort(ID::P);
++		for (int i = 0; i < ff.width; i++) {
++			auto it = ppos.find(sigmap(ff.sig_d[i]));
++			if (it == ppos.end()) {
++				ok = false;
++				break;
++			}
++			newP[it->second] = ff.sig_q[i];
++		}
++		if (!ok)
++			continue;
++		ff.remove();
++		retimed.erase(pff);
++		dsp->setPort(ID::P, newP);
++		dsp->setPort(ID::CLK, ff.sig_clk);
++		dsp->setPort(ID(CEP), ff.has_ce ? (ff.pol_ce ? ff.sig_ce : module->Not(NEW_ID, ff.sig_ce)) : SigSpec(State::S1));
++		dsp->setPort(ID(RSTP), State::S0);
++		dsp->setParam(ID(PREG), 1);
++		log("  packed moved register into PREG of %s\n", dsp);
++	}
++}
++
+ struct XilinxDspPass : public Pass {
+ 	XilinxDspPass() : Pass("xilinx_dsp", "Xilinx: pack resources into DSPs") { }
+ 	void help() override
+@@ -774,12 +1112,25 @@ struct XilinxDspPass : public Pass {
+ 		log("        select the family to target\n");
+ 		log("        default: xc7\n");
+ 		log("\n");
++		log("    -pipeline\n");
++		log("        (xc7 only) use more of the DSP48E1 pipeline registers:\n");
++		log("          - registers that drive one 'A' or 'B' input but are split over\n");
++		log("            several cells (e.g. a sign bit with a reset of its own) are\n");
++		log("            merged first, so that they can be packed as A2REG/B2REG;\n");
++		log("          - [AB]COUT -> [AB]CIN cascades are also found through two\n");
++		log("            registers when the upstream DSP uses A1REG/B1REG\n");
++		log("            ([AB]CASCREG=2);\n");
++		log("          - a register after a fabric adder tree of DSP outputs (e.g. the\n");
++		log("            partial products of a wide multiplier) is moved back to the\n");
++		log("            DSP outputs and packed into PREG where 'PCOUT' is unused.\n");
++		log("\n");
+ 	}
+ 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
+ 	{
+ 		log_header(design, "Executing XILINX_DSP pass (pack resources into DSPs).\n");
+ 
+ 		std::string family = "xc7";
++		bool pipeline = false;
+ 		size_t argidx;
+ 		for (argidx = 1; argidx < args.size(); argidx++)
+ 		{
+@@ -787,6 +1138,10 @@ struct XilinxDspPass : public Pass {
+ 				family = args[++argidx];
+ 				continue;
+ 			}
++			if (args[argidx] == "-pipeline") {
++				pipeline = true;
++				continue;
++			}
+ 			break;
+ 		}
+ 		extra_args(args, argidx, design);
+@@ -802,6 +1157,9 @@ struct XilinxDspPass : public Pass {
+ 			if (design->scratchpad_get_bool("xilinx_dsp.multonly"))
+ 				continue;
+ 
++			if (pipeline && family == "xc7")
++				xilinx_dsp_merge_input_ffs(module);
++
+ 			// Experimental feature: pack $add/$sub cells with
+ 			//   (* use_dsp48="simd" *) into DSP48E1's using its
+ 			//   SIMD feature
+@@ -834,8 +1192,12 @@ struct XilinxDspPass : public Pass {
+ 			//   chains
+ 			{
+ 				xilinx_dsp_cascade_pm pm(module, module->selected_cells());
++				pm.ud_xilinx_dsp_cascade.pipeline = pipeline && family == "xc7";
+ 				pm.run_xilinx_dsp_cascade();
+ 			}
++
++			if (pipeline && family == "xc7")
++				xilinx_dsp_retime_output_ffs(module);
+ 		}
+ 	}
+ } XilinxDspPass;
+diff --git a/techlibs/xilinx/xilinx_dsp_cascade.pmg b/techlibs/xilinx/xilinx_dsp_cascade.pmg
+index 587de4713..7692e63d5 100644
+--- a/techlibs/xilinx/xilinx_dsp_cascade.pmg
++++ b/techlibs/xilinx/xilinx_dsp_cascade.pmg
+@@ -45,6 +45,7 @@ pattern xilinx_dsp_cascade
+ 
+ udata <std::function<SigSpec(const SigSpec&)>> unextend
+ udata <vector<std::tuple<Cell*,int,int,int>>> chain longest_chain
++udata <bool> pipeline
+ state <Cell*> next
+ state <SigBit> clock
+ state <int> AREG BREG
+@@ -269,6 +270,32 @@ code argQ clock AREG
+ 					if (dffD == unextend(port(prev, \A)))
+ 						AREG = 1;
+ 				}
++
++
++
++				if (AREG < 0 && dff && pipeline && param(prev, \AREG) == 2) {
++					Cell *ffA2 = dff;
++					if (!ffA2->type.in($sdff, $sdffe) && port(prev, \RSTA, State::S0) != State::S0)
++						goto reject_AREG;
++					if (!ffA2->type.in($dffe, $sdffe) && port(prev, \CEA2, State::S0) != State::S1)
++						goto reject_AREG;
++					if (ffA2->type.in($dffe, $sdffe) && (port(ffA2, \EN) != port(prev, \CEA2, State::S0) || !param(ffA2, \EN_POLARITY).as_bool()))
++						goto reject_AREG;
++					argQ = dffD;
++					subpattern(in_dffe);
++					if (dff) {
++						if (dff->type != ffA2->type)
++							goto reject_AREG;
++						if (dff->type.in($sdff, $sdffe) && (port(dff, \SRST) != port(ffA2, \SRST) || param(dff, \SRST_POLARITY) != param(ffA2, \SRST_POLARITY)))
++							goto reject_AREG;
++						if (!dff->type.in($dffe, $sdffe) && port(prev, \CEA1, State::S0) != State::S1)
++							goto reject_AREG;
++						if (dff->type.in($dffe, $sdffe) && (port(dff, \EN) != port(prev, \CEA1, State::S0) || !param(dff, \EN_POLARITY).as_bool()))
++							goto reject_AREG;
++						if (dffD == unextend(port(prev, \A)))
++							AREG = 2;
++					}
++				}
+ 			}
+ 		}
+ reject_AREG:	;
+@@ -318,6 +345,30 @@ code argQ clock BREG
+ 						BREG = 1;
+ 					}
+ 				}
++
++				if (BREG < 0 && dff && pipeline && next->type.in(\DSP48E1) && param(prev, \BREG) == 2) {
++					Cell *ffB2 = dff;
++					if (!ffB2->type.in($sdff, $sdffe) && port(prev, \RSTB, State::S0) != State::S0)
++						goto reject_BREG;
++					if (!ffB2->type.in($dffe, $sdffe) && port(prev, \CEB2, State::S0) != State::S1)
++						goto reject_BREG;
++					if (ffB2->type.in($dffe, $sdffe) && (port(ffB2, \EN) != port(prev, \CEB2, State::S0) || !param(ffB2, \EN_POLARITY).as_bool()))
++						goto reject_BREG;
++					argQ = dffD;
++					subpattern(in_dffe);
++					if (dff) {
++						if (dff->type != ffB2->type)
++							goto reject_BREG;
++						if (dff->type.in($sdff, $sdffe) && (port(dff, \SRST) != port(ffB2, \SRST) || param(dff, \SRST_POLARITY) != param(ffB2, \SRST_POLARITY)))
++							goto reject_BREG;
++						if (!dff->type.in($dffe, $sdffe) && port(prev, \CEB1, State::S0) != State::S1)
++							goto reject_BREG;
++						if (dff->type.in($dffe, $sdffe) && (port(dff, \EN) != port(prev, \CEB1, State::S0) || !param(dff, \EN_POLARITY).as_bool()))
++							goto reject_BREG;
++						if (dffD == unextend(port(prev, \B)))
++							BREG = 2;
++					}
++				}
+ 			}
+ 		}
+ reject_BREG:	;
