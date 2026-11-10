@@ -1,0 +1,2006 @@
+diff --git a/himbaechel/uarch/xilinx/CMakeLists.txt b/himbaechel/uarch/xilinx/CMakeLists.txt
+index 7d7352c0..f720efbf 100644
+--- a/himbaechel/uarch/xilinx/CMakeLists.txt
++++ b/himbaechel/uarch/xilinx/CMakeLists.txt
+@@ -20,6 +20,7 @@ set(SOURCES
+     pack_io.cc
+     pins.cc
+     pins.h
++    replicate.cc
+     xdc.cc
+     xilinx.cc
+     xilinx.h
+diff --git a/himbaechel/uarch/xilinx/hardblock_timing.cc b/himbaechel/uarch/xilinx/hardblock_timing.cc
+index 78eecb89..cb5dfb22 100644
+--- a/himbaechel/uarch/xilinx/hardblock_timing.cc
++++ b/himbaechel/uarch/xilinx/hardblock_timing.cc
+@@ -186,6 +186,10 @@ const XilinxImpl::HardblockTiming *XilinxImpl::hardblock_timing_of(const CellInf
+ 
+ bool XilinxImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
+ {
++    if (replicate_carry_di && cell->type == id_CARRY4 && fromPort.in(id_DI0, id_DI1, id_DI2, id_DI3)) {
++        const IdString s = fromPort == id_DI0 ? id_S0 : fromPort == id_DI1 ? id_S1 : fromPort == id_DI2 ? id_S2 : id_S3;
++        return HimbaechelAPI::getCellDelay(cell, s, toPort, delay);
++    }
+     const HardblockTiming *t = hardblock_timing_of(cell);
+     if (t == nullptr)
+         return buffer_cell_delay(cell, fromPort, toPort, delay);
+diff --git a/himbaechel/uarch/xilinx/replicate.cc b/himbaechel/uarch/xilinx/replicate.cc
+new file mode 100644
+index 00000000..ac22e985
+--- /dev/null
++++ b/himbaechel/uarch/xilinx/replicate.cc
+@@ -0,0 +1,1927 @@
++/*
++ *  nextpnr -- Next Generation Place and Route
++ *
++ *  Permission to use, copy, modify, and/or distribute this software for any
++ *  purpose with or without fee is hereby granted, provided that the above
++ *  copyright notice and this permission notice appear in all copies.
++ *
++ *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <fstream>
++#include <functional>
++#include <memory>
++#include "log.h"
++#include "nextpnr.h"
++#include "timing.h"
++#include "util.h"
++#include "xilinx.h"
++
++#define HIMBAECHEL_CONSTIDS "uarch/xilinx/constids.inc"
++#include "himbaechel_constids.h"
++
++NEXTPNR_NAMESPACE_BEGIN
++
++namespace {
++
++const delay_t SLACK_NONE = 1000000000;
++
++struct Replicate
++{
++    Context *ctx;
++    XilinxImpl *impl;
++    std::unique_ptr<TimingAnalyser> tmg;
++
++
++    int min_fanout = 8;
++    int max_fanout = 400;
++    float crit_min = 0.8f;
++    int max_nets = 100;
++    int max_copies = 100;
++    int per_root = 3;
++    int rounds = 10;
++    int batch = 8;
++    int kmax = 3;
++    int radius = 12;
++    int top_tiles = 12;
++    int tries = 24;
++    delay_t margin = 50;
++    int kinds = 3;
++    bool move_orig = true;
++    bool ctrl_sinks = true;
++
++    bool cc_on = true;
++    int cc_paths = 20;
++    int cc_max = 3;
++    int cc_rounds = 8;
++    delay_t cc_win = 100;
++
++    bool fanout_on = false;
++
++    bool dlut_on = true;
++    std::string dump_file;
++    int verbose = 0;
++
++
++
++
++    float quant = 0.02f;
++    int alpha_ps = -228;
++    double beta = 1.711;
++    int site_lut_ps = 650, site_other_ps = 720, tile_ps = 680;
++    double fo_ps = 102;
++    int ctrl_ps = -275;
++    bool sa_model = false;
++    bool carry_di = true;
++    delay_t tol = 10;
++
++    int max_x = 0, max_y = 0;
++    std::vector<std::vector<std::vector<BelId>>> tile_luts, tile_ffs;
++    pool<IdString> excepted;
++    pool<IdString> rejected;
++    dict<IdString, IdString> root_of;
++    dict<IdString, int> copies_of;
++    dict<IdString, IdString> net_root;
++
++    Replicate(Context *ctx, XilinxImpl *impl) : ctx(ctx), impl(impl) {}
++
++
++    delay_t arc_delay(BelId sb, IdString sp, BelId db, IdString dp) const
++    {
++        if (sb == BelId() || db == BelId())
++            return 0;
++        if (dp == id_CIN && sp == id_CO3)
++            return 0;
++        Loc sl = ctx->getBelLocation(sb), dl = ctx->getBelLocation(db);
++        if (sb.tile == db.tile) {
++            const bool same_slice = (sl.z >> 6) == (dl.z >> 6);
++            if (!same_slice)
++                return tile_ps;
++            const int st = sl.z & 0xF;
++            const bool ff_src = st == BEL_FF || st == BEL_FF2;
++            const bool lut_in = dp.in(id_A1, id_A2, id_A3, id_A4, id_A5, id_A6);
++            if (lut_in)
++                return site_lut_ps;
++            if (!ff_src && (dp == id_D || dp.in(id_S0, id_S1, id_S2, id_S3, id_DI0, id_DI1, id_DI2, id_DI3) ||
++                            dp.in(id_I0, id_I1)))
++                return 0;
++            return site_other_ps;
++        }
++        delay_t m = impl->delay_matrix_lookup(dl.x - sl.x, dl.y - sl.y);
++        if (m < 0) {
++            int ax = std::abs(dl.x - sl.x), ay = std::abs(dl.y - sl.y);
++            m = (3 * (30 * std::min(ax, 18) + 10 * std::max(ax - 18, 0) + 60 * std::min(ay, 6) +
++                      20 * std::max(ay - 6, 0) + 300)) /
++                2;
++        }
++        delay_t d = alpha_ps + delay_t(beta * m);
++        if (dp.in(id_CE, id_SR))
++            d += ctrl_ps;
++        return std::max<delay_t>(d, 50);
++    }
++
++    delay_t fan(int sinks) const { return sinks <= 2 ? 0 : delay_t(fo_ps * std::log2(sinks / 2.0)); }
++
++    bool timed_net(const NetInfo *ni) const
++    {
++        if (ni->driver.cell == nullptr || ni->driver.cell->bel == BelId())
++            return false;
++        if (ni->driver.cell->type.in(id_BUFGCTRL, id_BUFHCE) || ni->driver.cell->isPseudo())
++            return false;
++        for (auto &usr : ni->users) {
++            int cnt = 0;
++            if (usr.cell && ctx->getPortTimingClass(usr.cell, usr.port, cnt) == TMG_CLOCK_INPUT)
++                return false;
++        }
++        return true;
++    }
++
++    delay_t worst_slack = 0;
++    std::vector<delay_t> slacks;
++    double slack_q(double q)
++    {
++        if (slacks.empty())
++            return 0;
++        size_t k = std::min(slacks.size() - 1, size_t(q * slacks.size()));
++        std::nth_element(slacks.begin(), slacks.begin() + k, slacks.end());
++        return ctx->getDelayNS(slacks[k]);
++    }
++
++
++    pool<IdString> fresh;
++
++    delay_t slack_of(const CellInfo *cell, IdString port) const
++    {
++        if (fresh.count(cell->name))
++            return SLACK_NONE;
++        float sl = tmg->get_setup_slack(CellPortKey(cell->name, port));
++        if (!(sl > -1000000000.0f && sl < 1000000000.0f))
++            return SLACK_NONE;
++        return delay_t(sl);
++    }
++
++    void analyse()
++    {
++        tmg = std::make_unique<TimingAnalyser>(ctx);
++        fresh.clear();
++        tmg->setup_only = true;
++        tmg->crit_quantile = quant;
++        tmg->setup();
++        std::vector<const NetInfo *> timed;
++        for (auto &n : ctx->nets) {
++            const NetInfo *ni = n.second.get();
++            if (!timed_net(ni))
++                continue;
++            timed.push_back(ni);
++            for (auto &usr : ni->users)
++                if (usr.cell && usr.cell->bel != BelId())
++                    tmg->set_route_delay(CellPortKey(usr),
++                                         DelayPair(arc_delay(ni->driver.cell->bel, ni->driver.port, usr.cell->bel,
++                                                             usr.port) +
++                                                   fan(int(ni->users.entries()))));
++        }
++        tmg->run(false);
++        worst_slack = std::numeric_limits<delay_t>::max();
++        slacks.clear();
++        for (const NetInfo *ni : timed)
++            for (auto &usr : ni->users) {
++                if (!usr.cell || usr.cell->bel == BelId())
++                    continue;
++                delay_t sl = slack_of(usr.cell, usr.port);
++                if (sl == SLACK_NONE)
++                    continue;
++                worst_slack = std::min(worst_slack, sl);
++                slacks.push_back(sl);
++            }
++        if (slacks.empty())
++            worst_slack = 0;
++    }
++
++
++    static bool truthy(const Property &p)
++    {
++        if (!p.is_string)
++            return p.as_int64() != 0;
++        std::string v = p.as_string();
++        std::transform(v.begin(), v.end(), v.begin(), ::toupper);
++        return !(v.empty() || v == "0" || v == "FALSE" || v == "NO");
++    }
++
++    bool kept_by_attribute(const dict<IdString, Property> &attrs) const
++    {
++        for (auto &a : attrs) {
++            std::string k = a.first.str(ctx);
++            std::transform(k.begin(), k.end(), k.begin(), ::toupper);
++            const bool is_keep_like = k == "KEEP" || k == "DONT_TOUCH" || k == "MARK_DEBUG" || k == "ASYNC_REG" ||
++                                      k == "IOB";
++            if (is_keep_like && truthy(a.second))
++                return true;
++        }
++        return false;
++    }
++
++    bool fixed(const CellInfo *ci) const
++    {
++        return ci->belStrength > STRENGTH_STRONG || ci->region != nullptr || ci->isPseudo() ||
++               ci->attrs.count(id_BEL) || ci->attrs.count(id_LOC);
++    }
++
++    bool plain_lut(const CellInfo *ci) const
++    {
++        if (ci->type != id_SLICE_LUTX || ci->attrs.count(id_X_LUT_AS_DRAM) || ci->attrs.count(id_X_LUT_AS_SRL))
++            return false;
++        const std::string orig = str_or_default(ci->attrs, id_X_ORIG_TYPE, "");
++        if (orig.size() != 4 || orig.compare(0, 3, "LUT") != 0)
++            return false;
++        for (auto &p : ci->ports) {
++            if (p.first.in(id_A1, id_A2, id_A3, id_A4, id_A5, id_A6)) {
++                if (p.second.type != PORT_IN)
++                    return false;
++            } else if (p.first == id_O6) {
++                if (p.second.type != PORT_OUT)
++                    return false;
++            } else if (p.second.net != nullptr) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool plain_ff(const CellInfo *ci) const
++    {
++        if (ci->type != id_SLICE_FFX || ci->attrs.count(id_X_FF_AS_LATCH))
++            return false;
++        const std::string orig = str_or_default(ci->attrs, id_X_ORIG_TYPE, "");
++        if (orig != "FDRE" && orig != "FDSE" && orig != "FDCE" && orig != "FDPE")
++            return false;
++        for (auto &p : ci->ports) {
++            if (p.first.in(id_D, id_CK, id_CE, id_SR)) {
++                if (p.second.type != PORT_IN)
++                    return false;
++            } else if (p.first == id_Q) {
++                if (p.second.type != PORT_OUT)
++                    return false;
++            } else if (p.second.net != nullptr) {
++                return false;
++            }
++        }
++        const NetInfo *ck = ci->getPort(id_CK);
++
++        if (ck == nullptr || ck->driver.cell == nullptr || ck->driver.cell->type != id_BUFGCTRL)
++            return false;
++        return true;
++    }
++
++
++    bool driver_ok(const CellInfo *ci, IdString port) const
++    {
++        if (ci == nullptr || ci->bel == BelId() || fixed(ci) || excepted.count(ci->name))
++            return false;
++        if (kept_by_attribute(ci->attrs))
++            return false;
++        if (!impl->is_logic_tile(ci->bel))
++            return false;
++        if (port == id_Q && (kinds & 1) && plain_ff(ci))
++            return true;
++        if (port == id_O6 && (kinds & 2) && plain_lut(ci)) {
++
++
++            if (ci->cluster == ClusterId())
++                return true;
++            if (ci->cluster != ci->name)
++                return false;
++            for (auto *ch : ci->constr_children)
++                if (ch->type != id_SLICE_FFX || !ch->constr_children.empty())
++                    return false;
++            return true;
++        }
++        return false;
++    }
++
++
++    bool sink_movable(const CellInfo *drv, const PortRef &usr) const
++    {
++        const CellInfo *c = usr.cell;
++        if (c == nullptr || c->bel == BelId() || c == drv || c->isPseudo())
++            return false;
++        if (c->bel.tile == drv->bel.tile)
++            return false;
++        if (drv->cluster != ClusterId() && c->cluster == drv->cluster)
++            return false;
++        if (c->type == id_SLICE_LUTX)
++            return !c->attrs.count(id_X_LUT_AS_DRAM) && !c->attrs.count(id_X_LUT_AS_SRL) &&
++                   usr.port.in(id_A1, id_A2, id_A3, id_A4, id_A5, id_A6);
++        if (c->type == id_SLICE_FFX) {
++            if (c->attrs.count(id_X_FF_AS_LATCH))
++                return false;
++
++
++            return usr.port == id_D || (ctrl_sinks && usr.port.in(id_CE, id_SR));
++        }
++        if (c->type == id_CARRY4)
++            return usr.port.in(id_S0, id_S1, id_S2, id_S3, id_DI0, id_DI1, id_DI2, id_DI3, id_CYINIT);
++        if (c->type.in(id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1, id_DSP48E1_DSP48E1))
++            return true;
++        return false;
++    }
++
++
++    struct Sink
++    {
++        CellInfo *cell;
++        IdString port;
++        delay_t d0, slack;
++        bool movable;
++        bool critical;
++    };
++    struct Input
++    {
++        IdString port;
++        NetInfo *net;
++        CellInfo *src;
++        IdString src_port;
++        delay_t e0, slack;
++        int fanout;
++        delay_t penalty;
++        delay_t others;
++    };
++    struct Cand
++    {
++        NetInfo *net = nullptr;
++        CellInfo *drv = nullptr;
++        IdString out_port;
++        bool is_ff = false;
++        std::vector<Sink> sinks;
++        std::vector<Input> ins;
++        delay_t w0 = 0;
++
++        CellInfo *dlut = nullptr;
++        std::vector<Input> lut_ins;
++        int d_idx = -1;
++    };
++
++    bool lut_copyable(const CellInfo *l) const
++    {
++        if (l == nullptr || l->bel == BelId() || fixed(l) || excepted.count(l->name) || kept_by_attribute(l->attrs))
++            return false;
++        if (!plain_lut(l))
++            return false;
++        if (l->cluster == ClusterId())
++            return true;
++        if (l->cluster != l->name)
++            return false;
++        for (auto *ch : l->constr_children)
++            if (ch->type != id_SLICE_FFX || !ch->constr_children.empty())
++                return false;
++        return true;
++    }
++
++
++    bool inputs_of(CellInfo *cell, std::vector<Input> &out) const
++    {
++        out.clear();
++        for (auto &p : cell->ports) {
++            if (p.second.type != PORT_IN || p.second.net == nullptr)
++                continue;
++            NetInfo *in = p.second.net;
++            Input i;
++            i.port = p.first;
++            i.net = in;
++            i.src = in->driver.cell;
++            i.src_port = in->driver.port;
++            if (i.src != nullptr && (i.src->region != nullptr))
++                return false;
++            const bool timed = i.src != nullptr && i.src->bel != BelId() && timed_net(in);
++            i.fanout = int(in->users.entries());
++            i.penalty = 0;
++            i.others = SLACK_NONE;
++            if (!timed) {
++                i.src = nullptr;
++                i.e0 = 0;
++                i.slack = SLACK_NONE;
++            } else {
++                i.e0 = arc_delay(i.src->bel, i.src_port, cell->bel, i.port) + fan(i.fanout);
++                i.slack = slack_of(cell, i.port);
++                i.penalty = fan(i.fanout + 1) - fan(i.fanout);
++                if (i.penalty < tol)
++                    i.penalty = 0;
++                for (auto &usr : in->users)
++                    if (usr.cell != nullptr && usr.cell->bel != BelId() && !(usr.cell == cell && usr.port == i.port))
++                        i.others = std::min(i.others, slack_of(usr.cell, usr.port));
++            }
++            out.push_back(i);
++        }
++        std::sort(out.begin(), out.end(),
++                  [&](const Input &a, const Input &b) { return a.port.str(ctx) < b.port.str(ctx); });
++        return true;
++    }
++
++
++    BelId lut_bel_for(BelId b) const
++    {
++        Loc l = ctx->getBelLocation(b);
++        if ((l.z & 0xF) != BEL_FF)
++            return BelId();
++        l.z = (l.z & ~0xF) | BEL_6LUT;
++        return ctx->getBelByLocation(l);
++    }
++
++    bool build(NetInfo *ni, Cand &c) const
++    {
++        c = Cand();
++        c.net = ni;
++        c.drv = ni->driver.cell;
++        c.out_port = ni->driver.port;
++        c.is_ff = c.drv->type == id_SLICE_FFX;
++        for (auto &usr : ni->users) {
++            if (usr.cell == nullptr || usr.cell->bel == BelId() || usr.cell->region != nullptr)
++                return false;
++            Sink s;
++            s.cell = usr.cell;
++            s.port = usr.port;
++            s.d0 = arc_delay(c.drv->bel, c.out_port, usr.cell->bel, usr.port) + fan(int(ni->users.entries()));
++            s.slack = slack_of(usr.cell, usr.port);
++            s.movable = sink_movable(c.drv, usr);
++            s.critical = s.slack != SLACK_NONE && tmg->get_criticality(CellPortKey(usr)) >= crit_min;
++            c.sinks.push_back(s);
++        }
++
++        std::stable_sort(c.sinks.begin(), c.sinks.end(), [&](const Sink &a, const Sink &b) {
++            if (a.cell != b.cell)
++                return a.cell->name.str(ctx) < b.cell->name.str(ctx);
++            return a.port.str(ctx) < b.port.str(ctx);
++        });
++        for (auto &p : c.drv->ports) {
++            if (p.second.type != PORT_IN || p.second.net == nullptr)
++                continue;
++            NetInfo *in = p.second.net;
++            Input i;
++            i.port = p.first;
++            i.net = in;
++            i.src = in->driver.cell;
++            i.src_port = in->driver.port;
++            if (i.src != nullptr && (i.src->region != nullptr))
++                return false;
++            const bool timed = i.src != nullptr && i.src->bel != BelId() && timed_net(in);
++            i.fanout = int(in->users.entries());
++            i.penalty = 0;
++            i.others = SLACK_NONE;
++            if (!timed) {
++
++                i.src = nullptr;
++                i.e0 = 0;
++                i.slack = SLACK_NONE;
++            } else {
++                i.e0 = arc_delay(i.src->bel, i.src_port, c.drv->bel, i.port) + fan(i.fanout);
++                i.slack = slack_of(c.drv, i.port);
++                i.penalty = fan(i.fanout + 1) - fan(i.fanout);
++
++                if (i.penalty < tol)
++                    i.penalty = 0;
++                for (auto &usr : in->users)
++                    if (usr.cell != nullptr && usr.cell->bel != BelId() && !(usr.cell == c.drv && usr.port == i.port))
++                        i.others = std::min(i.others, slack_of(usr.cell, usr.port));
++            }
++            c.ins.push_back(i);
++        }
++        std::sort(c.ins.begin(), c.ins.end(),
++                  [&](const Input &a, const Input &b) { return a.port.str(ctx) < b.port.str(ctx); });
++        if (c.is_ff && dlut_on) {
++            for (size_t j = 0; j < c.ins.size(); j++)
++                if (c.ins[j].port == id_D)
++                    c.d_idx = int(j);
++            NetInfo *dn = c.drv->getPort(id_D);
++            CellInfo *l = dn != nullptr ? dn->driver.cell : nullptr;
++            const bool local_lut = c.d_idx >= 0 && l != nullptr && dn->driver.port == id_O6 && l->bel != BelId() &&
++                                   l->bel.tile == c.drv->bel.tile && lut_copyable(l);
++            if (local_lut && inputs_of(l, c.lut_ins))
++                c.dlut = l;
++        }
++        c.w0 = SLACK_NONE;
++        for (auto &s : c.sinks)
++            c.w0 = std::min(c.w0, s.slack);
++        return c.w0 != SLACK_NONE;
++    }
++
++
++
++    bool bearable(delay_t old, delay_t now, delay_t floor) const
++    {
++        if (now >= std::min(old, floor))
++            return true;
++        return old - now <= tol && now >= worst_slack + tol;
++    }
++
++    struct Ev
++    {
++        delay_t worst = SLACK_NONE;
++        double gain = 0;
++        bool ok = false;
++    };
++
++    static delay_t worst_of(const Cand &c, const std::vector<int> &set)
++    {
++        delay_t w = SLACK_NONE;
++        for (int i : set)
++            w = std::min(w, c.sinks[i].slack);
++        return w;
++    }
++
++
++
++
++    Ev eval(const Cand &c, BelId b, const std::vector<int> &set, const CellInfo *moving, delay_t floor,
++            bool strict) const
++    {
++        Ev ev;
++        static thread_local std::vector<delay_t> de;
++        de.assign(c.ins.size(), 0);
++        for (size_t j = 0; j < c.ins.size(); j++) {
++            const Input &in = c.ins[j];
++            if (in.src == nullptr)
++                continue;
++            BelId sb = (moving != nullptr && in.src == moving) ? b : in.src->bel;
++            de[j] = arc_delay(sb, in.src_port, b, in.port) + fan(in.fanout) + in.penalty - in.e0;
++        }
++        if (moving == nullptr && c.dlut != nullptr && c.d_idx >= 0) {
++
++            Loc ll = ctx->getBelLocation(b);
++            ll.z = (ll.z & ~0xF) | BEL_6LUT;
++            BelId lb = ctx->getBelByLocation(ll);
++            if (lb == BelId())
++                lb = b;
++            delay_t g = 0;
++            bool any = false;
++            for (auto &in : c.lut_ins) {
++                if (in.src == nullptr)
++                    continue;
++                delay_t x = arc_delay(in.src->bel, in.src_port, lb, in.port) + fan(in.fanout) + in.penalty - in.e0;
++                g = any ? std::max(g, x) : x;
++                any = true;
++            }
++            de[c.d_idx] = g + arc_delay(lb, id_O6, b, id_D) - c.ins[c.d_idx].e0;
++        }
++        const delay_t load = fan(int(set.size()));
++        ev.ok = true;
++        for (int si : set) {
++            const Sink &s = c.sinks[si];
++            if (s.slack == SLACK_NONE)
++                continue;
++            BelId db = (moving != nullptr && s.cell == moving) ? b : s.cell->bel;
++            delay_t dd = arc_delay(b, c.out_port, db, s.port) + load - s.d0;
++            delay_t bound = SLACK_NONE;
++            if (!c.is_ff)
++                for (size_t j = 0; j < c.ins.size(); j++) {
++                    const Input &in = c.ins[j];
++                    if (in.src == nullptr || in.slack == SLACK_NONE)
++                        continue;
++                    bound = std::min(bound, std::max(in.slack, s.slack) - de[j] - dd);
++                }
++            if (bound == SLACK_NONE)
++                bound = s.slack - dd;
++            ev.worst = std::min(ev.worst, bound);
++            if (strict ? bound < floor : !bearable(s.slack, bound, floor))
++                ev.ok = false;
++            if (s.critical)
++                ev.gain += double(std::max<delay_t>(-2000, std::min<delay_t>(bound - s.slack, 2000)));
++        }
++        if (c.is_ff) {
++
++            for (size_t j = 0; j < c.ins.size(); j++) {
++                const Input &in = c.ins[j];
++                if (in.src == nullptr || in.slack == SLACK_NONE)
++                    continue;
++                delay_t now = in.slack - de[j];
++                if (!bearable(in.slack, now, floor)) {
++                    ev.ok = false;
++                    ev.worst = std::min(ev.worst, now);
++                }
++            }
++        }
++        return ev;
++    }
++
++
++    bool inputs_bear_copy(const Cand &c, delay_t floor) const
++    {
++        for (auto &in : c.ins)
++            if (in.src != nullptr && in.penalty > 0 && in.others != SLACK_NONE &&
++                !(c.dlut != nullptr && in.port == id_D) && !bearable(in.others, in.others - in.penalty, floor))
++                return false;
++        if (c.dlut != nullptr)
++            for (auto &in : c.lut_ins)
++                if (in.src != nullptr && in.penalty > 0 && in.others != SLACK_NONE &&
++                    !bearable(in.others, in.others - in.penalty, floor))
++                    return false;
++        return true;
++    }
++
++    std::vector<int> rest_of(const Cand &c, const std::vector<int> &set) const
++    {
++        std::vector<int> rest;
++        std::vector<char> in_set(c.sinks.size(), 0);
++        for (int i : set)
++            in_set[i] = 1;
++        for (size_t i = 0; i < c.sinks.size(); i++)
++            if (!in_set[i])
++                rest.push_back(int(i));
++        return rest;
++    }
++
++
++    void kmeans_groups(const Cand &c, const std::vector<int> &mov,
++                       const std::function<void(std::vector<int>)> &add) const
++    {
++        std::vector<std::pair<double, double>> pt;
++        for (int i : mov) {
++            Loc l = ctx->getBelLocation(c.sinks[i].cell->bel);
++            pt.emplace_back(l.x, l.y);
++        }
++        auto dist2 = [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
++            return (a.first - b.first) * (a.first - b.first) + (a.second - b.second) * (a.second - b.second);
++        };
++        for (int k = 2; k <= kmax && k <= int(mov.size()); k++) {
++
++            std::vector<std::pair<double, double>> cen;
++            double mx = 0, my = 0;
++            for (auto &p : pt) {
++                mx += p.first;
++                my += p.second;
++            }
++            std::pair<double, double> mean(mx / pt.size(), my / pt.size());
++            size_t far = 0;
++            for (size_t i = 1; i < pt.size(); i++)
++                if (dist2(pt[i], mean) > dist2(pt[far], mean))
++                    far = i;
++            cen.push_back(pt[far]);
++            while (int(cen.size()) < k) {
++                size_t best = 0;
++                double bd = -1;
++                for (size_t i = 0; i < pt.size(); i++) {
++                    double d = std::numeric_limits<double>::max();
++                    for (auto &ce : cen)
++                        d = std::min(d, dist2(pt[i], ce));
++                    if (d > bd) {
++                        bd = d;
++                        best = i;
++                    }
++                }
++                cen.push_back(pt[best]);
++            }
++            std::vector<int> asg(pt.size(), -1);
++            for (int it = 0; it < 12; it++) {
++                bool changed = false;
++                for (size_t i = 0; i < pt.size(); i++) {
++                    int b = 0;
++                    for (int j = 1; j < k; j++)
++                        if (dist2(pt[i], cen[j]) < dist2(pt[i], cen[b]))
++                            b = j;
++                    if (b != asg[i]) {
++                        asg[i] = b;
++                        changed = true;
++                    }
++                }
++                if (!changed)
++                    break;
++                for (int j = 0; j < k; j++) {
++                    double sx = 0, sy = 0;
++                    int n = 0;
++                    for (size_t i = 0; i < pt.size(); i++)
++                        if (asg[i] == j) {
++                            sx += pt[i].first;
++                            sy += pt[i].second;
++                            n++;
++                        }
++                    if (n > 0)
++                        cen[j] = std::make_pair(sx / n, sy / n);
++                }
++            }
++            for (int j = 0; j < k; j++) {
++                std::vector<int> g;
++                for (size_t i = 0; i < pt.size(); i++)
++                    if (asg[i] == j)
++                        g.push_back(mov[i]);
++                add(g);
++            }
++        }
++    }
++
++    std::vector<std::vector<int>> groups(const Cand &c) const
++    {
++        std::vector<std::vector<int>> out;
++        std::vector<int> mov, crit;
++        for (size_t i = 0; i < c.sinks.size(); i++)
++            if (c.sinks[i].movable) {
++                mov.push_back(int(i));
++                if (c.sinks[i].critical)
++                    crit.push_back(int(i));
++            }
++        if (crit.empty())
++            return out;
++        std::function<void(std::vector<int>)> add = [&](std::vector<int> g) {
++            std::sort(g.begin(), g.end());
++            if (g.empty() || g.size() == c.sinks.size())
++                return;
++            bool has_critical = false;
++            for (int i : g)
++                has_critical = has_critical || c.sinks[i].critical;
++            if (!has_critical)
++                return;
++            if (std::find(out.begin(), out.end(), g) == out.end())
++                out.push_back(g);
++        };
++        add(crit);
++        kmeans_groups(c, crit, add);
++        kmeans_groups(c, mov, add);
++        return out;
++    }
++
++
++    struct Spot
++    {
++        Ev ev;
++        int rank;
++        BelId bel;
++    };
++
++    static bool better(const Ev &a, const Ev &b)
++    {
++        if (a.ok != b.ok)
++            return a.ok;
++        if (a.gain != b.gain)
++            return a.gain > b.gain;
++        return a.worst > b.worst;
++    }
++
++
++    std::vector<Spot> spots(const Cand &c, const std::vector<int> &set, const CellInfo *moving, delay_t floor,
++                            bool strict) const
++    {
++
++        double sx = 0, sy = 0, sw = 0;
++        auto add = [&](const CellInfo *o, double w) {
++            if (o == nullptr || o->bel == BelId() || o == moving)
++                return;
++            Loc l = ctx->getBelLocation(o->bel);
++            sx += w * l.x;
++            sy += w * l.y;
++            sw += w;
++        };
++        for (int i : set)
++            add(c.sinks[i].cell, c.sinks[i].critical ? 1.0 : 0.05);
++        for (auto &in : c.ins)
++            if (in.src != nullptr && in.slack != SLACK_NONE)
++                add(in.src, 0.25);
++        std::vector<Spot> out;
++        if (sw <= 0)
++            return out;
++        int cx = int(std::lround(sx / sw)), cy = int(std::lround(sy / sw));
++        const auto &tiles = c.is_ff ? tile_ffs : tile_luts;
++        struct T
++        {
++            Ev ev;
++            int dist, x, y;
++        };
++        std::vector<T> ts;
++        for (int x = std::max(0, cx - radius); x <= std::min(max_x, cx + radius); x++)
++            for (int y = std::max(0, cy - radius); y <= std::min(max_y, cy + radius); y++) {
++                if (tiles[x][y].empty())
++                    continue;
++                bool any_free = false;
++                for (BelId bel : tiles[x][y])
++                    any_free = any_free || ctx->checkBelAvail(bel);
++                if (!any_free)
++                    continue;
++                ts.push_back({eval(c, tiles[x][y].front(), set, moving, floor, strict),
++                              std::abs(x - cx) + std::abs(y - cy), x, y});
++            }
++        std::sort(ts.begin(), ts.end(), [](const T &a, const T &b) {
++            if (better(a.ev, b.ev) || better(b.ev, a.ev))
++                return better(a.ev, b.ev);
++            if (a.dist != b.dist)
++                return a.dist < b.dist;
++            return a.x != b.x ? a.x < b.x : a.y < b.y;
++        });
++        int rank = 0;
++        for (size_t t = 0; t < ts.size() && int(t) < top_tiles; t++)
++            for (BelId bel : tiles[ts[t].x][ts[t].y]) {
++                if (!ctx->checkBelAvail(bel))
++                    continue;
++
++                int z = ctx->getBelLocation(bel).z;
++                int second = ((z & 0xF) == BEL_FF2) ? 1 : 0;
++                out.push_back({eval(c, bel, set, moving, floor, strict), second * 100000 + rank++, bel});
++            }
++        std::sort(out.begin(), out.end(), [](const Spot &a, const Spot &b) {
++            if (better(a.ev, b.ev) || better(b.ev, a.ev))
++                return better(a.ev, b.ev);
++            return a.rank < b.rank;
++        });
++        return out;
++    }
++
++
++    struct Done
++    {
++        IdString copy, net, new_net, orig;
++        IdString copy2, new_net2, orig2;
++        std::vector<std::pair<IdString, IdString>> moved;
++        BelId orig_old, orig_new;
++        PlaceStrength orig_strength = STRENGTH_WEAK;
++        bool is_ff = false;
++        delay_t before = 0, after = 0;
++        double gain = 0;
++    };
++
++    void dirty(const CellInfo *ci) const
++    {
++        if (ci != nullptr && ci->bel != BelId())
++            impl->replicate_dirty_tile(ci->bel);
++    }
++
++    void dirty_around(const Done &d)
++    {
++        for (IdString n : {d.copy, d.copy2, d.orig}) {
++            auto f = ctx->cells.find(n);
++            if (f == ctx->cells.end())
++                continue;
++            CellInfo *ci = f->second.get();
++            dirty(ci);
++            for (auto &p : ci->ports)
++                if (p.second.net != nullptr && p.second.type == PORT_IN)
++                    dirty(p.second.net->driver.cell);
++        }
++        for (auto &m : d.moved)
++            dirty(ctx->cells.at(m.first).get());
++        if (d.orig_old != BelId())
++            impl->replicate_dirty_tile(d.orig_old);
++        if (d.orig_new != BelId())
++            impl->replicate_dirty_tile(d.orig_new);
++    }
++
++    bool tiles_legal(const Done &d)
++    {
++        dirty_around(d);
++        auto ok = [&](const CellInfo *ci) {
++            if (ci == nullptr || ci->bel == BelId() || ctx->isBelLocationValid(ci->bel))
++                return true;
++            if (verbose > 1)
++                log_info("    replicate: %s: the tile of %s (%s at %s) would be illegal\n",
++                         d.net.c_str(ctx), ctx->nameOf(ci), ci->type.c_str(ctx), ctx->nameOfBel(ci->bel));
++            return false;
++        };
++        for (IdString n : {d.copy, d.copy2, d.orig}) {
++            auto f = ctx->cells.find(n);
++            if (f == ctx->cells.end())
++                continue;
++            CellInfo *ci = f->second.get();
++            if (!ok(ci))
++                return false;
++            for (auto &p : ci->ports)
++                if (p.second.net != nullptr && p.second.type == PORT_IN && !ok(p.second.net->driver.cell))
++                    return false;
++        }
++        for (auto &m : d.moved)
++            if (!ok(ctx->cells.at(m.first).get()))
++                return false;
++        if (d.orig_old != BelId() && !ctx->isBelLocationValid(d.orig_old))
++            return false;
++        return true;
++    }
++
++    void undo(const Done &d)
++    {
++        CellInfo *orig = ctx->cells.at(d.orig).get();
++        NetInfo *net = ctx->nets.at(d.net).get();
++        Done around = d;
++        if (d.orig_new != BelId() && orig->bel == d.orig_new) {
++            ctx->unbindBel(orig->bel);
++            ctx->bindBel(d.orig_old, orig, d.orig_strength);
++        }
++        auto f = ctx->cells.find(d.copy);
++        if (f != ctx->cells.end()) {
++            CellInfo *copy = f->second.get();
++            BelId cb = copy->bel;
++            if (cb != BelId())
++                ctx->unbindBel(cb);
++            for (auto &m : d.moved) {
++                CellInfo *s = ctx->cells.at(m.first).get();
++                s->disconnectPort(m.second);
++                s->connectPort(m.second, net);
++            }
++            std::vector<IdString> ports;
++            for (auto &p : copy->ports)
++                ports.push_back(p.first);
++            for (IdString p : ports)
++                copy->disconnectPort(p);
++            ctx->cells.erase(d.copy);
++            if (ctx->nets.count(d.new_net)) {
++                ctx->nets.erase(d.new_net);
++                ctx->net_aliases.erase(d.new_net);
++            }
++            if (cb != BelId())
++                impl->replicate_dirty_tile(cb);
++        }
++        auto f2 = d.copy2 == IdString() ? ctx->cells.end() : ctx->cells.find(d.copy2);
++        if (f2 != ctx->cells.end()) {
++            CellInfo *lc = f2->second.get();
++            BelId lb = lc->bel;
++            if (lb != BelId())
++                ctx->unbindBel(lb);
++            std::vector<IdString> ports;
++            for (auto &p : lc->ports)
++                ports.push_back(p.first);
++            for (IdString p : ports)
++                lc->disconnectPort(p);
++            ctx->cells.erase(d.copy2);
++            if (ctx->nets.count(d.new_net2)) {
++                ctx->nets.erase(d.new_net2);
++                ctx->net_aliases.erase(d.new_net2);
++            }
++            if (lb != BelId())
++                impl->replicate_dirty_tile(lb);
++        }
++        impl->replicate_retag();
++        around.copy = IdString();
++        around.copy2 = IdString();
++        dirty_around(around);
++    }
++
++    int n_fail_legal = 0, n_fail_place = 0, n_no_option = 0, n_orig_moved = 0;
++
++    IdString root_cell(IdString n) const { return root_of.count(n) ? root_of.at(n) : n; }
++    IdString root_net(IdString n) const { return net_root.count(n) ? net_root.at(n) : n; }
++
++    CellInfo *make_copy(CellInfo *orig, IdString cname)
++    {
++        CellInfo *copy = ctx->createCell(cname, orig->type);
++        copy->params = orig->params;
++        copy->attrs = orig->attrs;
++        for (const char *a : {"BEL", "LOC", "NEXTPNR_BEL", "BEL_STRENGTH"})
++            copy->attrs.erase(ctx->id(a));
++        copy->hierpath = orig->hierpath;
++        copy->timing_index = orig->timing_index;
++        copy->cell_bel_pins = orig->cell_bel_pins;
++        std::vector<IdString> port_names;
++        for (auto &p : orig->ports)
++            port_names.push_back(p.first);
++        for (IdString pn : port_names) {
++            const PortInfo &op = orig->ports.at(pn);
++            copy->ports[pn].name = pn;
++            copy->ports[pn].type = op.type;
++            if (op.type == PORT_IN && op.net != nullptr)
++                copy->connectPort(pn, op.net);
++        }
++        return copy;
++    }
++
++
++    bool apply(const Cand &c, const std::vector<int> &set, Done &d, std::vector<int> &bad_sinks)
++    {
++        bad_sinks.clear();
++        d = Done();
++        d.is_ff = c.is_ff;
++        d.orig = c.drv->name;
++        d.net = c.net->name;
++        d.orig_strength = c.drv->belStrength;
++        d.before = c.w0;
++        IdString root = root_of.count(c.drv->name) ? root_of.at(c.drv->name) : c.drv->name;
++        IdString nroot = net_root.count(c.net->name) ? net_root.at(c.net->name) : c.net->name;
++        int k = copies_of.count(root) ? copies_of.at(root) : 0;
++        IdString cname, nname;
++        do {
++            ++k;
++            cname = ctx->idf("%s$rep%d", root.c_str(ctx), k);
++            nname = ctx->idf("%s$rep%d", nroot.c_str(ctx), k);
++        } while (ctx->cells.count(cname) || ctx->nets.count(nname) || ctx->net_aliases.count(nname));
++
++        std::vector<int> rest = rest_of(c, set);
++
++        CellInfo *orig = c.drv;
++        CellInfo *copy = make_copy(orig, cname);
++        CellInfo *lcopy = nullptr;
++        IdString lroot, dnroot;
++        int k2 = 0;
++        if (c.dlut != nullptr) {
++            lroot = root_cell(c.dlut->name);
++            dnroot = root_net(orig->getPort(id_D)->name);
++            k2 = copies_of.count(lroot) ? copies_of.at(lroot) : 0;
++            IdString l2, n2;
++            do {
++                ++k2;
++                l2 = ctx->idf("%s$rep%d", lroot.c_str(ctx), k2);
++                n2 = ctx->idf("%s$rep%d", dnroot.c_str(ctx), k2);
++            } while (ctx->cells.count(l2) || ctx->nets.count(n2) || ctx->net_aliases.count(n2) || l2 == cname ||
++                     n2 == nname);
++            lcopy = make_copy(c.dlut, l2);
++            NetInfo *dn2 = ctx->createNet(n2);
++            lcopy->connectPort(id_O6, dn2);
++            copy->disconnectPort(id_D);
++            copy->connectPort(id_D, dn2);
++            d.copy2 = l2;
++            d.new_net2 = n2;
++            d.orig2 = c.dlut->name;
++        }
++        NetInfo *nn = ctx->createNet(nname);
++        copy->connectPort(c.out_port, nn);
++        for (int i : set) {
++            const Sink &s = c.sinks[i];
++            s.cell->disconnectPort(s.port);
++            s.cell->connectPort(s.port, nn);
++            d.moved.emplace_back(s.cell->name, s.port);
++        }
++        d.copy = cname;
++        d.new_net = nname;
++        impl->replicate_retag();
++
++
++        dirty_around(d);
++        bool legal = true;
++        for (int i : set)
++            if (!ctx->isBelLocationValid(c.sinks[i].cell->bel)) {
++                legal = false;
++                bad_sinks.push_back(i);
++            }
++        if (legal && !tiles_legal(d))
++            legal = false;
++        if (!legal) {
++            if (verbose)
++                for (int i : bad_sinks)
++                    log_info("    replicate: %s: sink %s.%s (%s at %s) cannot leave the net alone\n", ctx->nameOf(c.net),
++                             ctx->nameOf(c.sinks[i].cell), c.sinks[i].port.c_str(ctx),
++                             c.sinks[i].cell->type.c_str(ctx), ctx->nameOfBel(c.sinks[i].cell->bel));
++            undo(d);
++            n_fail_legal++;
++            return false;
++        }
++
++
++        const delay_t w_set = worst_of(c, set);
++        const delay_t floor = w_set + margin;
++        Ev e_orig = eval(c, orig->bel, rest, orig, floor, false);
++        Ev e_copy;
++        if (e_orig.ok) {
++            auto sp = spots(c, set, nullptr, floor, true);
++            int tried = 0;
++            for (auto &s : sp) {
++                if (!s.ev.ok || s.ev.gain + e_orig.gain < double(margin) || tried >= tries)
++                    break;
++                if (!ctx->checkBelAvail(s.bel) || !ctx->isValidBelForCellType(copy->type, s.bel))
++                    continue;
++                BelId lb;
++                if (lcopy != nullptr) {
++                    lb = lut_bel_for(s.bel);
++                    if (lb == BelId() || !ctx->checkBelAvail(lb) || !ctx->isValidBelForCellType(lcopy->type, lb))
++                        continue;
++                }
++                tried++;
++                if (lcopy != nullptr)
++                    ctx->bindBel(lb, lcopy, STRENGTH_WEAK);
++                ctx->bindBel(s.bel, copy, STRENGTH_WEAK);
++                impl->replicate_dirty_tile(s.bel);
++                if (ctx->isBelLocationValid(s.bel)) {
++                    e_copy = s.ev;
++                    break;
++                }
++                ctx->unbindBel(s.bel);
++                if (lcopy != nullptr)
++                    ctx->unbindBel(lb);
++                impl->replicate_dirty_tile(s.bel);
++            }
++        }
++        if (copy->bel == BelId()) {
++            if (verbose > 1)
++                log_info("    replicate: %s: no legal bel for the copy that serves %d sinks (original with the rest "
++                         "ok %d)\n",
++                         ctx->nameOf(c.net), int(set.size()), int(e_orig.ok));
++            undo(d);
++            n_fail_place++;
++            return false;
++        }
++
++
++        const bool orig_can_move = move_orig && orig->cluster == ClusterId() && orig->constr_children.empty();
++        if (orig_can_move && !rest.empty()) {
++            auto sp = spots(c, rest, orig, floor, false);
++            int tried = 0;
++            BelId old = orig->bel;
++            for (auto &s : sp) {
++                if (!s.ev.ok || s.ev.gain < e_orig.gain + double(margin) || tried >= tries)
++                    break;
++                if (s.bel == old || !ctx->checkBelAvail(s.bel) || !ctx->isValidBelForCellType(orig->type, s.bel))
++                    continue;
++                tried++;
++                ctx->unbindBel(old);
++                ctx->bindBel(s.bel, orig, d.orig_strength);
++                d.orig_old = old;
++                d.orig_new = s.bel;
++                if (tiles_legal(d)) {
++                    e_orig = s.ev;
++                    break;
++                }
++                ctx->unbindBel(s.bel);
++                ctx->bindBel(old, orig, d.orig_strength);
++                impl->replicate_dirty_tile(s.bel);
++                impl->replicate_dirty_tile(old);
++                d.orig_old = BelId();
++                d.orig_new = BelId();
++            }
++        }
++        d.before = w_set;
++        d.after = e_copy.worst;
++        d.gain = e_copy.gain + e_orig.gain;
++        if (!tiles_legal(d)) {
++            undo(d);
++            n_fail_legal++;
++            return false;
++        }
++        root_of[cname] = root;
++        net_root[nname] = nroot;
++        copies_of[root] = k;
++        fresh.insert(cname);
++        if (lcopy != nullptr) {
++            fresh.insert(d.copy2);
++            root_of[d.copy2] = lroot;
++            net_root[d.new_net2] = dnroot;
++            copies_of[lroot] = k2;
++        }
++        return true;
++    }
++
++
++    struct PathArc
++    {
++        NetInfo *net;
++        CellInfo *sink;
++        IdString port;
++    };
++    pool<std::pair<IdString, IdString>> cc_rejected;
++
++
++    void walk(CellInfo *cell, IdString port, std::vector<PathArc> &path) const
++    {
++        path.clear();
++        pool<IdString> seen;
++        for (int step = 0; step < 200; step++) {
++            NetInfo *ni = cell->getPort(port);
++            if (ni == nullptr || ni->driver.cell == nullptr || !timed_net(ni))
++                break;
++            path.push_back({ni, cell, port});
++            CellInfo *d = ni->driver.cell;
++            if (seen.count(d->name))
++                break;
++            seen.insert(d->name);
++            int cnt = 0;
++            if (ctx->getPortTimingClass(d, ni->driver.port, cnt) != TMG_COMB_OUTPUT)
++                break;
++            IdString best;
++            delay_t bs = SLACK_NONE;
++            for (auto &p : d->ports) {
++                if (p.second.type != PORT_IN || p.second.net == nullptr)
++                    continue;
++                int c2 = 0;
++                if (ctx->getPortTimingClass(d, p.first, c2) != TMG_COMB_INPUT)
++                    continue;
++                delay_t s = slack_of(d, p.first);
++                if (s < bs || (s == bs && best != IdString() && p.first.str(ctx) < best.str(ctx))) {
++                    bs = s;
++                    best = p.first;
++                }
++            }
++            if (best == IdString())
++                break;
++            cell = d;
++            port = best;
++        }
++        std::reverse(path.begin(), path.end());
++    }
++
++    std::vector<std::pair<delay_t, std::pair<CellInfo *, IdString>>> endpoints() const
++    {
++        std::vector<std::pair<delay_t, std::pair<CellInfo *, IdString>>> eps;
++        for (auto &cell : ctx->cells) {
++            CellInfo *ci = cell.second.get();
++            if (ci->bel == BelId())
++                continue;
++            for (auto &p : ci->ports) {
++                if (p.second.type != PORT_IN || p.second.net == nullptr)
++                    continue;
++                int cnt = 0;
++                auto cls = ctx->getPortTimingClass(ci, p.first, cnt);
++                if (cls != TMG_REGISTER_INPUT && cls != TMG_ENDPOINT)
++                    continue;
++                delay_t s = slack_of(ci, p.first);
++                if (s == SLACK_NONE)
++                    continue;
++                eps.push_back({s, {ci, p.first}});
++            }
++        }
++        std::sort(eps.begin(), eps.end(), [&](const auto &a, const auto &b) {
++            if (a.first != b.first)
++                return a.first < b.first;
++            if (a.second.first != b.second.first)
++                return a.second.first->name.str(ctx) < b.second.first->name.str(ctx);
++            return a.second.second.str(ctx) < b.second.second.str(ctx);
++        });
++        return eps;
++    }
++
++    int cc_walked = 0, cc_made = 0, n_pair = 0;
++
++
++
++    int cc_round(std::vector<Done> &done, int &n_ff, int &n_lut, pool<IdString> &considered)
++    {
++        pool<IdString> touched;
++
++
++        pool<IdString> no_act;
++        int made = 0, paths = 0;
++        std::vector<PathArc> path;
++        for (auto &ep : endpoints()) {
++            if (made >= cc_max || paths >= cc_paths)
++                break;
++            CellInfo *ec = ep.second.first;
++            if (touched.count(ec->name))
++                continue;
++            walk(ec, ep.second.second, path);
++            if (path.empty())
++                continue;
++            bool stale = false;
++            for (auto &a : path)
++                stale = stale || touched.count(a.sink->name) || touched.count(a.net->driver.cell->name) ||
++                        fresh.count(a.sink->name) || fresh.count(a.net->driver.cell->name);
++            if (stale)
++                continue;
++            bool any_new = false;
++            for (auto &a : path)
++                any_new = any_new || !no_act.count(a.net->driver.cell->name);
++            if (!any_new)
++                continue;
++            paths++;
++            cc_walked++;
++            struct Act
++            {
++                delay_t gain;
++                int idx;
++                std::vector<int> set;
++            };
++            std::vector<Act> acts;
++            std::vector<Cand> cands(path.size());
++            for (size_t i = 0; i < path.size(); i++) {
++                const PathArc &a = path[i];
++                NetInfo *ni = a.net;
++                CellInfo *drv = ni->driver.cell;
++                if (no_act.count(drv->name))
++                    continue;
++                no_act.insert(drv->name);
++                if (int(ni->users.entries()) < 2 || int(ni->users.entries()) > max_fanout)
++                    continue;
++                if (!driver_ok(drv, ni->driver.port) || kept_by_attribute(ni->attrs))
++                    continue;
++                IdString root = root_cell(drv->name);
++                if (copies_of.count(root) && copies_of.at(root) >= per_root)
++                    continue;
++                if (cc_rejected.count(std::make_pair(drv->name, a.sink->name)))
++                    continue;
++                Cand &c = cands[i];
++                if (!build(ni, c))
++                    continue;
++                int si = -1;
++                for (size_t j = 0; j < c.sinks.size(); j++)
++                    if (c.sinks[j].cell == a.sink && c.sinks[j].port == a.port)
++                        si = int(j);
++                if (si < 0 || !c.sinks[si].movable || c.sinks[si].slack == SLACK_NONE)
++                    continue;
++                std::vector<int> set;
++                for (size_t j = 0; j < c.sinks.size(); j++)
++                    if (c.sinks[j].movable && c.sinks[j].slack != SLACK_NONE &&
++                        c.sinks[j].slack <= c.sinks[si].slack + cc_win)
++                        set.push_back(int(j));
++                if (set.size() == c.sinks.size())
++                    continue;
++                for (int j : set)
++                    c.sinks[j].critical = true;
++                const delay_t floor = worst_of(c, set) + margin;
++                if (!inputs_bear_copy(c, floor))
++                    continue;
++                Ev eo = eval(c, c.drv->bel, rest_of(c, set), c.drv, floor, false);
++                if (!eo.ok)
++                    continue;
++                auto sp = spots(c, set, nullptr, floor, true);
++                if (sp.empty() || !sp.front().ev.ok)
++                    continue;
++                acts.push_back({sp.front().ev.worst - worst_of(c, set), int(i), set});
++                no_act.erase(drv->name);
++            }
++            std::stable_sort(acts.begin(), acts.end(), [](const Act &a, const Act &b) { return a.gain > b.gain; });
++            int tries_left = 3;
++            for (auto &act : acts) {
++                if (tries_left-- <= 0)
++                    break;
++                Cand &c = cands[act.idx];
++                const PathArc &a = path[act.idx];
++                considered.insert(c.net->name);
++                Done d;
++                std::vector<int> bad;
++                if (apply(c, act.set, d, bad)) {
++                    done.push_back(d);
++                    (d.is_ff ? n_ff : n_lut)++;
++                    n_pair += d.copy2 != IdString();
++                    made++;
++                    cc_made++;
++                    for (IdString n : {d.orig, d.copy, d.copy2, d.orig2})
++                        if (n != IdString())
++                            touched.insert(n);
++                    for (auto &m : d.moved)
++                        touched.insert(m.first);
++                    for (auto &s : c.sinks)
++                        touched.insert(s.cell->name);
++                    for (auto &in : c.ins)
++                        if (in.src != nullptr)
++                            touched.insert(in.src->name);
++                    for (auto &in : c.lut_ins)
++                        if (in.src != nullptr)
++                            touched.insert(in.src->name);
++                    for (auto &pa : path)
++                        touched.insert(pa.sink->name);
++                    if (verbose)
++                        log_info("  replicate cc: path to %s.%s (%.3f ns, %d arcs): %s (%s, fanout %d) copied for %d "
++                                 "sinks to %s at %s%s%s, group slack bound %.3f -> %.3f ns\n",
++                                 ctx->nameOf(ec), ep.second.second.c_str(ctx), ctx->getDelayNS(ep.first),
++                                 int(path.size()), ctx->nameOf(c.drv), d.is_ff ? "FF" : "LUT", int(c.sinks.size()),
++                                 int(d.moved.size()), d.copy.c_str(ctx), ctx->nameOfBel(ctx->cells.at(d.copy)->bel),
++                                 d.copy2 != IdString() ? " with its D LUT" : "",
++                                 d.orig_new != BelId() ? ", original moved" : "", ctx->getDelayNS(d.before),
++                                 ctx->getDelayNS(d.after));
++                    break;
++                }
++                cc_rejected.insert(std::make_pair(c.drv->name, a.sink->name));
++            }
++            if (verbose > 1 && acts.empty())
++                log_info("    replicate cc: path to %s.%s (%.3f ns, %d arcs): no driver to copy passes the "
++                         "estimate\n",
++                         ctx->nameOf(ec), ep.second.second.c_str(ctx), ctx->getDelayNS(ep.first), int(path.size()));
++        }
++        return made;
++    }
++
++
++    bool settle(int round, size_t first, std::vector<Done> &done, int &n_ff, int &n_lut)
++    {
++        const delay_t ws_before = worst_slack;
++        analyse();
++        if (worst_slack >= ws_before - std::max<delay_t>(tol, 1))
++            return false;
++        log_warning("replicate: round %d lowered the model's worst slack (%.3f -> %.3f ns); taking its %d copies "
++                    "back\n",
++                    round, ctx->getDelayNS(ws_before), ctx->getDelayNS(worst_slack), int(done.size() - first));
++        while (done.size() > first) {
++            const Done &d = done.back();
++            (d.is_ff ? n_ff : n_lut)--;
++            n_pair -= d.copy2 != IdString();
++            rejected.insert(d.net);
++            for (auto &m : d.moved)
++                cc_rejected.insert(std::make_pair(d.orig, m.first));
++            undo(d);
++            done.pop_back();
++        }
++        analyse();
++        return true;
++    }
++
++    void dump(const std::string &fn) const
++    {
++        std::ofstream f(fn);
++        for (auto &ep : endpoints())
++            f << ep.second.first->name.str(ctx) << "\t" << ep.second.second.str(ctx) << "\t" << ep.first << "\n";
++
++
++        std::ofstream a(fn + ".arcs");
++        for (auto &n : ctx->nets) {
++            const NetInfo *ni = n.second.get();
++            if (!timed_net(ni))
++                continue;
++            for (auto &usr : ni->users) {
++                if (usr.cell == nullptr || usr.cell->bel == BelId())
++                    continue;
++                std::string pin = str_or_default(usr.cell->attrs, ctx->idf("X_ORIG_PORT_%s", usr.port.c_str(ctx)),
++                                                 usr.port.str(ctx));
++                if (pin.find(' ') != std::string::npos)
++                    pin = pin.substr(0, pin.find(' '));
++                delay_t d = arc_delay(ni->driver.cell->bel, ni->driver.port, usr.cell->bel, usr.port) +
++                            fan(int(ni->users.entries()));
++                a << usr.cell->name.str(ctx) << "\t" << pin << "\t" << usr.port.str(ctx) << "\t" << d << "\t"
++                  << ni->users.entries() << "\t" << slack_of(usr.cell, usr.port) << "\t"
++                  << ni->driver.cell->type.str(ctx) << "\t" << usr.cell->type.str(ctx) << "\n";
++            }
++        }
++    }
++
++
++    bool choose(const Cand &c, std::vector<int> &best_set, double &best_gain) const
++    {
++        best_gain = double(margin) - 1;
++        bool found = false;
++        for (auto &g : groups(c)) {
++            const delay_t floor = worst_of(c, g) + margin;
++            if (!inputs_bear_copy(c, floor))
++                continue;
++            Ev e_orig = eval(c, c.drv->bel, rest_of(c, g), c.drv, floor, false);
++            if (!e_orig.ok)
++                continue;
++            auto sp = spots(c, g, nullptr, floor, true);
++            if (sp.empty() || !sp.front().ev.ok)
++                continue;
++            double gain = sp.front().ev.gain + e_orig.gain;
++            if (gain > best_gain) {
++                best_gain = gain;
++                best_set = g;
++                found = true;
++            }
++        }
++        return found;
++    }
++
++
++    void explain(const Cand &c) const
++    {
++        int n_mov = 0, n_crit = 0, n_crit_mov = 0;
++        for (auto &s : c.sinks) {
++            n_mov += s.movable;
++            n_crit += s.critical;
++            n_crit_mov += s.movable && s.critical;
++        }
++        log_info("    replicate: %s (%s, fanout %d, worst slack %.3f ns): %d sinks critical, %d movable, %d both\n",
++                 ctx->nameOf(c.net), c.is_ff ? "FF" : "LUT", int(c.sinks.size()), ctx->getDelayNS(c.w0), n_crit, n_mov,
++                 n_crit_mov);
++        for (auto &g : groups(c)) {
++            const delay_t floor = worst_of(c, g) + margin;
++            Ev e_orig = eval(c, c.drv->bel, rest_of(c, g), c.drv, floor, false);
++            auto sp = spots(c, g, nullptr, floor, true);
++            Ev here = eval(c, c.drv->bel, g, nullptr, floor, true);
++            log_info("      group of %d: floor %.3f ns; inputs bear the copy %d; original with the rest ok %d (gain "
++                     "%.0f ps); copy at the original's bel: worst %.3f ns, gain %.0f ps; best free bel: %s worst "
++                     "%.3f ns, gain %.0f ps, ok %d\n",
++                     int(g.size()), ctx->getDelayNS(floor), int(inputs_bear_copy(c, floor)), int(e_orig.ok),
++                     e_orig.gain, ctx->getDelayNS(here.worst), here.gain,
++                     sp.empty() ? "-" : ctx->nameOfBel(sp.front().bel),
++                     sp.empty() ? 0.0 : ctx->getDelayNS(sp.front().ev.worst), sp.empty() ? 0.0 : sp.front().ev.gain,
++                     sp.empty() ? 0 : int(sp.front().ev.ok));
++        }
++    }
++
++    void parse_model(const std::string &opts)
++    {
++        size_t pos = 0;
++        while (pos < opts.size()) {
++            size_t end = opts.find(':', pos);
++            if (end == std::string::npos)
++                end = opts.size();
++            std::string kv = opts.substr(pos, end - pos);
++            pos = end + 1;
++            size_t eq = kv.find('=');
++            if (eq == std::string::npos)
++                continue;
++            std::string k = kv.substr(0, eq);
++            double x = std::atof(kv.c_str() + eq + 1);
++            if (k == "quant")
++                quant = float(x);
++            else if (k == "alpha")
++                alpha_ps = int(x);
++            else if (k == "beta")
++                beta = x;
++            else if (k == "site")
++                site_lut_ps = int(x);
++            else if (k == "siteother")
++                site_other_ps = int(x);
++            else if (k == "tile")
++                tile_ps = int(x);
++        }
++    }
++
++    void parse(const std::string &opts)
++    {
++        size_t pos = 0;
++        while (pos < opts.size()) {
++            size_t end = opts.find(':', pos);
++            if (end == std::string::npos)
++                end = opts.size();
++            std::string kv = opts.substr(pos, end - pos);
++            pos = end + 1;
++            if (kv.empty())
++                continue;
++            size_t eq = kv.find('=');
++            if (eq == std::string::npos)
++                continue;
++            std::string k = kv.substr(0, eq);
++            double x = std::atof(kv.c_str() + eq + 1);
++            if (k == "minfo")
++                min_fanout = std::max(2, int(x));
++            else if (k == "maxfo")
++                max_fanout = int(x);
++            else if (k == "critmin")
++                crit_min = float(x);
++            else if (k == "nets")
++                max_nets = int(x);
++            else if (k == "copies")
++                max_copies = int(x);
++            else if (k == "perroot")
++                per_root = int(x);
++            else if (k == "rounds")
++                rounds = int(x);
++            else if (k == "batch")
++                batch = std::max(1, int(x));
++            else if (k == "kmax")
++                kmax = int(x);
++            else if (k == "radius")
++                radius = std::max(1, int(x));
++            else if (k == "tiles")
++                top_tiles = std::max(1, int(x));
++            else if (k == "tries")
++                tries = std::max(1, int(x));
++            else if (k == "margin")
++                margin = delay_t(x);
++            else if (k == "fops")
++                fo_ps = x;
++            else if (k == "ctrlps")
++                ctrl_ps = int(x);
++            else if (k == "samodel")
++                sa_model = x != 0;
++            else if (k == "carrydi")
++                carry_di = x != 0;
++            else if (k == "tol")
++                tol = delay_t(x);
++            else if (k == "kinds")
++                kinds = int(x);
++            else if (k == "ctrl")
++                ctrl_sinks = x != 0;
++            else if (k == "cc")
++                cc_on = x != 0;
++            else if (k == "ccpaths")
++                cc_paths = std::max(1, int(x));
++            else if (k == "ccmax")
++                cc_max = std::max(1, int(x));
++            else if (k == "ccrounds")
++                cc_rounds = int(x);
++            else if (k == "ccwin")
++                cc_win = delay_t(x);
++            else if (k == "fanout")
++                fanout_on = x != 0;
++            else if (k == "dlut")
++                dlut_on = x != 0;
++            else if (k == "dump")
++                dump_file = kv.substr(eq + 1);
++            else if (k == "moveorig")
++                move_orig = x != 0;
++            else if (k == "verbose")
++                verbose = int(x);
++            else if (k == "quant")
++                quant = float(x);
++            else if (k == "alpha")
++                alpha_ps = int(x);
++            else if (k == "beta")
++                beta = x;
++            else if (k == "site")
++                site_lut_ps = int(x);
++            else if (k == "siteother")
++                site_other_ps = int(x);
++            else if (k == "tile")
++                tile_ps = int(x);
++            else
++                log_error("-o replicate: unknown key '%s'\n", k.c_str());
++        }
++    }
++
++    void init()
++    {
++        for (auto bel : ctx->getBels()) {
++            Loc l = ctx->getBelLocation(bel);
++            max_x = std::max(max_x, l.x);
++            max_y = std::max(max_y, l.y);
++        }
++        tile_luts.assign(max_x + 1, std::vector<std::vector<BelId>>(max_y + 1));
++        tile_ffs.assign(max_x + 1, std::vector<std::vector<BelId>>(max_y + 1));
++        for (auto bel : ctx->getBels()) {
++            if (!impl->is_logic_tile(bel))
++                continue;
++            Loc l = ctx->getBelLocation(bel);
++            if (ctx->isValidBelForCellType(id_SLICE_LUTX, bel)) {
++                if ((l.z & 0xF) == BEL_6LUT)
++                    tile_luts[l.x][l.y].push_back(bel);
++            } else if (ctx->isValidBelForCellType(id_SLICE_FFX, bel)) {
++                tile_ffs[l.x][l.y].push_back(bel);
++            }
++        }
++        for (auto &ex : ctx->timing_exceptions) {
++            for (IdString n : ex.from_cells)
++                excepted.insert(n);
++            for (IdString n : ex.to_cells)
++                excepted.insert(n);
++            for (auto &t : ex.through)
++                excepted.insert(t.first);
++        }
++    }
++
++    void run(const std::string &opts)
++    {
++        parse(opts);
++        if (sa_model) {
++
++            alpha_ps = 489;
++            beta = 1.391;
++            site_lut_ps = 665;
++            site_other_ps = 866;
++            tile_ps = 682;
++            fo_ps = 65;
++            ctrl_ps = 0;
++            if (ctx->args.options.count("sa-refine"))
++                parse_model(ctx->args.options.at("sa-refine").as<std::string>());
++            parse(opts);
++        }
++        auto t_start = std::chrono::steady_clock::now();
++        log_info("replicate: modes%s%s, fanout %d..%d, criticality >= %.2f, %d nets, at most %d copies (%d per cell), margin %d "
++                 "ps, arc model %d + %.3f * matrix + %.0f * log2(sinks / 2), CE/SR %+d (site %d/%d, tile %d ps), "
++                 "criticality quantile %.3f\n",
++                 cc_on ? " critical-cell" : "", fanout_on ? " fanout" : "", min_fanout, max_fanout, crit_min, max_nets,
++                 max_copies, per_root, int(margin), alpha_ps, beta, fo_ps, ctrl_ps,
++                 site_lut_ps, site_other_ps, tile_ps, quant);
++        init();
++        impl->replicate_retag();
++        impl->replicate_carry_di = carry_di;
++        analyse();
++        if (!dump_file.empty())
++            dump(dump_file);
++        const delay_t ws0 = worst_slack;
++        const double q05_0 = slack_q(0.005), q2_0 = slack_q(0.02);
++        pool<IdString> considered;
++        std::vector<Done> done;
++        int n_ff = 0, n_lut = 0;
++        bool stop = false;
++        for (int round = 1; cc_on && round <= cc_rounds && !stop && int(done.size()) < max_copies; round++) {
++            size_t first = done.size();
++            int made = cc_round(done, n_ff, n_lut, considered);
++            if (made == 0)
++                break;
++            stop = settle(round, first, done, n_ff, n_lut);
++            if (verbose)
++                log_info("  replicate cc round %d: %d copies, model slack worst/0.5%%/2%% %.3f/%.3f/%.3f ns\n", round,
++                         made, ctx->getDelayNS(worst_slack), slack_q(0.005), slack_q(0.02));
++        }
++        for (int round = 1; fanout_on && round <= rounds && !stop && int(done.size()) < max_copies; round++) {
++
++            struct Entry
++            {
++                delay_t slack;
++                std::string name;
++                NetInfo *net;
++            };
++            std::vector<Entry> list;
++            int n_fanout = 0, n_driver = 0;
++            for (auto &n : ctx->nets) {
++                NetInfo *ni = n.second.get();
++                int fo = int(ni->users.entries());
++                if (fo < min_fanout || fo > max_fanout || rejected.count(ni->name))
++                    continue;
++                n_fanout++;
++                if (!timed_net(ni) || !driver_ok(ni->driver.cell, ni->driver.port))
++                    continue;
++                if (kept_by_attribute(ni->attrs))
++                    continue;
++                n_driver++;
++                IdString root = root_of.count(ni->driver.cell->name) ? root_of.at(ni->driver.cell->name)
++                                                                      : ni->driver.cell->name;
++                if (copies_of.count(root) && copies_of.at(root) >= per_root)
++                    continue;
++                float crit = 0;
++                delay_t ws = SLACK_NONE;
++                for (auto &usr : ni->users) {
++                    if (usr.cell == nullptr || usr.cell->bel == BelId())
++                        continue;
++                    crit = std::max(crit, tmg->get_criticality(CellPortKey(usr)));
++                    ws = std::min(ws, slack_of(usr.cell, usr.port));
++                }
++                if (crit < crit_min || ws == SLACK_NONE)
++                    continue;
++                list.push_back({ws, ni->name.str(ctx), ni});
++            }
++            std::sort(list.begin(), list.end(), [](const Entry &a, const Entry &b) {
++                return a.slack != b.slack ? a.slack < b.slack : a.name < b.name;
++            });
++            if (verbose)
++                log_info("  replicate round %d: %d nets of that fanout, %d with a driver that can be copied, %d of "
++                         "them critical\n",
++                         round, n_fanout, n_driver, int(list.size()));
++            if (int(list.size()) > max_nets)
++                list.resize(max_nets);
++            pool<IdString> touched;
++            size_t round_first = done.size();
++            int deferred = 0;
++            for (auto &e : list) {
++                if (int(done.size() - round_first) >= batch || int(done.size()) >= max_copies)
++                    break;
++                NetInfo *ni = e.net;
++
++
++                bool stale = touched.count(ni->driver.cell->name);
++                for (auto &usr : ni->users)
++                    stale = stale || (usr.cell != nullptr && touched.count(usr.cell->name));
++                for (auto &p : ni->driver.cell->ports)
++                    if (p.second.type == PORT_IN && p.second.net != nullptr && p.second.net->driver.cell != nullptr)
++                        stale = stale || touched.count(p.second.net->driver.cell->name);
++                if (stale) {
++                    deferred++;
++                    continue;
++                }
++                considered.insert(ni->name);
++                Cand c;
++                if (!build(ni, c)) {
++                    rejected.insert(ni->name);
++                    continue;
++                }
++                bool made = false;
++                for (int attempt = 0; attempt < 3 && !made; attempt++) {
++                    std::vector<int> set, bad;
++                    double est;
++                    if (!choose(c, set, est)) {
++                        n_no_option++;
++                        if (verbose > 1)
++                            explain(c);
++                        break;
++                    }
++                    Done d;
++                    if (apply(c, set, d, bad)) {
++                        made = true;
++                        done.push_back(d);
++                        (d.is_ff ? n_ff : n_lut)++;
++                        n_pair += d.copy2 != IdString();
++                        if (d.copy2 != IdString())
++                            touched.insert(d.orig2);
++                        touched.insert(d.orig);
++                        touched.insert(d.copy);
++                        for (auto &m : d.moved)
++                            touched.insert(m.first);
++                        for (auto &in : c.ins)
++                            if (in.src != nullptr)
++                                touched.insert(in.src->name);
++                        for (auto &s : c.sinks)
++                            touched.insert(s.cell->name);
++                        if (verbose)
++                            log_info("  replicate: %s (%s, fanout %d): %d sinks to %s at %s%s, group slack bound "
++                                     "%.3f -> %.3f ns, critical sinks gain %.0f ps\n",
++                                     ctx->nameOf(ni), d.is_ff ? "FF" : "LUT", int(c.sinks.size()),
++                                     int(d.moved.size()), d.copy.c_str(ctx),
++                                     ctx->nameOfBel(ctx->cells.at(d.copy)->bel),
++                                     d.orig_new != BelId() ? ", original moved" : "", ctx->getDelayNS(d.before),
++                                     ctx->getDelayNS(d.after), d.gain);
++                    } else if (!bad.empty()) {
++
++                        for (int i : bad)
++                            c.sinks[i].movable = false;
++                    } else {
++                        break;
++                    }
++                }
++                if (!made)
++                    rejected.insert(ni->name);
++            }
++            size_t made_now = done.size() - round_first;
++            if (made_now == 0) {
++                stop = true;
++                continue;
++            }
++            stop = settle(round, round_first, done, n_ff, n_lut);
++            if (verbose)
++                log_info("  replicate round %d: %d copies, %d nets waiting, model slack worst/0.5%%/2%% "
++                         "%.3f/%.3f/%.3f ns\n",
++                         round, int(made_now), deferred, ctx->getDelayNS(worst_slack), slack_q(0.005),
++                         slack_q(0.02));
++        }
++
++
++
++        auto value_of = [&](const NetInfo *n) {
++            if (n == nullptr)
++                return IdString();
++            return net_root.count(n->name) ? net_root.at(n->name) : n->name;
++        };
++        auto check_copy = [&](IdString cn, IdString on) {
++            const CellInfo *copy = ctx->cells.at(cn).get();
++            const CellInfo *orig = ctx->cells.at(on).get();
++            bool same = copy->type == orig->type && copy->params == orig->params && copy->bel != BelId();
++            for (auto &p : orig->ports)
++                if (p.second.type == PORT_IN)
++                    same = same && copy->ports.count(p.first) &&
++                           value_of(copy->ports.at(p.first).net) == value_of(p.second.net);
++            for (auto &p : copy->ports)
++                if (p.second.type == PORT_IN)
++                    same = same && orig->ports.count(p.first);
++            if (!same)
++                log_error("replicate: copy '%s' differs from its original '%s'\n", cn.c_str(ctx), on.c_str(ctx));
++        };
++        for (auto &d : done) {
++            check_copy(d.copy, d.orig);
++            if (d.copy2 != IdString())
++                check_copy(d.copy2, d.orig2);
++        }
++        impl->replicate_retag();
++        for (auto &d : done)
++            n_orig_moved += d.orig_new != BelId();
++        int bad = 0;
++        for (auto &cell : ctx->cells) {
++            CellInfo *ci = cell.second.get();
++            if (ci->bel == BelId())
++                continue;
++            if (impl->is_logic_tile(ci->bel))
++                impl->replicate_dirty_tile(ci->bel);
++        }
++        for (auto &cell : ctx->cells) {
++            CellInfo *ci = cell.second.get();
++            if (ci->bel != BelId() && !ctx->isBelLocationValid(ci->bel))
++                bad++;
++        }
++        if (bad)
++            log_error("replicate left %d cells on invalid bels\n", bad);
++        impl->replicate_carry_di = false;
++        if (cc_on)
++            log_info("replicate: critical-cell mode: %d paths walked, %d copies\n", cc_walked, cc_made);
++        if (n_pair)
++            log_info("replicate: %d flip-flops copied together with the LUT that feeds their D\n", n_pair);
++        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
++        log_info("replicate: %d nets considered, %d copies made (%d flip-flops, %d LUTs; %d originals moved); "
++                 "refused: %d no gain by the estimate, %d legality, %d no legal bel; model slack worst %.3f -> %.3f ns, "
++                 "0.5%% %.3f -> %.3f ns, 2%% %.3f -> %.3f ns; %.2f s\n",
++                 int(considered.size()), int(done.size()), n_ff, n_lut, n_orig_moved, n_no_option, n_fail_legal,
++                 n_fail_place, ctx->getDelayNS(ws0), ctx->getDelayNS(worst_slack), q05_0, slack_q(0.005), q2_0,
++                 slack_q(0.02), secs);
++    }
++};
++}
++
++
++void XilinxImpl::replicate_retag()
++{
++    ctx->assignArchInfo();
++    assign_cell_tags();
++}
++
++
++
++void XilinxImpl::replicate_dirty_tile(BelId bel)
++{
++    auto &ts = tile_status.at(bel.tile);
++    if (!ts.lts)
++        return;
++    for (auto &e : ts.lts->eights)
++        e.dirty = true;
++    for (auto &h : ts.lts->halfs)
++        h.dirty = true;
++}
++
++void XilinxImpl::replicate()
++{
++    const bool asked = ctx->args.options.count("replicate");
++    const bool replay = ctx->args.options.count("preplaced") || ctx->args.options.count("prerouted");
++    if (!asked)
++        return;
++    if (replay) {
++        log_info("replicate: skipped, the placement is given (-o preplaced / -o prerouted)\n");
++        return;
++    }
++    Replicate(ctx, this).run(ctx->args.options.at("replicate").as<std::string>());
++}
++
++NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 3c845d7f..005f0226 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -84,6 +84,13 @@ po::options_description XilinxImpl::getUArchOptions()
+                            "detour, larger ones by a feedthrough LUT; optional value sets the max passes (default 8)");
+     specific.add_options()("lut6-first", "after placement, move a LUT alone on a 5LUT to its 6LUT and a flip-flop alone on "
+                            "an x5FF to its xFF where the tile stays legal (their outputs then avoid the slower xMUX pin)");
++    specific.add_options()("replicate", po::value<std::string>()->implicit_value(""),
++                           "timing-driven copies of flip-flops and LUTs after placement, for the critical sinks "
++                           "of the drivers on the worst paths (cc) and/or of high-fanout nets (fanout): "
++                           "key=value:... (cc, ccpaths, ccmax, ccrounds, ccwin, fanout, minfo, maxfo, critmin, "
++                           "nets, rounds, batch, kmax, copies, perroot, radius, tiles, tries, margin, tol, kinds, "
++                           "moveorig, ctrl, dlut, carrydi, alpha, beta, fops, ctrlps, site, siteother, tile, quant, "
++                           "samodel, dump, verbose)");
+     specific.add_options()("lut-a6-perm", "with a chipdb that has the A6 LUT permutation pips: let the router put "
+                            "an input of a LUT that sits alone on the 6LUT on the A6 pin (off: those pips are unused)");
+     specific.add_options()("carry-di-bypass", po::value<std::string>()->implicit_value(""),
+@@ -1225,6 +1232,9 @@ void XilinxImpl::postPlace()
+         log_info("timing-opt: radius %d tiles, %d rounds\n", cfg.radius, cfg.iterations);
+         timing_opt(ctx, cfg);
+     }
++
++
++    replicate();
+     if (ctx->args.options.count("lut6-first"))
+         lut6_first();
+     fixup_placement();
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 347989d6..9111e4d1 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -397,6 +397,13 @@ struct XilinxImpl : HimbaechelAPI
+     bool place_brams_by_group();
+     void replace_around_brams();
+     void sa_refine();
++
++    void replicate();
++    void replicate_retag();
++    void replicate_dirty_tile(BelId bel);
++
++
++    bool replicate_carry_di = false;
+ 
+     delay_t predictDelay(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const override;
+     delay_t estimateDelay(WireId src, WireId dst) const override;

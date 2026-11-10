@@ -54,6 +54,7 @@ both models are low:
   (OpenPARF, BSD-3); no code was copied.
   - Seed 1 HPWL after legalisation, with `static-delay`: rv_big 25980 -> 22470, rv_soc 17514 -> 18422,
     bram 21894 -> 21615.
+- `-o static-grad-y=F` / `-o static-hpwl-y=N` (build `place_v10`): y weight of the global wirelength gradient and of the placer1 cost. Negative on rv_soc (docs/wip/placement-global.md).
 - No-op with each new option off: `.frames` identical to place_v4 on rv_soc, 3 seeds each, for place_v6, place_v7,
   place_v8 and place_v9 (build/qor/place/r13/run6b.log, run8.log, run10.log).
 

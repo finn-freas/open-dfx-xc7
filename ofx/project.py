@@ -14,8 +14,11 @@ CONFIG = {
     "file": "ofx.toml",
     "build_dir": "build",
     "seed": 1,
+    "seeds": "auto",
+    "seeds_auto_max": 3,
     "partpins": "auto",
     "variants": {"auto": "partpin2", "anchors": "router"},
+    "timed_variants": {"auto": "pp3hb28_t", "anchors": "pp3hb28_t"},
     "module": "rm_slot",
     "decoupler_rtl": ROOT / "designs" / "common" / "dfx_decoupler.v",
     "report_paths": 0,
@@ -87,6 +90,15 @@ class Project:
         if self.device["problems"]:
             raise ProjectError(f"part {self.part}: " + "; ".join(self.device["problems"]))
         self.seed = int(p.get("seed", CONFIG["seed"]))
+        sv = p.get("seeds", CONFIG["seeds"])
+        m = re.fullmatch(r"auto(?::(\d+))?", sv) if isinstance(sv, str) else None
+        try:
+            self.seeds = (int(m.group(1) or CONFIG["seeds_auto_max"]) if m else int(sv))
+        except (TypeError, ValueError):
+            self.seeds = 0
+        self.seeds_auto = bool(m) and self.seeds > 1
+        if self.seeds < 1 or isinstance(sv, (bool, float)):
+            raise ProjectError(f"{self.file}: seeds must be a number >= 1, \"auto\" or \"auto:N\" (got {sv!r})")
         self.sources = [self.path(s) for s in p.get("sources", [])]
         self.constraints = [self.path(s) for s in p.get("constraints", [])]
         self.build = self.path(p.get("build_dir", CONFIG["build_dir"]))
@@ -143,7 +155,9 @@ class Project:
         parts = d.get("partition", [])
         if not parts:
             raise ProjectError("[dfx] needs at least one [[dfx.partition]]")
-        out = {"partpins": mode, "variant": d.get("variant") or CONFIG["variants"][mode],
+        timed = bool(d.get("timed", False))
+        variant = d.get("variant") or (CONFIG["timed_variants"][mode] if timed else CONFIG["variants"][mode])
+        out = {"partpins": mode, "variant": variant, "timed": timed,
                "rar": bool(d.get("rar", False)), "compress": bool(d.get("compress", False)),
                "decoupler": bool(d.get("decoupler", False)), "timing_allow_fail": list(d.get("timing_allow_fail", [])),
                "configs": [list(c) for c in d.get("configs", [])], "partitions": []}
@@ -162,6 +176,11 @@ class Project:
             miss = [str(v) for v in rms.values() if not v.exists()]
             if miss:
                 raise ProjectError(f"partition {q['name']}: missing RM sources {miss}")
+            if q.get("greybox"):
+                gname = "grey" if len(parts) == 1 else f"grey{i + 1}"
+                if gname in rms:
+                    raise ProjectError(f"partition {q['name']}: greybox = true adds the RM '{gname}', which is taken")
+                rms[gname] = self.build / "stage" / f"greybox_{q['name']}.v"
             if len(rms) < 2:
                 raise ProjectError(f"partition {q['name']}: needs at least two RMs")
             shell = self.path(q["shell"]) if q.get("shell") else None
@@ -170,7 +189,7 @@ class Project:
             out["partitions"].append({
                 "name": q["name"], "inst": q["inst"], "module": q.get("module", CONFIG["module"]),
                 "region": q["region"], "spec": spec, "spec_file": spec_file, "shell": shell,
-                "register": list(q.get("register", [])), "rms": rms,
+                "register": list(q.get("register", [])), "rms": rms, "greybox": bool(q.get("greybox", False)),
                 "default_rms": list(q.get("default_rms", list(rms))), "stub": q.get("stub")})
         if len(out["partitions"]) > 1 and mode != "anchors":
             raise ProjectError("several partitions need partpins = \"anchors\" (the multi-partition native flow)")

@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Sun, 8 Nov 2026 14:00:00 -0500
+Subject: [PATCH] xilinx: -o carry-di-bypass, carry DI through the slice X pin
+
+pack_carry inserted a feed-through LUT on the position's 5LUT for almost
+every CARRY4 DI input (rv_soc 366 of 368), and allowed only LUT1-LUT5 as the
+S LUT, because the S LUT and the DI feed-through share the inputs of one
+LUT6 site.  Vivado feeds DI from the AX..DX pin through the xCY0 mux and
+keeps the S LUT in the carry slice.
+
+With -o carry-di-bypass a DI that no LUT of its own position drives comes in
+through the X pin, unless it is constant or DI0 of a chain head whose CYINIT
+already uses AX.  The X-pin use is recorded in the cell tags (x_sigs) through
+the X_DI_BYPASS attribute, so slice validity keeps a flip-flop bypass or a
+MUXF7/F8 select off that pin; the S LUT may then be a LUT6.  Routing and FASM
+need no change: the chipdb has the AX -> ACY0 site pip and AX is the FASM
+default.
+
+Without the option the packer is unchanged (FASM identical on rv_soc and
+bram); on a design without carry chains (fir) the option changes nothing.
+Vivado-timed over 3 seeds it cuts slices 6-16 % (bram to Vivado's count)
+and leaves Fmax neutral to slightly better (+1.7 % mean on four designs,
+0.0 % on a LiteX SoC).
+---
+ himbaechel/uarch/xilinx/pack_carry.cc | 46 +++++++++++++++++++++------
+ himbaechel/uarch/xilinx/xilinx.cc     |  7 ++++
+ 2 files changed, 44 insertions(+), 9 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/pack_carry.cc b/himbaechel/uarch/xilinx/pack_carry.cc
+index e2a5e09d..85a471f1 100644
+--- a/himbaechel/uarch/xilinx/pack_carry.cc
++++ b/himbaechel/uarch/xilinx/pack_carry.cc
+@@ -225,6 +225,16 @@ void XC7Packer::pack_carries()
+ 
+     // N.B. LUT6 is not a valid type here, as CARRY requires dual outputs
+     pool<IdString> lut_types{id_LUT1, id_LUT2, id_LUT3, id_LUT4, id_LUT5};
++
++
++
++
++
++    const bool di_bypass_asked = ctx->args.options.count("carry-di-bypass");
++    pool<IdString> s_lut_types = lut_types;
++    if (di_bypass_asked)
++        s_lut_types.insert(id_LUT6);
++    int di_bypassed = 0;
+ 
+     pool<IdString> folded_nets;
+     int moved = 0, duplicated = 0;
+@@ -297,12 +307,20 @@ void XC7Packer::pack_carries()
+             // is free, or duplicated there when it is already clustered (see below)
+             CellInfo *s_dup_source = nullptr;
+             pool<IdString> s_dup_inputs;
++            const bool di_is_constant = c4_di != nullptr && (c4_di->driver.cell == nullptr ||
++                                                             c4_di->driver.cell->type.in(id_GND, id_VCC) ||
++                                                             c4_di->name == ctx->id("$PACKER_GND_NET") ||
++                                                             c4_di->name == ctx->id("$PACKER_VCC_NET"));
++            const bool x_taken_by_cyinit = z == 0 && c4->getPort(id_CYINIT) != nullptr;
++            const bool di_bypass_ok = di_bypass_asked && c4_di != nullptr && !di_is_constant && !x_taken_by_cyinit;
++            const pool<IdString> &s_types = di_bypass_ok ? s_lut_types : lut_types;
++            const int s_max_inputs = di_bypass_ok ? 6 : 5;
+             if (c4_s) {
+-                const bool s_driven_by_lut = c4_s->driver.cell != nullptr && lut_types.count(c4_s->driver.cell->type);
++                const bool s_driven_by_lut = c4_s->driver.cell != nullptr && s_types.count(c4_s->driver.cell->type);
+                 const bool s_is_only_load = c4_s->users.entries() == 1;
+                 if (s_driven_by_lut && s_is_only_load) {
+                     s_lut = c4_s->driver.cell;
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < s_max_inputs; j++) {
+                         NetInfo *ix = s_lut->getPort(ctx->idf("I%d", j));
+                         if (ix) {
+                             unique_lut_inputs.insert(ix->name);
+@@ -311,7 +329,7 @@ void XC7Packer::pack_carries()
+                     }
+                 } else if (s_driven_by_lut) {
+                     s_dup_source = c4_s->driver.cell;
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < s_max_inputs; j++) {
+                         NetInfo *ix = s_dup_source->getPort(ctx->idf("I%d", j));
+                         if (ix)
+                             s_dup_inputs.insert(ix->name);
+@@ -345,8 +363,8 @@ void XC7Packer::pack_carries()
+                 pool<IdString> shared_inputs = unique_lut_inputs;
+                 for (IdString ix : s_dup_inputs)
+                     shared_inputs.insert(ix);
+-                const int shared_input_count = int(shared_inputs.size()) + (di_lut ? 0 : 1);
+-                const bool duplicate_fits = shared_input_count <= 5;
++                const int shared_input_count = int(shared_inputs.size()) + ((di_lut || di_bypass_ok) ? 0 : 1);
++                const bool duplicate_fits = di_bypass_ok ? int(s_dup_inputs.size()) <= 6 : shared_input_count <= 5;
+                 const bool source_is_free = s_dup_source->cluster == ClusterId();
+                 if (duplicate_fits && source_is_free) {
+                     s_lut = s_dup_source;
+@@ -358,7 +376,7 @@ void XC7Packer::pack_carries()
+                     CellInfo *dup = ctx->createCell(ctx->idf("%s$S_DUP%d", s_dup_source->name.c_str(ctx), k),
+                                                     s_dup_source->type);
+                     NetInfo *dup_out = ctx->createNet(ctx->idf("%s$S_DUP%d", c4_s->name.c_str(ctx), k));
+-                    for (int j = 0; j < 5; j++) {
++                    for (int j = 0; j < s_max_inputs; j++) {
+                         IdString ip = ctx->idf("I%d", j);
+                         const bool source_has_input = s_dup_source->ports.count(ip);
+                         if (!source_has_input)
+@@ -380,9 +398,13 @@ void XC7Packer::pack_carries()
+             int lut_inp_count = int(unique_lut_inputs.size());
+             if (!s_lut)
+                 ++lut_inp_count; // for feedthrough
+-            if (!di_lut)
++            if (!di_lut && !di_bypass_ok)
+                 ++lut_inp_count; // for feedthrough
+-            if (lut_inp_count > 5) {
++            const bool s_needs_whole_lut = s_lut != nullptr && s_inputs > 5;
++            if (di_bypass_ok && di_lut && (lut_inp_count > 5 || s_needs_whole_lut)) {
++
++                di_lut = nullptr;
++            } else if (lut_inp_count > 5) {
+                 // Must use feedthrough for at least one LUT
+                 di_lut = nullptr;
+                 if (s_inputs > 4)
+@@ -396,7 +418,11 @@ void XC7Packer::pack_carries()
+                 auto s_feed = feed_through_lut(c4_s, {pr});
+                 s_lut = s_feed;
+             }
+-            if (!di_lut && c4_di) {
++            if (!di_lut && c4_di && di_bypass_ok) {
++                c4->attrs[ctx->id("X_DI_BYPASS")] =
++                        Property(int_or_default(c4->attrs, ctx->id("X_DI_BYPASS"), 0) | (1 << z), 4);
++                ++di_bypassed;
++            } else if (!di_lut && c4_di) {
+                 PortRef pr;
+                 pr.cell = c4;
+                 pr.port = ctx->idf("DI[%d]", z);
+@@ -427,6 +453,8 @@ void XC7Packer::pack_carries()
+         log_info("   Moved %d shared LUTs driving carry S inputs into the carry site.\n", moved);
+     if (duplicated > 0)
+         log_info("   Duplicated %d shared LUTs driving carry S inputs.\n", duplicated);
++    if (di_bypassed > 0)
++        log_info("   %d carry DI inputs come in through the slice X pin (carry-di-bypass).\n", di_bypassed);
+ 
+     for (auto net : folded_nets)
+         ctx->nets.erase(net);
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 8472a80f..49201d4e 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -82,6 +82,9 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("hold-fix", po::value<std::string>()->implicit_value(""),
+                            "after routing, fix hold-time (min-delay) violations: small deficits by a routing "
+                            "detour, larger ones by a feedthrough LUT; optional value sets the max passes (default 8)");
++    specific.add_options()("carry-di-bypass", po::value<std::string>()->implicit_value(""),
++                           "feed a carry DI that no LUT of its own position drives through the slice X pin "
++                           "(AX..DX), as Vivado does, instead of a feed-through LUT; the S LUT may then be a LUT6");
+     specific.add_options()("preplaced", po::value<std::string>(),
+                            "before placing, pin the cells named in this file to the bels they had in a reference "
+                            "build (scripts/routing_dump.py from that build's --write JSON), packer-made cells included");
+@@ -2090,6 +2093,10 @@ void XilinxImpl::assign_cell_tags()
+                 ct.carry.x_sigs[i] = nullptr;
+             }
+             ct.carry.x_sigs[0] = ci->getPort(id_CYINIT);
++            const int di_bypass = int_or_default(ci->attrs, ctx->id("X_DI_BYPASS"), 0);
++            for (int i = 0; i < 4; i++)
++                if (di_bypass & (1 << i))
++                    ct.carry.x_sigs[i] = ci->getPort(ctx->idf("DI%d", i));
+         } else if (ci->type == id_RAMB18E1_RAMB18E1 || ci->type == id_RAMB36E1_RAMB36E1) {
+             bool read_sdp = ((ci->type == id_RAMB18E1_RAMB18E1 &&
+                               int_or_default(ci->params, ctx->id("READ_WIDTH_B"), 0) == 36) ||

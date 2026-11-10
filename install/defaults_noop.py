@@ -17,10 +17,15 @@ CONFIG = {
     "prefix": Path(os.environ.get("OFX_PREFIX", Path.home() / ".local" / "ofx")),
     "out": ROOT / "build" / "defaults_noop",
     "designs": {
-        "blinky": {"top": "blinky", "recorded": "build/patched/baseline/blinky_stock/blinky.json"},
+        "blinky": {"top": "blinky", "recorded": "build/patched/baseline/blinky_stock/blinky.json",
+                   "changed_by": ["carry_di_bypass"]},
         "rv_soc": {"top": "rv_soc", "recorded": "build/patched/baseline/rv_soc_stock/rv_soc.json",
                    "rtl": ["rv_soc.v", "uart.v", "picorv32.v", "pr/rm_stub.v"],
-                   "changed_by": ["hardblock_timing"]},
+                   "changed_by": ["hardblock_timing", "carry_di_bypass"]},
+        "fir": {"top": "qor_fir", "dir": "designs/qor/qor_fir",
+                "recorded": "build/qor/synth/fir/3b84a4562f8f4000/qor_fir.json",
+                "changed_by": ["hardblock_timing", "dsp_cascade"],
+                "base_args": ["-o", "dsp-cascade-place"]},
     },
     "part": "xc7a35tcsg324-1",
     "max_nextpnr": int(os.environ.get("OFX_MAX_NEXTPNR", 2)),
@@ -125,7 +130,7 @@ def check_candidates(names, p, out, dry):
         print(f"== candidate {opt}: on top of the defaults", flush=True)
         for name in spec.get("noop_synth", []):
             d = CONFIG["designs"][name]
-            xdc = next((ROOT / "designs" / name).glob("*.xdc"))
+            xdc = next((ROOT / d.get("dir", f"designs/{name}")).glob("*.xdc"))
             s0, _ = defaults.synth_script(base, xdc, p["plugins"])
             s1, _ = defaults.synth_script(on, xdc, p["plugins"])
             j0 = synth(name, d, s0 or CONFIG["plain_synth"], out / name / "synth_defaults", p, dry)
@@ -186,10 +191,13 @@ def main():
     ap.add_argument("--designs", nargs="+", default=list(CONFIG["designs"]))
     ap.add_argument("--candidates", nargs="*", default=None, choices=list(CONFIG["candidates"]),
                     help="instead of the defaults checks, check these opt-in options for the defaults (no name: all)")
+    ap.add_argument("--plugins", default=None, help="yosys plugin directory instead of the prefix's")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
     dry = CONFIG["dry_run"] and not a.run
     p = paths(Path(a.prefix).resolve())
+    if a.plugins:
+        p["plugins"] = Path(a.plugins).resolve()
     out = Path(a.out).resolve()
     on = dict(defaults.CONFIG["defaults"])
     print(f"== defaults: {json.dumps(on, sort_keys=True)}")
@@ -203,22 +211,25 @@ def main():
     for name in a.designs:
         d = CONFIG["designs"][name]
         on_args = defaults.nextpnr_args(dict(on, **{k: False for k in d.get("changed_by", [])}))
-        xdc = next((ROOT / "designs" / name).glob("*.xdc"))
+        src = ROOT / d.get("dir", f"designs/{name}")
+        xdc = next(src.glob("*.xdc"))
         script, _ = defaults.synth_script(on, xdc, p["plugins"])
         if script:
-            j0 = synth(name, d, CONFIG["plain_synth"], out / name / "synth_plain", p, dry)
-            j1 = synth(name, d, script, out / name / "synth_defaults", p, dry)
+            j0 = synth(name, d, CONFIG["plain_synth"], out / name / "synth_plain", p, dry, src=src)
+            j1 = synth(name, d, script, out / name / "synth_defaults", p, dry, src=src)
             if not dry:
                 same = built(j0) and built(j1) and json_body(j0) == json_body(j1)
                 result(same, f"{name}: yosys JSON with the default synthesis ({script}) identical to plain synth_xilinx "
                              f"(creator line aside)")
         if on_args:
-            f0 = pnr(name, d, [], out / name / "pnr_off", p, dry)
-            f1 = pnr(name, d, on_args, out / name / "pnr_on", p, dry)
+            base_args = d.get("base_args", [])
+            pxdc = xdc if d.get("dir") else None
+            f0 = pnr(name, d, base_args, out / name / "pnr_off", p, dry, xdc=pxdc)
+            f1 = pnr(name, d, base_args + on_args, out / name / "pnr_on", p, dry, xdc=pxdc)
             if not dry:
                 same = built(f0) and built(f1) and filecmp.cmp(f0, f1, shallow=False)
                 result(same, f"{name}: release nextpnr with {' '.join(on_args)} gives .frames identical to without "
-                             f"(recorded netlist {d['recorded']})")
+                             f"(recorded netlist {d['recorded']}{', both with ' + ' '.join(base_args) if base_args else ''})")
     if dry:
         return
     print(f"== {sum(results)}/{len(results)} checks pass")

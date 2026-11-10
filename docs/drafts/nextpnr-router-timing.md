@@ -23,6 +23,11 @@ Everything is opt-in; without the options the router and placer behave as before
     tripped router2's tree reconstruction assertion, so the whole net is ripped, as `--tmg-ripup` does.
   - `critExp` (2), `critFloor` (0.05): crit_weight = max(floor, 1 - crit^exp).
   - `critEstWeight` (-1 = off), `critEstThresh` (0.9): A* estimate weight for arcs at or above the threshold.
+- `-o no-lut-routethru` (xilinx, 2026-11-08): LUT_ROUTETHRU pseudo-pips (IMUX -> unused LUT -> LOGIC_OUTS) are
+  unavailable to the router. The flag is read in preRoute, so placement (and the placer's delay table) is unchanged.
+  Why: the chipdb times these pips as SITE_NULL (free; the rcal class `clb_site_out` adds -56 ps), Vivado's timer
+  charges a LUT delay plus a new exit, and Vivado's router used none on the qor designs; on rv_soc s1 they carry 75 %
+  of nextpnr's extra delay on the 200 worst paths (flow/route_arcs.py). Binary build/nextpnr-build/rte-nrt.
 
 ## Evidence
 See docs/qor-vivado.md Finding 16 for the Vivado-timed results. No-op and runtime checks are listed there.
@@ -31,3 +36,4 @@ See docs/qor-vivado.md Finding 16 for the Vivado-timed results. No-op and runtim
 Built without options (build/nextpnr-build/rte-run), FASM (sorted, comments dropped) identical to the release binary
 build/nextpnr-build/rel01 on rv_soc, rv_mul, rv_big and bram (calibrated chipdb, static placer, seed 1, 5 ns;
 build/rte/noop/, 2026-11-06).
+- `-o no-lut-routethru` off (rte-nrt binary): FASM identical to the base binary on rv_soc, rv_mul, rv_big, bram (s1, rcal).

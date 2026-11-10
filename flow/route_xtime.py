@@ -63,6 +63,9 @@ CONFIG = {
                       "args": ["--router2-opt", "critSeedDelay=1.0", "--router2-opt", "critRipupIters=3", "--router2-opt", "critRipupThresh=0.8"]},
         "vimp_sd1crk3ew1": {"bin": NB / "rte-run" / "nextpnr-himbaechel", "import": True,
                       "args": ["--router2-opt", "critSeedDelay=1.0", "--router2-opt", "critRipupIters=3", "--router2-opt", "critEstWeight=1.0"]},
+        "own_nrt": {"bin": NB / "rte-nrt" / "nextpnr-himbaechel", "import": False, "args": ["-o", "no-lut-routethru"]},
+        "own_nrt0": {"bin": NB / "rte-nrt" / "nextpnr-himbaechel", "import": False, "args": []},
+        "vimp_nrt": {"bin": NB / "rte-nrt" / "nextpnr-himbaechel", "import": True, "args": ["-o", "no-lut-routethru"]},
     },
     "chipdbs": {
         "cal": ROOT / "build/chipdb-cal/on/chipdb-xc7a50t.bin",
@@ -142,8 +145,11 @@ def run_vivado_once(todo, dry):
     CONFIG["win_out"].mkdir(parents=True, exist_ok=True)
     shutil.copy(CONFIG["tcl"], CONFIG["win_src"] / "build_rte.tcl")
     import shlex
-    script = (f"source {shlex.quote(str(CONFIG['slot_helper']))}; vivado_acquire; cd /mnt/c/Users/finnf; "
-              f"{' '.join(shlex.quote(c) for c in cmd)} >> {shlex.quote(str(CONFIG['win_out'] / 'stdout.txt'))} 2>&1; "
+    done = " ".join(shlex.quote(str(CONFIG["win_out"] / n / "status.txt")) for n in todo)
+    script = (f"export VIV_SLOT1_ONLY=1; source {shlex.quote(str(CONFIG['slot_helper']))}; vivado_acquire; cd /mnt/c/Users/finnf; "
+              f"{' '.join(shlex.quote(c) for c in cmd)} >> {shlex.quote(str(CONFIG['win_out'] / 'stdout.txt'))} 2>&1 & "
+              f"cp=$!; while kill -0 $cp 2>/dev/null; do ok=1; for f in {done}; do [ -f \"$f\" ] || ok=0; done; "
+              f"if [ $ok = 1 ]; then sleep 90; kill $cp 2>/dev/null; break; fi; sleep 10; done; "
               f"vivado_release")
     subprocess.run(["bash", "-c", script])
 

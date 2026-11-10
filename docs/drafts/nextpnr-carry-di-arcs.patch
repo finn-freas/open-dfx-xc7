@@ -1,0 +1,27 @@
+From a4b08d86bb2983828f4eac754aef0456be887dc0 Mon Sep 17 00:00:00 2001
+From: open-dfx-xc7 <noreply@open-dfx-xc7>
+Date: Tue, 10 Nov 2026 04:26:35 -0500
+Subject: [PATCH] xilinx gen: import the CARRY4 DI -> O/CO timing arcs
+
+prjxray's slicem.sdf keeps the DI0-3 -> O/CO arcs under the cell types CARRY4_AX/BX/CX/DX, which the
+generator never read, so every carry DI input was untimed (placer, router and reported Fmax).
+---
+ himbaechel/uarch/xilinx/gen/xilinx_gen.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/himbaechel/uarch/xilinx/gen/xilinx_gen.py b/himbaechel/uarch/xilinx/gen/xilinx_gen.py
+index da357ad3..6a6d89aa 100644
+--- a/himbaechel/uarch/xilinx/gen/xilinx_gen.py
++++ b/himbaechel/uarch/xilinx/gen/xilinx_gen.py
+@@ -738,6 +738,8 @@ def main():
+     import_sdf_timings(mux, slicem_sdf.cells[("SELMUX2_1", "SLICEM/F7BMUX")])
+     carry = ch.timing.add_cell_variant("DEFAULT", "CARRY4")
+     import_sdf_timings(carry, slicem_sdf.cells[("CARRY4", "SLICEM")])
++    for di_cell in ("CARRY4_AX", "CARRY4_BX", "CARRY4_CX", "CARRY4_DX"):
++        import_sdf_timings(carry, slicem_sdf.cells[(di_cell, "SLICEM")])
+ 
+     import_bram_timings(ch.timing, parse_sdf.parse_sdf_file(path.join(timings_root, "timings", "BRAM_L.sdf")), is_virtex7)
+ 
+-- 
+2.53.0
+

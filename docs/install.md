@@ -148,6 +148,11 @@ are in `install/patches/messages/`.
 | 0025 | xilinx: program unused MMCM/PLL outputs as Vivado does | `nextpnr-clkout-unused.patch` |
 | 0026 | xilinx: FIFO18E1 and FIFO36E1 | `nextpnr-fifo.patch` |
 | 0027 | xilinx: XADC | `nextpnr-xadc.patch` |
+| 0028 | xilinx: partition-pin pre-route: FAN and CTRL wires are on the direct approach to a CE or SR pin (fixes dfxpp_a50, after 0.1) | `nextpnr-partition-pins-ce-sr.patch` |
+| 0029 | timing_log: skip a cross-clock Fmax line when neither clock has an Fmax (crash with latches, after 0.1) | `nextpnr-timing-log-xclock.patch` |
+| 0030 | xilinx: LDCE and LDPE latches (after 0.1) | `nextpnr-latch.patch` |
+| 0031 | xilinx: -o carry-di-bypass, carry DI through the slice X pin (opt-in in nextpnr; on in ofx, after 0.1) | `nextpnr-carry-di-bypass.patch` (the carry part of `nextpnr-packing-dpl.patch`) |
+| 0032 | xilinx: a LUT-RAM or SRL only in slice 0 of a CLBLM tile (fixes agent; regression flow/slicem_check.sh, after 0.1) | `nextpnr-slicem-slice0.patch` |
 
 0001-0011 are byte-identical to the previous series. The patched tree is `install/patches/nextpnr/TREE`
 (`961ea46e`); the installer refuses a worktree whose tree differs. It was built as variant `rel01`

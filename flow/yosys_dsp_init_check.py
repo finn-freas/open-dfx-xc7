@@ -131,7 +131,7 @@ def synth(case, which, dry):
     if net.exists():
         return o, 0
     src = source(case)
-    s = CONFIG["synth"].format(top=case)
+    s = CONFIG.get(f"synth_{which}", CONFIG["synth"]).format(top=case)
     ys = (f"read_verilog {src}; {s}; tee -o {o / 'stat.txt'} stat;"
           f" write_json {o / (case + '.json')}; write_verilog -noattr {net}")
     if not dry:
@@ -242,9 +242,22 @@ def noop(name, dry):
 def main():
     ap = argparse.ArgumentParser(description="xilinx_dsp init fix: repro cases with the stock and fixed yosys, "
                                              "simulation and equivalence of the fixed result, no-op designs")
+    ap.add_argument("--plugin", help="test the release plugin xilinx_dsp_init.so (ofx dsp_init) instead of the full "
+                                     "yosys build: stock yosys with the plugin; no SAT and no no-op step (the no-op "
+                                     "check of the plugin is install/synth_noop_suite.py dsp_init)")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
     dry = CONFIG["dry_run"] and not a.run
+    if a.plugin:
+        import sys
+        sys.path.insert(0, str(ROOT))
+        from ofx import defaults
+        CONFIG["yosys"]["fixed"] = CONFIG["yosys"]["stock"]
+        CONFIG["synth_fixed"] = (f"plugin -i {Path(a.plugin).resolve()}; {CONFIG['synth']} -run begin:map_dsp; "
+                                 f"{defaults.MAP_DSP_XC7.format(xilinx_dsp='xilinx_dsp_init -family xc7')}; "
+                                 f"{CONFIG['synth']} -run coarse:")
+        CONFIG["out"] = CONFIG["out"].parent / (CONFIG["out"].name + "_plugin")
+        CONFIG["noop"] = {}
     report = {"cases": {}, "noop": {}}
     for case, what in CONFIG["cases"].items():
         r = {"what": what}
@@ -257,7 +270,7 @@ def main():
             elif not dry:
                 t = (o / "yosys.log").read_text(errors="replace")
                 r[which]["error"] = next((ln for ln in t.splitlines() if "ERROR" in ln), "")
-        r["equiv"] = equiv(case, dry)
+        r["equiv"] = None if a.plugin else equiv(case, dry)
         report["cases"][case] = r
     for name in CONFIG["noop"]:
         report["noop"][name] = noop(name, dry)

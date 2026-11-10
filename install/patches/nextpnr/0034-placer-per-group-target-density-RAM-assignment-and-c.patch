@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Sun, 8 Nov 2026 19:37:58 -0500
+Subject: [PATCH] placer: per-group target density, RAM assignment and
+ criticality quantile
+
+- -o static-group-util=COMB,FF,RAM,DSP: the static placer's target
+  utilisation per cell group (< 0 keeps --placer-static-target-util).
+- -o static-ram-assign: unclustered block RAMs are assigned to sites by a
+  greedy timing-weighted assignment instead of the nearest free site.
+- --placer-static-crit-quantile Q: the static placer's criticality is
+  measured against the slack at quantile Q of the domain pair's port slacks
+  instead of the worst path (TimingAnalyser::crit_quantile).
+- --placer-static-driver-crit-fanout N: a net driver takes its users'
+  worst criticality up to fanout N (default 5, unchanged).
+
+Every option is off by default and an unset option changes nothing
+(.frames identical on rv_soc and bram, 3 seeds).
+---
+ common/kernel/command.cc          |  11 +++
+ common/kernel/timing.cc           |  16 +++++
+ common/kernel/timing.h            |   4 ++
+ common/place/placer_static.cc     | 113 +++++++++++++++++++++++++++++-
+ common/place/placer_static.h      |  12 ++++
+ himbaechel/uarch/xilinx/xilinx.cc |  20 ++++++
+ 6 files changed, 173 insertions(+), 3 deletions(-)
+
+diff --git a/common/kernel/command.cc b/common/kernel/command.cc
+index 7e62f871..d9b7288f 100644
+--- a/common/kernel/command.cc
++++ b/common/kernel/command.cc
+@@ -400,6 +400,11 @@ po::options_description CommandHandler::getGeneralOptions()
+     general.add_options()("placer-static-arc-ratio", po::value<float>(),
+                           "placer static: driver->sink timing-arc term for critical arcs, scaled to this fraction of "
+                           "the wirelength gradient (float, default: off)");
++    general.add_options()("placer-static-crit-quantile", po::value<float>(),
++                          "placer static: criticality relative to the slack at this quantile of the port slacks, not "
++                          "the worst path (default: off)");
++    general.add_options()("placer-static-driver-crit-fanout", po::value<int>(),
++                          "placer static: a net driver takes its users' worst criticality below this fanout (default 5)");
+     general.add_options()("placer-static-anchor-init", po::value<int>(),
+                           "placer static: star-model relaxation iterations toward fixed cells before spreading (default: off)");
+     general.add_options()("placer-static-weighted-precond",
+@@ -654,6 +659,12 @@ void CommandHandler::setupContext(Context *ctx)
+         ctx->settings[ctx->id("placerStatic/logicOverlapStop")] = std::to_string(vm["placer-static-overlap-stop"].as<float>());
+     if (vm.count("placer-static-arc-ratio"))
+         ctx->settings[ctx->id("placerStatic/arcRatio")] = std::to_string(vm["placer-static-arc-ratio"].as<float>());
++    if (vm.count("placer-static-crit-quantile"))
++        ctx->settings[ctx->id("placerStatic/critQuantile")] =
++                std::to_string(vm["placer-static-crit-quantile"].as<float>());
++    if (vm.count("placer-static-driver-crit-fanout"))
++        ctx->settings[ctx->id("placerStatic/driverCritFanout")] =
++                std::to_string(vm["placer-static-driver-crit-fanout"].as<int>());
+     if (vm.count("placer-static-anchor-init"))
+         ctx->settings[ctx->id("placerStatic/anchorInit")] = std::to_string(vm["placer-static-anchor-init"].as<int>());
+     if (vm.count("placer-static-weighted-precond"))
+diff --git a/common/kernel/timing.cc b/common/kernel/timing.cc
+index 39ad26b0..db619fc4 100644
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -994,6 +994,19 @@ void TimingAnalyser::compute_slack()
+ 
+ void TimingAnalyser::compute_criticality()
+ {
++    dict<int, delay_t> ref_slack;
++    if (crit_quantile > 0) {
++        dict<int, std::vector<delay_t>> slacks;
++        for (auto p : topological_order)
++            for (auto &pdp : ports.at(p).domain_pairs)
++                slacks[int(pdp.first)].push_back(pdp.second.setup_slack);
++        for (auto &s : slacks) {
++            auto &v = s.second;
++            size_t k = std::min(v.size() - 1, size_t(float(v.size()) * crit_quantile));
++            std::nth_element(v.begin(), v.begin() + k, v.end());
++            ref_slack[s.first] = std::min<delay_t>(v.at(k), -1);
++        }
++    }
+     for (auto p : topological_order) {
+         auto &pd = ports.at(p);
+         for (auto &pdp : pd.domain_pairs) {
+@@ -1020,6 +1033,9 @@ void TimingAnalyser::compute_criticality()
+                     crit = crit_floor + (1.0f - crit_floor) * slack / worst;
+                 else
+                     crit = crit_floor * (1.0f - slack / float(budget));
++            } else if (crit_quantile > 0) {
++                float ref = float(ref_slack.at(int(pdp.first)));
++                crit = 1.0f - (float(pdp.second.setup_slack) - ref) / -ref;
+             } else {
+                 crit = 1.0f -
+                        (float(pdp.second.setup_slack) - float(dp.worst_setup_slack)) / float(-dp.worst_setup_slack);
+diff --git a/common/kernel/timing.h b/common/kernel/timing.h
+index 561f042a..5c47b1ec 100644
+--- a/common/kernel/timing.h
++++ b/common/kernel/timing.h
+@@ -112,6 +112,10 @@ struct TimingAnalyser
+ 
+     float crit_target = 0;
+     float crit_floor = 0.9f;
++
++
++
++    float crit_quantile = 0;
+ 
+     bool setup_only = false;
+     bool have_loops = false;
+diff --git a/common/place/placer_static.cc b/common/place/placer_static.cc
+index f16a2fc8..29d37946 100644
+--- a/common/place/placer_static.cc
++++ b/common/place/placer_static.cc
+@@ -659,11 +659,12 @@ class StaticPlacer
+             const auto &cg = cfg.cell_groups.at(group);
+             const auto &g = groups.at(group);
+             double util = g.concrete_area / g.total_area;
++            double target_util = cg.target_util >= 0 ? cg.target_util : cfg.target_util;
+             log_info("⌁   group %s pre-spacer utilisation %.02f%% (target %.02f%%)\n", ctx->nameOf(cg.name),
+-                     (util * 100.0), (cfg.target_util * 100.0));
++                     (util * 100.0), (target_util * 100.0));
+             // TODO: better computation of spacer size and placement?
+             int inserted_spacers = 0;
+-            int spacer_count = (g.total_area * cfg.target_util - g.concrete_area) / cg.spacer_rect.area();
++            int spacer_count = (g.total_area * target_util - g.concrete_area) / cg.spacer_rect.area();
+             if (spacer_count <= 0)
+                 continue;
+             while (inserted_spacers < spacer_count) {
+@@ -961,7 +962,7 @@ class StaticPlacer
+                 if (port.second.type == PORT_IN) {
+                     crit = tmg.get_criticality(CellPortKey(cell->name, port.first));
+                 } else if (port.second.type == PORT_OUT) {
+-                    if (ni && ni->users.entries() < 5) {
++                    if (ni && int(ni->users.entries()) < cfg.driver_crit_fanout) {
+                         for (auto usr : ni->users)
+                             crit = std::max(crit, tmg.get_criticality(CellPortKey(usr)));
+                     }
+@@ -1422,8 +1423,111 @@ class StaticPlacer
+         }
+     }
+ 
++
++    void assign_legalise()
++    {
++        std::vector<int> cells;
++        for (int i = 0; i < int(ccells.size()); i++) {
++            auto &mc = mcells.at(i);
++            auto &cc = ccells.at(i);
++            if (mc.group < cfg.logic_groups || !cfg.cell_groups.at(mc.group).assign_legalise)
++                continue;
++            if (mc.is_fixed || cc.macro_idx != -1 || cc.base_cell->bel != BelId())
++                continue;
++            cells.push_back(i);
++        }
++        if (cells.empty())
++            return;
++        dict<IdString, std::vector<BelId>> bels_of_type;
++        for (int i : cells) {
++            CellInfo *ci = ccells.at(i).base_cell;
++            if (bels_of_type.count(ci->type))
++                continue;
++            auto &v = bels_of_type[ci->type];
++            for (auto bel : ctx->getBels())
++                if (ctx->isValidBelForCellType(ci->type, bel))
++                    v.push_back(bel);
++        }
++        struct Arc
++        {
++            Loc other;
++            IdString port, other_port;
++            bool is_driver;
++            float w;
++        };
++        struct Cand
++        {
++            float cost;
++            int cell;
++            BelId bel;
++        };
++        std::vector<Cand> cands;
++        for (int i : cells) {
++            CellInfo *ci = ccells.at(i).base_cell;
++            std::vector<Arc> arcs;
++            for (auto &port : ci->ports) {
++                NetInfo *ni = port.second.net;
++                if (ni == nullptr || ni->driver.cell == nullptr || ni->users.entries() > 64)
++                    continue;
++                if (cfg.glbBufTypes.count(ni->driver.cell->type))
++                    continue;
++                auto loc_of = [&](CellInfo *o) {
++                    RealPair p = cell_loc(o, false);
++                    return Loc(int(p.x), int(p.y), 0);
++                };
++                if (ni->driver.cell == ci) {
++                    for (auto usr : ni->users) {
++                        if (usr.cell == ci || (usr.cell->udata == -1 && usr.cell->bel == BelId()))
++                            continue;
++                        float c = cfg.timing_driven ? tmg.get_criticality(CellPortKey(usr)) : 0;
++                        arcs.push_back({loc_of(usr.cell), port.first, usr.port, true,
++                                        float(1.0 + cfg.timing_weight * std::pow(double(c), double(cfg.crit_exp)))});
++                    }
++                } else if (port.second.type == PORT_IN) {
++                    CellInfo *drv = ni->driver.cell;
++                    if (drv->udata == -1 && drv->bel == BelId())
++                        continue;
++                    float c = cfg.timing_driven ? tmg.get_criticality(CellPortKey(ci->name, port.first)) : 0;
++                    arcs.push_back({loc_of(drv), port.first, ni->driver.port, false,
++                                    float(1.0 + cfg.timing_weight * std::pow(double(c), double(cfg.crit_exp)))});
++                }
++            }
++            for (auto bel : bels_of_type.at(ci->type)) {
++                if (!ci->testRegion(bel))
++                    continue;
++                Loc pl = get_place_loc(ctx->getBelLocation(bel));
++                float cost = 0;
++                for (auto &a : arcs)
++                    cost += a.w * float(a.is_driver ? cfg.predict_delay(ctx, cfg, pl, a.port, a.other, a.other_port)
++                                                    : cfg.predict_delay(ctx, cfg, a.other, a.other_port, pl, a.port));
++                cands.push_back({cost, i, bel});
++            }
++        }
++        std::stable_sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) { return a.cost < b.cost; });
++        int placed = 0;
++        for (auto &c : cands) {
++            CellInfo *ci = ccells.at(c.cell).base_cell;
++            if (ci->bel != BelId() || !ctx->checkBelAvail(c.bel))
++                continue;
++            ctx->bindBel(c.bel, ci, STRENGTH_WEAK);
++            if (!ctx->isBelLocationValid(c.bel)) {
++                ctx->unbindBel(c.bel);
++                continue;
++            }
++            auto &mc = mcells.at(c.cell);
++            Loc loc = get_place_loc(ctx->getBelLocation(c.bel));
++            mc.pos = mc.ref_pos = RealPair(loc, 0.5);
++            mc.is_fixed = true;
++            placed++;
++        }
++        log_info("Assignment-legalised %d of %d cells (block RAMs) to their cheapest free sites.\n", placed,
++                 int(cells.size()));
++    }
++
+     void legalise_step(bool dsp_bram)
+     {
++        if (dsp_bram)
++            assign_legalise();
+         for (int i = 0; i < int(ccells.size()); i++) {
+             auto &mc = mcells.at(i);
+             auto &cc = ccells.at(i);
+@@ -1759,6 +1863,7 @@ class StaticPlacer
+     {
+         groups.resize(cfg.cell_groups.size());
+         tmg.setup_only = true;
++        tmg.crit_quantile = cfg.crit_quantile;
+         tmg.setup();
+         dump_density = ctx->setting<bool>("static/dump_density", false);
+     };
+@@ -1852,6 +1957,8 @@ PlacerStaticCfg::PlacerStaticCfg(Context *ctx)
+     arc_ratio = ctx->setting_or<float>("placerStatic/arcRatio", 0.0f);
+     weighted_precond = ctx->setting_or<bool>("placerStatic/weightedPrecond", false);
+     anchor_init = ctx->setting_or<int>("placerStatic/anchorInit", 0);
++    crit_quantile = ctx->setting_or<float>("placerStatic/critQuantile", 0.0f);
++    driver_crit_fanout = ctx->setting_or<int>("placerStatic/driverCritFanout", 5);
+     arc_exp = ctx->setting_or<float>("placerStatic/arcExp", 8.0f);
+     arc_min_crit = ctx->setting_or<float>("placerStatic/arcMinCrit", 0.5f);
+     arc_start_overlap = ctx->setting_or<float>("placerStatic/arcStartOverlap", 0.3f);
+diff --git a/common/place/placer_static.h b/common/place/placer_static.h
+index d64220ed..e8c17547 100644
+--- a/common/place/placer_static.h
++++ b/common/place/placer_static.h
+@@ -48,6 +48,12 @@ struct StaticCellGroupCfg
+     pool<IdString> zero_area_cells;
+     // size of spacers to insert
+     StaticRect spacer_rect{0.5, 0.5};
++
++    double target_util = -1;
++
++
++
++    bool assign_legalise = false;
+ };
+ 
+ struct PlacerStaticCfg
+@@ -74,6 +80,12 @@ struct PlacerStaticCfg
+     float grad_scale_y = 1.0f;
+ 
+     int anchor_init = 0;
++
++
++    float crit_quantile = 0;
++
++
++    int driver_crit_fanout = 5;
+ 
+ 
+ 
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 8cb42fcd..06530d24 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -129,6 +129,13 @@ po::options_description XilinxImpl::getUArchOptions()
+                            "placer delay prediction SITE,TILE,ALPHA,BETA (ps, ps, ps, factor): a LUT input from the "
+                            "same slice costs SITE, another slice of the same tile TILE, and a connection between "
+                            "tiles ALPHA + BETA * the delay matrix (off by default)");
++    specific.add_options()("static-ram-assign",
++                           "static placer: legalise the block RAMs by a global assignment to sites, cheapest "
++                           "(timing-weighted predicted delay to their neighbours) first, instead of the nearest free "
++                           "site");
++    specific.add_options()("static-group-util", po::value<std::string>(),
++                           "static placer: target utilisation per cell group COMB,FF,RAM,DSP (spacers fill each group "
++                           "up to it); default: --placer-static-target-util for all");
+     specific.add_options()("hardblock-timing", po::value<std::string>()->implicit_value(""),
+                            "time the DSP48E1 and ICAPE2 pins with the prjxray-db SDF arcs (off by default: they are "
+                            "untimed); see hardblock_timing.cc");
+@@ -1350,6 +1357,7 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+         comb.cell_area[id_RAMB36E1_RAMB36E1] = StaticRect(1.0f, 6.0f);
+         comb.bel_area[id_RAMB36E1_RAMB36E1] = StaticRect(0.0f, 0.0f);
+         comb.spacer_rect = StaticRect(1.0f, 3.0f);
++        comb.assign_legalise = ctx->args.options.count("static-ram-assign") > 0;
+     }
+     {
+         cfg.cell_groups.emplace_back();
+@@ -1359,6 +1367,18 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+         comb.bel_area[id_DSP48E1_DSP48E1] = StaticRect(1.0f, 3.0f);
+         comb.spacer_rect = StaticRect(1.0f, 3.0f);
+     }
++
++
++    if (ctx->args.options.count("static-group-util")) {
++        std::string s = ctx->args.options.at("static-group-util").as<std::string>();
++        double u[4];
++        if (sscanf(s.c_str(), "%lf,%lf,%lf,%lf", &u[0], &u[1], &u[2], &u[3]) != 4)
++            log_error("-o static-group-util expects COMB,FF,RAM,DSP, got '%s'\n", s.c_str());
++        for (int i = 0; i < 4 && i < int(cfg.cell_groups.size()); i++)
++            cfg.cell_groups.at(i).target_util = u[i];
++        log_info("Static placer target utilisation per group: COMB %.2f FF %.2f RAM %.2f DSP %.2f.\n", u[0], u[1], u[2],
++                 u[3]);
++    }
+     cfg.get_cell_area_override = [this](Context *ctx, const CellInfo *ci) -> std::optional<StaticRect> {
+         if (ci->type != id_SLICE_LUTX)
+             return {};

@@ -11,6 +11,26 @@ proc step {fh name script} {
     flush $fh
 }
 
+proc xt_dump_cells {fn} {
+    set f [open $fn w]
+    foreach c [get_cells -hierarchical -filter {IS_PRIMITIVE}] {
+        puts $f [join [list [get_property NAME $c] [get_property REF_NAME $c] [get_property LOC $c] [get_property BEL $c]] "\t"]
+    }
+    close $f
+}
+
+proc xt_dump_paths {fn n} {
+    set f [open $fn w]
+    foreach p [get_timing_paths -setup -max_paths $n -nworst 1 -unique_pins] {
+        set cells {}
+        foreach c [get_cells -of_objects $p] { lappend cells [get_property NAME $c] }
+        puts $f [join [list [get_property SLACK $p] [get_property DATAPATH_DELAY $p] [get_property DATAPATH_LOGIC_DELAY $p] \
+                           [get_property DATAPATH_NET_DELAY $p] [get_property STARTPOINT_PIN $p] [get_property ENDPOINT_PIN $p] \
+                           [join $cells " "]] "\t"]
+    }
+    close $f
+}
+
 file mkdir $CONFIG_OUTROOT
 foreach name $CONFIG_NAMES {
     set src $CONFIG_SRCROOT/$name
@@ -60,6 +80,10 @@ foreach name $CONFIG_NAMES {
         report_utilization -file $out/util.rpt
         report_timing_summary -file $out/timing.rpt
         report_timing -max_paths 10 -nworst 1 -input_pins -file $out/paths.rpt
+        if {[file exists $src/dump.flag]} {
+            xt_dump_cells $out/cells.txt
+            xt_dump_paths $out/paths.txt 1000
+        }
         if {[file exists $src/endpoints.flag]} {
             catch { report_timing_summary -max_paths 10 -report_unconstrained -check_timing_verbose -file $out/timing_full.rpt }
             catch { report_timing -hold -max_paths 10 -nworst 1 -input_pins -file $out/paths_hold.rpt }

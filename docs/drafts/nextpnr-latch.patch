@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Sun, 8 Nov 2026 09:46:02 -0500
+Subject: [PATCH] xilinx: LDCE and LDPE latches
+
+yosys maps a latch to LDCE/LDPE, which had no pack rule, so a design with a
+latch stopped with 'no BELs remaining to implement cell type LDCE'.  A latch
+is the slice storage element in latch mode: G on CK, GE on CE, CLR/PRE on SR,
+IS_G_INVERTED as IS_C_INVERTED, marked X_FF_AS_LATCH, which the control-set,
+placer and FASM checks already handle (AFF..DFF only, no flipflop in the same
+half-slice).  The writer sets LATCH, clears FFSYNC, ZRST for LDCE, INIT
+default 1 for LDPE, and the clock inverter has the opposite sense for a latch:
+CLKINV for a gate that is not inverted.
+---
+ himbaechel/uarch/xilinx/fasm.cc | 10 +++++++++-
+ himbaechel/uarch/xilinx/pack.cc | 14 ++++++++++++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index 965d5c63..9de9a5d8 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -806,7 +806,7 @@ struct FasmBackend
+                 // are built from carry it, and int_or_default() resolves an 'x'
+                 // bit to 0, which is the same bug by another route.
+                 const bool type_defaults_init_high =
+-                        (type == "FDSE" || type == "FDSE_1" || type == "FDPE" || type == "FDPE_1");
++                        (type == "FDSE" || type == "FDSE_1" || type == "FDPE" || type == "FDPE_1" || type == "LDPE");
+                 const int default_init = type_defaults_init_high ? 1 : 0;
+                 auto init_it = ff->params.find(id_INIT);
+                 const bool init_is_defined = (init_it != ff->params.end()) && init_it->second.is_fully_def();
+@@ -852,6 +852,14 @@ struct FasmBackend
+                     SET_CHECK(is_clkinv, true);
+                     SET_CHECK(is_latch, false);
+                     SET_CHECK(is_sync, false);
++                } else if (type == "LDCE" || type == "LDPE") {
++
++                    zrst = (type == "LDCE");
++
++
++                    SET_CHECK(is_clkinv, int_or_default(ff->params, id_IS_C_INVERTED) != 1);
++                    SET_CHECK(is_latch, true);
++                    SET_CHECK(is_sync, false);
+                 } else {
+                     log_error("unsupported FF type: '%s'\n", type.c_str());
+                 }
+diff --git a/himbaechel/uarch/xilinx/pack.cc b/himbaechel/uarch/xilinx/pack.cc
+index f4bf085f..bf63b867 100644
+--- a/himbaechel/uarch/xilinx/pack.cc
++++ b/himbaechel/uarch/xilinx/pack.cc
+@@ -388,6 +388,20 @@ void XilinxPacker::pack_ffs()
+     ff_rules[id_FDSE_1] = XFormRule(ff_rules[id_FDSE]);
+     ff_rules[id_FDSE_1].set_params.emplace_back(id_IS_C_INVERTED, 1);
+ 
++
++
++
++    ff_rules[id_LDCE].new_type = id_SLICE_FFX;
++    ff_rules[id_LDCE].port_xform[id_G] = id_CK;
++    ff_rules[id_LDCE].port_xform[ctx->id("GE")] = id_CE;
++    ff_rules[id_LDCE].port_xform[id_CLR] = id_SR;
++    ff_rules[id_LDCE].param_xform[ctx->id("IS_G_INVERTED")] = id_IS_C_INVERTED;
++    ff_rules[id_LDCE].set_attrs.emplace_back(id_X_FF_AS_LATCH, "1");
++
++    ff_rules[id_LDPE] = XFormRule(ff_rules[id_LDCE]);
++    ff_rules[id_LDPE].port_xform.erase(id_CLR);
++    ff_rules[id_LDPE].port_xform[id_PRE] = id_SR;
++
+     generic_xform(ff_rules, true);
+ }
+ 

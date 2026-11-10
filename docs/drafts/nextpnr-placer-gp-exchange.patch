@@ -1,0 +1,236 @@
+diff -ru a/common/kernel/command.cc b/common/kernel/command.cc
+--- a/common/kernel/command.cc	2026-11-08 18:47:58.287886396 -0500
++++ b/common/kernel/command.cc	2026-11-08 18:47:58.253145365 -0500
+@@ -405,6 +405,18 @@
+                           "the worst path (default: off)");
+     general.add_options()("placer-static-driver-crit-fanout", po::value<int>(),
+                           "placer static: a net driver takes its users' worst criticality below this fanout (default 5)");
++    general.add_options()("placer-static-gp-dump", po::value<std::string>(),
++                          "placer static: write the global-placement problem (grid, bel areas, cells, nets) to this file "
++                          "for an external global placer, then place as usual");
++    general.add_options()("placer-static-gp-import", po::value<std::string>(),
++                          "placer static: take the global placement from this file (\"<cell> <x> <y>\" per line, placer "
++                          "grid units) instead of running the spreading iterations, then legalise and refine as usual");
++    general.add_options()("placer-static-gp-import-warm",
++                          "placer static: with --placer-static-gp-import, start the usual spreading iterations from the "
++                          "imported positions instead of legalising them directly");
++    general.add_options()("placer-static-gp-out", po::value<std::string>(),
++                          "placer static: write the cell positions just before logic legalisation to this file "
++                          "(--placer-static-gp-import format)");
+     general.add_options()("placer-static-anchor-init", po::value<int>(),
+                           "placer static: star-model relaxation iterations toward fixed cells before spreading (default: off)");
+     general.add_options()("placer-static-weighted-precond",
+@@ -659,6 +671,14 @@
+     if (vm.count("placer-static-driver-crit-fanout"))
+         ctx->settings[ctx->id("placerStatic/driverCritFanout")] =
+                 std::to_string(vm["placer-static-driver-crit-fanout"].as<int>());
++    if (vm.count("placer-static-gp-dump"))
++        ctx->settings[ctx->id("placerStatic/gpDump")] = vm["placer-static-gp-dump"].as<std::string>();
++    if (vm.count("placer-static-gp-import"))
++        ctx->settings[ctx->id("placerStatic/gpImport")] = vm["placer-static-gp-import"].as<std::string>();
++    if (vm.count("placer-static-gp-import-warm"))
++        ctx->settings[ctx->id("placerStatic/gpImportWarm")] = true;
++    if (vm.count("placer-static-gp-out"))
++        ctx->settings[ctx->id("placerStatic/gpOut")] = vm["placer-static-gp-out"].as<std::string>();
+     if (vm.count("placer-static-anchor-init"))
+         ctx->settings[ctx->id("placerStatic/anchorInit")] = std::to_string(vm["placer-static-anchor-init"].as<int>());
+     if (vm.count("placer-static-weighted-precond"))
+diff -ru a/common/place/placer_static.cc b/common/place/placer_static.cc
+--- a/common/place/placer_static.cc	2026-11-08 18:47:58.288279133 -0500
++++ b/common/place/placer_static.cc	2026-11-08 18:47:58.269964220 -0500
+@@ -1317,9 +1317,9 @@
+                 if (mc.is_fixed)
+                     continue;
+                 auto last_pos = mc.pos;
+-                mc.pos = mc.pos * (1 - alpha) + (pos + RealPair(cc.chunk_dx, cc.chunk_dy) - macro.centroid) * alpha;
++                mc.pos = mc.pos * (1 - alpha) + (pos + RealPair(float(cc.chunk_dx), float(cc.chunk_dy)) - macro.centroid) * alpha;
+                 mc.ref_pos = mc.ref_pos * (1 - alpha) +
+-                             (ref_pos + RealPair(cc.chunk_dx, cc.chunk_dy) - macro.centroid) * alpha;
++                             (ref_pos + RealPair(float(cc.chunk_dx), float(cc.chunk_dy)) - macro.centroid) * alpha;
+                 dist += std::sqrt(std::pow(last_pos.x - mc.pos.x, 2) + std::pow(last_pos.y - mc.pos.y, 2));
+             }
+         }
+@@ -1526,6 +1526,15 @@
+ 
+     void legalise_step(bool dsp_bram)
+     {
++        if (!dsp_bram && !cfg.gp_out.empty()) {
++            FILE *f = fopen(cfg.gp_out.c_str(), "w");
++            if (f) {
++                for (int i = 0; i < int(ccells.size()); i++)
++                        fprintf(f, "%s %f %f\n", ccells.at(i).base_cell->name.c_str(ctx), mcells.at(i).pos.x,
++                                mcells.at(i).pos.y);
++                fclose(f);
++            }
++        }
+         if (dsp_bram)
+             assign_legalise();
+         for (int i = 0; i < int(ccells.size()); i++) {
+@@ -1867,6 +1876,118 @@
+         tmg.setup();
+         dump_density = ctx->setting<bool>("static/dump_density", false);
+     };
++
++    void gp_dump(const std::string &path)
++    {
++        FILE *f = fopen(path.c_str(), "w");
++        if (!f)
++            log_error("cannot write %s\n", path.c_str());
++        fprintf(f, "grid %d %d\n", width, height);
++        for (int g = 0; g < int(groups.size()); g++) {
++            fprintf(f, "group %d %s\n", g, cfg.cell_groups.at(g).name.c_str(ctx));
++            for (auto tile : groups.at(g).loc_area)
++                if (tile.value > 0)
++                    fprintf(f, "area %d %d %d %f\n", g, tile.x, tile.y, tile.value);
++        }
++        dict<IdString, int> beltype2group;
++        for (int i = 0; i < int(cfg.cell_groups.size()); i++)
++            for (const auto &bel_type : cfg.cell_groups.at(i).bel_area)
++                beltype2group[bel_type.first] = i;
++        for (auto bel : ctx->getBels()) {
++            IdString type = ctx->getBelType(bel);
++            auto fnd = beltype2group.find(type);
++            if (fnd == beltype2group.end() || fnd->second < cfg.logic_groups)
++                continue;
++            Loc loc = get_place_loc(ctx->getBelLocation(bel));
++            fprintf(f, "bel %d %s %d %d %d %s\n", fnd->second, type.c_str(ctx), loc.x, loc.y, loc.z, ctx->nameOfBel(bel));
++        }
++        for (int i = 0; i < int(ccells.size()); i++) {
++            auto &mc = mcells.at(i);
++            auto &cc = ccells.at(i);
++            fprintf(f, "cell %d %d %f %f %d %f %f %d %d %d %s %s\n", i, mc.group, mc.rect.w, mc.rect.h, int(mc.is_fixed),
++                    mc.pos.x, mc.pos.y, cc.macro_idx, cc.chunk_dx, cc.chunk_dy, cc.base_cell->type.c_str(ctx),
++                    cc.base_cell->name.c_str(ctx));
++        }
++        for (auto &nd : nets) {
++            if (nd.skip)
++                continue;
++            std::vector<std::string> pins;
++            std::set<int> seen;
++            bool drv = true;
++            auto add = [&](const PortRef &ref, bool is_drv) {
++                if (!ref.cell)
++                    return;
++                CellInfo *ci = ref.cell;
++                if (ci->udata != -1) {
++                    pins.push_back(stringf("%c%d|%s|%s|%s", is_drv ? 'O' : 'I', int(ci->udata), ref.port.c_str(ctx),
++                                           ci->type.c_str(ctx), ci->name.c_str(ctx)));
++                } else if (ci->bel != BelId()) {
++                    Loc l = get_place_loc(ctx->getBelLocation(ci->bel));
++                    pins.push_back(stringf("%c@%d,%d", is_drv ? 'O' : 'I', l.x, l.y));
++                }
++            };
++            add(nd.ni->driver, true);
++            for (auto &usr : nd.ni->users)
++                add(usr, false);
++            (void)drv;
++            if (pins.size() < 2)
++                continue;
++            fprintf(f, "net %s %d", nd.ni->name.c_str(ctx), int(pins.size()));
++            for (auto &p : pins)
++                fprintf(f, " %s", p.c_str());
++            fprintf(f, "\n");
++        }
++        fclose(f);
++        log_info("Wrote the global-placement problem to %s.\n", path.c_str());
++    }
++
++
++
++    void gp_import(const std::string &path)
++    {
++        std::ifstream in(path);
++        if (!in)
++            log_error("cannot read %s\n", path.c_str());
++        dict<IdString, RealPair> want;
++        std::string name;
++        float x, y;
++        while (in >> name >> x >> y)
++            want[ctx->id(name)] = RealPair(x, y);
++        int got = 0, miss = 0;
++        for (int i = 0; i < int(ccells.size()); i++) {
++            auto &mc = mcells.at(i);
++            if (mc.is_fixed)
++                continue;
++            auto fnd = want.find(ccells.at(i).base_cell->name);
++            if (fnd == want.end()) {
++                miss++;
++                continue;
++            }
++            mc.pos = mc.ref_pos = clamp_loc(fnd->second);
++            got++;
++        }
++        for (auto &m : macros) {
++            RealPair anchor(0, 0);
++            int n = 0;
++            for (int idx : m.conc_cells) {
++                auto &cc = ccells.at(idx);
++                anchor += mcells.at(idx).pos - RealPair(float(cc.chunk_dx), float(cc.chunk_dy));
++                n++;
++            }
++            if (n == 0)
++                continue;
++            anchor /= float(n);
++            for (int idx : m.conc_cells) {
++                auto &cc = ccells.at(idx);
++                if (mcells.at(idx).is_fixed)
++                    continue;
++                mcells.at(idx).pos = mcells.at(idx).ref_pos = clamp_loc(anchor + RealPair(float(cc.chunk_dx), float(cc.chunk_dy)));
++            }
++        }
++        log_info("Imported the global placement of %d cells from %s (%d movable cells not in the file).\n", got,
++                 path.c_str(), miss);
++    }
++
+     void place()
+     {
+         log_info("Running Static placer...\n");
+@@ -1877,11 +1998,22 @@
+         init_nets();
+         if (cfg.anchor_init > 0)
+             anchor_initial(cfg.anchor_init);
++        if (!cfg.gp_dump.empty())
++            gp_dump(cfg.gp_dump);
+         insert_dark();
+         insert_spacer();
+ 
+         prepare_density_bins();
+-        if (ccells.empty()) {
++        if (!cfg.gp_import.empty() && cfg.gp_import_warm)
++            gp_import(cfg.gp_import);
++        if (!cfg.gp_import.empty() && !cfg.gp_import_warm && !ccells.empty()) {
++            gp_import(cfg.gp_import);
++            initialise();
++            update_nets(true);
++            log_info("HPWL of the imported global placement: %f\n", system_hpwl());
++            legalise_step(true);
++            legalise_step(false);
++        } else if (ccells.empty()) {
+             log_info("No cells available for static to place\n");
+         } else {
+             initialise();
+@@ -1957,6 +2089,10 @@
+     arc_ratio = ctx->setting_or<float>("placerStatic/arcRatio", 0.0f);
+     weighted_precond = ctx->setting_or<bool>("placerStatic/weightedPrecond", false);
+     anchor_init = ctx->setting_or<int>("placerStatic/anchorInit", 0);
++    gp_dump = ctx->setting_or<std::string>("placerStatic/gpDump", "");
++    gp_import = ctx->setting_or<std::string>("placerStatic/gpImport", "");
++    gp_import_warm = ctx->setting_or<bool>("placerStatic/gpImportWarm", false);
++    gp_out = ctx->setting_or<std::string>("placerStatic/gpOut", "");
+     crit_quantile = ctx->setting_or<float>("placerStatic/critQuantile", 0.0f);
+     driver_crit_fanout = ctx->setting_or<int>("placerStatic/driverCritFanout", 5);
+     arc_exp = ctx->setting_or<float>("placerStatic/arcExp", 8.0f);
+diff -ru a/common/place/placer_static.h b/common/place/placer_static.h
+--- a/common/place/placer_static.h	2026-11-08 18:47:58.288469922 -0500
++++ b/common/place/placer_static.h	2026-11-08 18:47:58.285019021 -0500
+@@ -80,6 +80,9 @@
+     float grad_scale_y = 1.0f;
+     // Star-model relaxation toward the fixed cells (IO, ICAP, pre-placed blocks) before spreading; 0 = off.
+     int anchor_init = 0;
++    std::string gp_dump, gp_import;
++    bool gp_import_warm = false;
++    std::string gp_out;
+     // Criticality for the global placer's net weights relative to the slack at this quantile of the port slacks,
+     // not the worst path (TimingAnalyser::crit_quantile); 0 = off.
+     float crit_quantile = 0;
+Only in a: himbaechel

@@ -44,3 +44,65 @@
   path timing-aware without falling back to write_xaiger.
 - TDP WRITE_FIRST for single-port write-first memories; FSM extraction with init values.
 
+## Round 3 (2026-11-08): path depth on rv_soc (coordinator: 8.1 cells/path vs Vivado's 6.3)
+- flow/path_cells.py: cells per path and their kinds on a Vivado run's 100 worst non-ICAP paths (paths_noicap.txt +
+  the run's EDIF). Results (build/qor/synx/path_cells_tu.json):
+  - tu baseline (pl15_tuonly_stub, exact import, exact_sa s1-3): 8.20 / 8.13 / 8.19 cells/path; per path LUT2-6
+    5.58 / 5.39 / 5.85 (LUT2 alone ~2.8), nextpnr-made LUTs (xr_*) 0.21 / 0.27 / 0.07, CARRY4 0.36 / 0.42 / 0.22.
+  - the same yosys netlist placed by Vivado itself (vref_exact): 8.02, with 1.0 CARRY4 + 0.88 LUT1 inverters per path.
+  - Vivado's own netlist after opt_design (qor_synx rv_soc_viv opt_paths): 6.27 cells/path (4.19 LUTs, 0.08 CARRY4).
+  - yosys netlist after opt_design in Vivado: `ys` 7.16, `t_cal_dff` 6.53, `x1_cal` 6.63, `x1` 7.84 cells/path.
+  => the extra depth is synthesis (abc LUT chains, mostly LUT2), about 0.9 cells/path; nextpnr's own LUTs add only
+     ~0.2. abc9 with arrival times + the flat calibrated model (`x1_cal`) removes ~0.5 of it.
+- flow/depth_bench.py: tu placer (v15, pl15_tuonly_stub args) on `x1`, `x1_cal`, `x1_cal` + `-o carry-di-bypass`
+  (nextpnr made LUT1s 497 -> 285); rv_soc s1-3 done (nextpnr timer is ICAP-bound, 134-138 MHz). The x1_cal netlist
+  is byte-identical (src aside) to the lockstep-simulated synth_timing x1_cal netlist.
+- x1_cal_syn2 (ABC `&syn2; &dc2; &dch` before `&if`, with arrival times + calibrated model): graph depth max 6 -> 5 LUT
+  levels, 1130 -> 1087 LUT cells; lockstep sim PASS; dp_tu_x1calsyn2 s1-3 placed and exported.
+- Result (exact import, Vivado timer, rv_soc, seeds 1-3): tu 105.03 / 96.07 / 99.50 (mean 100.20), cells/path 8.17;
+  tu + x1_cal 111.48 / 100.23 / 101.45 (mean 104.39, +4.2 %), cells/path 7.24 (LUTs 5.66 -> 4.45 per path).
+  tu + x1_cal_syn2 122.80 / 114.08 / 115.81 (mean 117.56, +17.3 % over tu), cells/path 7.05.
+  Vivado's own netlist after opt_design: 6.27. Pending: x1_cal + carry-di-bypass, x1.
+- Runs: flow/depth_vivado_slot3.sh (slot 3; slot 1 too from 21:00), summary flow/depth_summary.py.
+- Superseded: exact-import Vivado runs (slot 1, from 21:00, 60 s gap): rv_soc_p5_dp_tu_{x1cal,x1cal_cdb,x1}_s{1,2,3}_exact
+  via flow/rte_dump_vivado.sh (RTE_OUT=build/exact, RTE_ROUTE_DUMP=0); log build/qor/synx/logs/depth_vivado.log.
+  Then: `python3 flow/path_cells.py <W>/build/exact/rv_soc_p5_dp_tu_*_exact` and Fmax from slack.txt / sa_summary.
+- Verification of x1_cal_syn2 (the netlists handed to the global placer, byte-identical to the checked ones):
+  rv_soc / rv_big (x1_cal_syn2) / rv_mul (dx1_cal_syn2, DSP draft): firmware lockstep 157836 cycles, 0 mismatches.
+  bram: sequential equivalence PROVEN (miter of default vs x1_cal_syn2, ABC dprove "Networks are equivalent";
+  build/qor/synx/equiv/bram/x1_cal_syn2_*/seq.log). flow/synth_timing_equiv.py now maps SRL16E/SRLC32E/IBUF/OBUF to
+  their cells_sim models (expose -evert did not cut them from a JSON netlist) and runs setundef -zero before aigmap.
+  Negative controls (flow/equiv_negctl.py, one LUT INIT bit flipped): 7 of 8 flips found NOT EQUIVALENT; the
+  remaining flip (k=0) proved equivalent, i.e. that bit is not observable. The structural check alone leaves 37 of 1103
+  cells unproven (lfsr[59], y[35:0]); the random-input simulation (flow/netlist_randsim.py) is not sensitive on bram
+  (broken netlists also pass) and is not used as evidence.
+- QoR suite quick set, open flow with the preset (`qor_suite.py open --quick --variant x1calsyn2 --synth <script>`,
+  script in build/qor/synx/x1calsyn2_suite_synth.txt), seed 1, nextpnr timer vs the base label (base run dirs as found):
+  rv_big 149.16 -> 133.24, serv 137.32 -> 121.65, aes 90.27 -> 91.84, sha256 75.05 -> 79.92, bram 231.64 -> 210.57,
+  axi_xbar 124.29 -> 144.18 MHz. yosys time 29.5 -> 25.2, 24.4 -> 22.7, 34.4 -> 30.1, 18.8 -> 15.8, 7.9 -> 7.1,
+  19.5 -> 15.5 s (shared machine). LUT cells: aes 3951 -> 5079 (+29 %); the others -1 to -3 %.
+  Vivado-timer exact import (placedx) for base and x1calsyn2 queued after 21:15 (log build/qor/synx/logs/suite_vivado.log).
+  Suite designs have no testbenches: their netlists are not verified (the preset is verified on rv_soc/rv_big/rv_mul/bram).
+
+## State at wind-down (2026-11-08 22:05): nothing of mine running, no lock held
+x1_cal_syn2 under the exact import (tu placer, Vivado timer, flow/depth_summary.py --design D):
+| design | tu baseline (s1/s2/s3, mean) | + x1_cal_syn2 (s1/s2/s3, mean) | cells/path |
+|---|---|---|---|
+| rv_soc | 105.03 / 96.07 / 99.50 = 100.20 | 122.80 / 114.08 / 115.81 = 117.56 (+17.3 %) | 8.17 -> 7.05 |
+| rv_mul (DSP draft) | 99.97 / 95.10 / 102.05 = 99.04 | 118.33 / 109.13 / 106.54 = 111.33 (+12.4 %) | 8.24 -> 7.30 |
+| rv_big (no DSP draft) | 89.01 / 82.45 / 84.84 = 85.43 | 83.04 / 84.38 / 87.88 = 85.10 (-0.4 %) | 8.76 -> 8.64 |
+| bram | 144.47 / 144.74 / 141.82 = 143.68 | 132.47 / 144.84 / - (s3 not run) | 10.46 -> 10.08 |
+- Helps LUT-depth-bound CPU paths (rv_soc, rv_mul); neutral where carry/DSP chains dominate (rv_big: 1.8 CARRY4 per
+  path; bram: 6.5). Not a default yet: bram s3 and the QoR-suite Vivado check are missing; suite nextpnr-timer results
+  were mixed and aes grew 29 % in LUTs (see above).
+- Verification: rv_soc/rv_big/rv_mul lockstep PASS; bram sequential equivalence proven. Suite designs unverified.
+
+Resume (all under the Vivado slot rules; scripts skip names whose status.txt exists):
+1. bram s3:  `bash flow/depth_vivado_slot3.sh --run bram_p5_dp_tu_x1calsyn2_s3_exact`
+2. rv_soc x1_cal + carry-di-bypass and x1-only (exported, not run):
+   `bash flow/depth_vivado_slot3.sh --run rv_soc_p5_dp_tu_x1cal_cdb_s{1,2,3}_exact rv_soc_p5_dp_tu_x1_s{1,2,3}_exact`
+   (log >> build/qor/synx/logs/depth_vivado.log)
+3. QoR-suite Vivado exact check (open runs done for x1calsyn2):
+   `python3 flow/qor_suite.py vivado --quick --variant x1calsyn2 --modes placedx --run` and the same with `--variant base`.
+4. Summaries: `python3 flow/depth_summary.py --design rv_soc|rv_mul|rv_big|bram`.
+

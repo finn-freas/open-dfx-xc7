@@ -272,10 +272,42 @@ st_ofx() {
     in_ofx() { env -i HOME="$HOME" LANG=C.UTF-8 PATH="$CLEAN_PATH" bash -c "cd '$w' && $1"; }
     in_ofx "python3 bin/ofx new $OFX_BOARD proj/blinky" > "$LOGS/ofx_new.log" 2>&1 || rc=1
     cp -a "$w/proj/blinky" "$w/proj/blinky_off"
-    printf '\n[build]\nhardblock_timing = false\ndsp_cascade = false\ndsp_pipeline = false\nasync_reg = false\nclkbuf_keep_buffer_inputs = false\ncell_timing = "stub"\nplacer = "heap"\n' >> "$w/proj/blinky_off/ofx.toml"
-    for p in blinky blinky_off; do
+    printf '\n[build]\nhardblock_timing = false\ndsp_cascade = false\ndsp_pipeline = false\nasync_reg = false\nclkbuf_keep_buffer_inputs = false\ndsp_init = false\ncarry_di_bypass = false\ncell_timing = "stub"\nplacer = "heap"\nplacer_tuning = false\n' >> "$w/proj/blinky_off/ofx.toml"
+    cp -a "$w/proj/blinky" "$w/proj/blinky_seeds"
+    sed -i 's/^seed = 1$/seed = 1\nseeds = 2/' "$w/proj/blinky_seeds/ofx.toml"
+    cp -a "$w/proj/blinky" "$w/proj/blinky_miss"
+    sed -i 's/-period 10.000/-period 1.000/' "$w/proj/blinky_miss/constraints/blinky.xdc"
+    for p in blinky blinky_off blinky_seeds; do
         stage_cmd "ofx_$p" in_ofx "python3 bin/ofx -p proj/$p build --run" || rc=1
     done
+    if stage_cmd ofx_blinky_miss in_ofx "python3 bin/ofx -p proj/blinky_miss build --run"; then
+        echo "FAIL blinky_miss: the build passed a 1000 MHz clock"
+        rc=1
+    fi
+    python3 - "$w/proj" <<'PY' | tee "$LOGS/ofx_seeds.log" || rc=1
+import json, sys
+from pathlib import Path
+bad = 0
+for p, runs, auto in (("blinky", 1, True), ("blinky_seeds", 2, False), ("blinky_miss", 3, True)):
+    impl = Path(sys.argv[1]) / p / "build" / "impl"
+    try:
+        r = json.loads((impl / "seeds.json").read_text())
+        k = r["kept"]
+        if p == "blinky_miss":
+            same = k is None and all(not x["ok"] and x["score"] is not None and x["score"] < 1 for x in r["runs"])
+            ok = len(r["runs"]) == runs and r.get("auto") == auto and same
+        else:
+            same = (impl / "seeds" / f"s{k}" / "blinky.fasm").read_bytes() == (impl / "blinky.fasm").read_bytes()
+            ok = len(r["runs"]) == runs and r.get("auto") == auto and same and any(impl.glob("*.bit"))
+        print(f"{'PASS' if ok else 'FAIL'} {p}: {len(r['runs'])} run(s) (want {runs}, auto {r.get('auto')}), "
+              f"kept seed {k}, " + ("every run misses timing" if p == "blinky_miss" else
+                                    f"fasm {'is' if same else 'is NOT'} the kept run's"))
+    except (OSError, KeyError, ValueError) as e:
+        ok = False
+        print(f"FAIL {p}: {e}")
+    bad += not ok
+sys.exit(1 if bad else 0)
+PY
     python3 - "$w/proj/blinky" "$w/proj/blinky_off" "$LOGS/ofx_blinky_off.log" <<'PY' | tee "$LOGS/ofx.log" || rc=1
 import json, sys
 from pathlib import Path

@@ -3,7 +3,7 @@ set -uo pipefail
 
 VIVADO_BAT="/mnt/c/AMDDesignTools/2025.2/Vivado/bin/vivado.bat"
 WIN_WORK="/mnt/c/Users/finnf/open-dfx-xc7-vivado/dpl"
-OUT="/mnt/c/Users/finnf/open-dfx-xc7-vivado/build/dpl_xtime"
+OUT="/mnt/c/Users/finnf/open-dfx-xc7-vivado/build/${DPL_XTIME:-dpl_xtime2}"
 DRY_RUN=1
 
 if [ "${1:-}" = "--run" ]; then DRY_RUN=0; shift; fi
@@ -20,7 +20,11 @@ for n in "$@"; do
   [ -d "$SRC/$n" ] || { echo "no source $n"; continue; }
   rm -rf "$WIN_WORK/src/$n"
   cp -r "$SRC/$n" "$WIN_WORK/src/$n"
-  vivado_acquire
+  while true; do
+    if _viv_mkdir vivado.lock; then VIV_HELD=vivado.lock; break; fi
+    sleep 3
+  done
+  trap '_viv_rmdir "$VIV_HELD"' EXIT
   echo "$(date +%T) $n on $VIV_HELD"
   log="$OUT/vivado_${n}.log"
   (cd "$WIN_WORK" && cmd.exe /c "$(wslpath -w "$VIVADO_BAT")" -mode batch -nojournal -log "$(wslpath -m "$log")" \

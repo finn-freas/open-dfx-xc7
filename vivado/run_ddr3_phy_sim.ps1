@@ -1,11 +1,14 @@
 param(
     [int[]]$Extras = @(0),
-    [switch]$Run
+    [string[]]$Defines = @(),
+    [string]$Tag = "",
+    [switch]$Run,
+    [switch]$Slotted
 )
 
 $CONFIG = @{
     WslProject = "\\wsl.localhost\Ubuntu\home\finnf\open-dfx-xc7"
-    WinWork    = "$HOME\open-dfx-xc7-vivado\sim\ddr3_phy"
+    WinWork    = "$HOME\open-dfx-xc7-vivado\sim\ddr3_phy$Tag"
     VivadoDirs = @("C:\AMDDesignTools\2025.2\Vivado\bin", "C:\Xilinx\Vivado\2025.2\bin", "C:\Xilinx\2025.2\Vivado\bin")
     Sources    = @("phy_top.v", "ddr3_model.v", "tb_phy.v")
     SrcSub     = "designs\ddr3\phy_sim"
@@ -24,20 +27,22 @@ if ($CONFIG.DryRun -and -not $Run) {
     Write-Output "add -Run to simulate"
     exit 0
 }
-if (Get-Process -Name vivado -ErrorAction SilentlyContinue) { throw "another vivado process is running; not starting" }
+if (-not $Slotted -and (Get-Process -Name vivado -ErrorAction SilentlyContinue)) { throw "another vivado process is running; not starting" }
 New-Item -ItemType Directory -Force $CONFIG.WinWork | Out-Null
 Set-Location $CONFIG.WinWork
 foreach ($s in $CONFIG.Sources) { Copy-Item -Force "$($CONFIG.WslProject)\$($CONFIG.SrcSub)\$s" . }
 Copy-Item -Force $glbl .
-& (Join-Path $bin "xvlog.bat") -sv @($CONFIG.Sources) glbl.v *> xvlog.out
+$dargs = @($Defines | ForEach-Object { @("-d", $_) })
+& (Join-Path $bin "xvlog.bat") -sv @dargs @($CONFIG.Sources) glbl.v *> xvlog.out
 if ($LASTEXITCODE) { throw "xvlog failed, see $($CONFIG.WinWork)\xvlog.out" }
 & (Join-Path $bin "xelab.bat") -debug off -timescale 1ps/1ps -L unisims_ver -L secureip -s tb_snap "work.$($CONFIG.Top)" work.glbl *> xelab.out
 if ($LASTEXITCODE) { throw "xelab failed, see $($CONFIG.WinWork)\xelab.out" }
 $dst = "$($CONFIG.WslProject)\$($CONFIG.LogDst)"
 New-Item -ItemType Directory -Force $dst | Out-Null
-Copy-Item -Force xvlog.out, xelab.out $dst
+Copy-Item -Force xvlog.out "$dst\xvlog$Tag.out"
+Copy-Item -Force xelab.out "$dst\xelab$Tag.out"
 foreach ($x in $Extras) {
-    $log = "xsim_extra$x.out"
+    $log = "xsim_extra$x$Tag.out"
     for ($i = 0; $i -lt $CONFIG.Retries; $i++) {
         $t0 = Get-Date
         & (Join-Path $bin "xsim.bat") tb_snap -R -testplusarg "`"RD_EXTRA=$x`"" *> $log

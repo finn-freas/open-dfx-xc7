@@ -97,6 +97,7 @@ rms = { xor = "rm/rm_core_xor.v", andn = "rm/rm_core_andn.v" }
 | `vhdl_std`, `vhdl_units`, `vhdl_generics` | VHDL options (see the VHDL section) |
 | `constraints` | XDC files, concatenated in order |
 | `seed` | nextpnr seed (default 1) |
+| `seeds` | `"auto"` (default) or `"auto:N"`: place and route `seed` alone, and only when it misses timing (worst clock below its target) or fails, also seeds `seed`+1 .. `seed`+N-1 (N default 3) and keep the best; a number N: always place and route seeds `seed` .. `seed`+N-1; `1`: one seed, no `seeds/` directory. The seeds run in parallel (up to `OFX_SEED_JOBS`, default 4, at once) and the one with the best routed Fmax (worst clock relative to its target) is kept; the runs are in `build/impl/seeds/`, the choice in `seeds.json`. Best of 3 raised Vivado-timed Fmax by 2.8 % on average over rv_soc / bram / rv_big / rv_mul (exact placement import, every 3-of-6-seed subset), best of 4 by 3.7 %; each extra seed costs one more nextpnr run |
 | `build_dir` | default `build` |
 
 `[clocks]`: `port = period_ns`. A `create_clock` is added for a port that no XDC already constrains, and the
@@ -171,10 +172,11 @@ Vivado's timer (`flow/release_bench.py`, variants `rel_new` and `rel_qor*`) has 
 | `dsp_pipeline` | `false` | yosys: `xilinx_dsp_qor -pipeline` (plugin) instead of synth_xilinx's `xilinx_dsp` | changes the netlist of every multiplier design; equivalence by random simulation only, and the FIR is slower in Vivado's P&R with it (215.75 -> 205.68 MHz, Finding 8) |
 | `async_reg` | `true` | yosys: `xilinx_asyncreg -xdc <the project XDC>` (plugin) after flatten: ASYNC_REG flip-flops are kept as flip-flops | JSON identical to plain synth_xilinx on designs without ASYNC_REG (blinky, rv_soc in `install/defaults_noop.py`); x_async_* match Vivado (3 FDRE, no SRL) |
 | `clkbuf_keep_buffer_inputs` | `false` | yosys: `clkbufmap_gapfix` instead of `clkbufmap` (BUFIO/BUFR inputs stay on the unbuffered clock) | not a no-op: rv_soc's netlist differs only in the inserted BUFG's `$auto$` name, which changes nextpnr's hash order and the bitstream; fixes bufio_iddr and oserdes; bufr then stops on a hold violation (`install/defaults_noop.py --candidates`, docs/release-0.1.md) |
+| `carry_di_bypass` | `false` | nextpnr `-o carry-di-bypass` (release patch 0031): a CARRY4 DI comes in through the slice X pin (AX..DX) instead of a feed-through LUT, and the S LUT may be a LUT6, as in Vivado | off = no-op; on: `.frames` identical on fir (no carry chain; `install/defaults_noop.py`); slices -6 to -16 %; Fmax with the exact placement import (flow/exact_src.py, Vivado timer, 3 seeds, paired): rv_soc -3.6 %, bram +1.3 %, rv_mul -0.3 %, rv_big -1.3 % (mean -1.0 %), so opt-in. The earlier +1.7 % came from the placed mode, which drops nextpnr's feed-through LUTs and leaves the LUT-RAMs and LUT pins to Vivado (Finding 15, round 3) |
 | `cell_timing` | `"stub"` | `auto`: the calibrated chipdb (`cal/chipdb-xc7a50t.bin`) for xc7a35t*-1 parts; `stub`: never | changes placement everywhere; Vivado's timer on the calibrated placements is better on 4 designs and worse on bram (155.09 -> 149.88), one seed each (Finding 10) |
 | `placer` | `"auto"` | `auto`: `--placer static` at every size (0.1; was: up to 3000 cells, else heap); `static`, `heap` force one | upstream placer, no draft; Vivado's timer on the static placements is 3-34 % better than on heap placements on all 5 qor designs (Finding 7); LiteX DDR/eth SoCs equal within 2 % under Vivado's timer and HeAP does not route mc12_a100 (docs/wip/placement-global.md) |
 
-All options off (`hardblock_timing`, `dsp_cascade`, `dsp_pipeline`, `async_reg`, `clkbuf_keep_buffer_inputs` false,
+All options off (`hardblock_timing`, `dsp_cascade`, `dsp_pipeline`, `async_reg`, `clkbuf_keep_buffer_inputs`, `carry_di_bypass` false,
 `cell_timing = "stub"`, `placer = "heap"`) gives the plain flow: no yosys script change, no nextpnr argument and the
 default chipdb (`install/defaults_noop.py` checks this).
 

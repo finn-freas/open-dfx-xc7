@@ -9,12 +9,29 @@ module tb_phy;
     localparam NCHECK = 24;
     parameter  DEBUG_ONLY = 0;
 
-    reg sys_clk = 0, sys4x_clk = 0, sys4x_dqs_clk = 0, idelay_clk = 0;
     reg sys_rst = 1, idelay_rst = 1;
+`ifdef PLL_CLOCKS
+    reg clk100 = 0;
+    always #5000 clk100 = ~clk100;
+    wire sys_clk, sys4x_clk, sys4x_dqs_clk, idelay_clk;
+    wire pll_fb, pll_c0, pll_c1, pll_c2, pll_c3, pll_locked;
+    PLLE2_BASE #(.CLKIN1_PERIOD(10.0), .DIVCLK_DIVIDE(1), .CLKFBOUT_MULT(16),
+                 .CLKOUT0_DIVIDE(16), .CLKOUT1_DIVIDE(4), .CLKOUT2_DIVIDE(4), .CLKOUT2_PHASE(90.0),
+                 .CLKOUT3_DIVIDE(8)) u_pll (
+        .CLKIN1(clk100), .CLKFBIN(pll_fb), .CLKFBOUT(pll_fb), .CLKOUT0(pll_c0), .CLKOUT1(pll_c1),
+        .CLKOUT2(pll_c2), .CLKOUT3(pll_c3), .LOCKED(pll_locked), .PWRDWN(1'b0), .RST(1'b0));
+    BUFG u_b0 (.I(pll_c0), .O(sys_clk));
+    BUFG u_b1 (.I(pll_c1), .O(sys4x_clk));
+    BUFG u_b2 (.I(pll_c2), .O(sys4x_dqs_clk));
+    BUFG u_b3 (.I(pll_c3), .O(idelay_clk));
+`else
+    reg sys_clk = 0, sys4x_clk = 0, sys4x_dqs_clk = 0, idelay_clk = 0;
+    wire pll_locked = 1'b1;
     always #(TSYS / 2) sys_clk = ~sys_clk;
     always #(TCK / 2) sys4x_clk = ~sys4x_clk;
     initial begin #(TCK / 4); forever #(TCK / 2) sys4x_dqs_clk = ~sys4x_dqs_clk; end
     always #2500 idelay_clk = ~idelay_clk;
+`endif
 
     wire [13:0] a;
     wire  [2:0] ba;
@@ -184,6 +201,10 @@ module tb_phy;
         nop;
         for (p = 0; p < 4; p = p + 1) begin bank[p] = 0; address[p] = 0; wrdata[p] = 0; end
         #(200000);
+`ifdef PLL_CLOCKS
+        wait (pll_locked === 1'b1);
+        #(10000);
+`endif
         idelay_rst = 0;
         #(100000);
         sys_rst = 0;

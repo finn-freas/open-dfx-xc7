@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Sun, 8 Nov 2026 09:08:43 -0500
+Subject: [PATCH] timing_log: skip a cross-clock Fmax line when neither clock
+ has an Fmax
+
+log_fmax took the minimum of both clocks constraints when neither of them
+was in clock_fmax and threw std::out_of_range (dict::at) after routing.
+raygentop (1356 LDCE latches, each gate net its own clock) hit it.
+---
+ common/kernel/timing_log.cc | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/common/kernel/timing_log.cc b/common/kernel/timing_log.cc
+index c7322eb2..d04947b3 100644
+--- a/common/kernel/timing_log.cc
++++ b/common/kernel/timing_log.cc
+@@ -299,6 +299,8 @@ static void log_fmax(Context *ctx, TimingResult &result, bool warn_on_failure)
+             // otherwise get the worst case (min.)
+             float target;
+             auto &clock_fmax = result.clock_fmax;
++            if (!clock_fmax.count(clock_a) && !clock_fmax.count(clock_b))
++                continue;
+             if (clock_fmax.count(clock_a) && !clock_fmax.count(clock_b)) {
+                 target = clock_fmax.at(clock_a).constraint;
+             } else if (!clock_fmax.count(clock_a) && clock_fmax.count(clock_b)) {

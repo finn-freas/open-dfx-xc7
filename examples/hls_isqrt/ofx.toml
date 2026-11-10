@@ -1,0 +1,15 @@
+[project]
+name = "hls_isqrt"
+top = "hls_isqrt"
+board = "arty-a7-35t"
+sources = ["src/hls_isqrt.v"]
+constraints = ["constraints/hls_isqrt.xdc"]
+seed = 1
+
+[clocks]
+clk = 10.0
+
+[[hls]]
+top = "isqrt"
+sources = ["c/isqrt.c"]
+testbench = "c/tb.c"

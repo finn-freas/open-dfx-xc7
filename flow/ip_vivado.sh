@@ -2,7 +2,6 @@
 set -euo pipefail
 
 VIVADO_BAT="/mnt/c/AMDDesignTools/2025.2/Vivado/bin/vivado.bat"
-LOCK="/mnt/c/Users/finnf/vivado.lock"
 WIN_WORK="/mnt/c/Users/finnf/open-dfx-xc7-vivado/ip"
 POLL_S=30
 YIELD_S=300
@@ -26,13 +25,12 @@ others_waiting() {
   pgrep -f 'ip_vivado.s[h] --run' | grep -vx -e "$$" -e "$PPID" | grep -q . && return 0
   pgrep -f 'until mkdir .*vivado.loc[k]' >/dev/null
 }
-while :; do
-  while tasklist.exe 2>/dev/null | grep -qi '^vivado.exe'; do sleep "$POLL_S"; done
-  if [ "$PRIORITY" = low ] && others_waiting; then echo "low priority: another Vivado job is waiting, sleep $YIELD_S s"; sleep "$YIELD_S"; continue; fi
-  mkdir "$LOCK" 2>/dev/null && break
-  sleep "$POLL_S"
-done
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+if [ "$PRIORITY" = low ]; then
+  while others_waiting; do echo "low priority: another Vivado job is waiting, sleep $YIELD_S s"; sleep "$YIELD_S"; done
+fi
+source "$ROOT/vivado/vivado_slot.sh"
+vivado_acquire
+trap 'vivado_release' INT TERM
 cd "$WORK"
 cmd.exe /c "$(wslpath -w "$VIVADO_BAT")" -mode batch -nojournal -log "$(wslpath -m "$WORK/vivado.log")" \
   -source "$(wslpath -m "$WORK/run.tcl")" -tclargs "${args[@]}" > "$WORK/stdout.txt" 2>&1 || true

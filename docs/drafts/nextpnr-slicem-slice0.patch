@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Sun, 8 Nov 2026 17:07:20 -0500
+Subject: [PATCH] xilinx: a LUT-RAM or SRL only in slice 0 of a CLBLM tile
+
+xc7_logic_tile_valid checked the SLICEM-only LUTs (distributed RAM, SRL) per
+tile type: it rejected them in a CLBLL tile but accepted them in either slice
+of a CLBLM tile, although only slice 0 of a CLBLM is a SLICEM.  A placer move
+into the SLICEL half was accepted by isBelLocationValid and the global-clock
+router later failed on a relptr assertion.  LUTs 4..7 (slice 1) of a CLBLM
+are now checked like a CLBLL's.
+---
+ himbaechel/uarch/xilinx/xilinx_place.cc | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/xilinx_place.cc b/himbaechel/uarch/xilinx/xilinx_place.cc
+index 8b3003fa..18d0d941 100644
+--- a/himbaechel/uarch/xilinx/xilinx_place.cc
++++ b/himbaechel/uarch/xilinx/xilinx_place.cc
+@@ -61,8 +61,10 @@ bool XilinxImpl::xc7_logic_tile_valid(IdString tile_type, const LogicTileStatus
+     // later as an unroutable "Pin 'DI1'/'WE' of bel ... has no associated
+     // wire".  A cheap O(16) scan here closes that hole for both the 6LUT
+     // and 5LUT bels.  (Port of nextpnr-xilinx arch_place.cc.)
+-    if (!is_slicem) {
+-        for (int i = 0; i < 8; i++) {
++
++    {
++        const int first_slicel_lut = is_slicem ? 4 : 0;
++        for (int i = first_slicel_lut; i < 8; i++) {
+             auto l6 = get_tags(lts.cells[(i << 4) | BEL_6LUT]);
+             auto l5 = get_tags(lts.cells[(i << 4) | BEL_5LUT]);
+             bool l6_needs_slicem = l6 != nullptr && (l6->lut.is_memory || l6->lut.is_srl);

@@ -35,18 +35,33 @@ def write_netlist(syn_json, edf, dry):
         subprocess.run(cmd, check=True)
 
 
-def placement(routed):
+CARRY_SPLIT = re.compile(r"\$split\$muxcy\d+\$PACKED_CARRY4\$$")
+
+
+def placement(routed, netlist_cells=None):
+    """nextpnr placement as (cell, BEL) rows for Vivado's place_cell. A CARRY4 loses nextpnr's packing suffix
+    ($split$muxcy<N>$PACKED_CARRY4$, any N; flow/qor_suite.py placement_rows); when nextpnr split one netlist CARRY4
+    over two sites, the part holding bit 0 (muxcy0) is kept and Vivado places the rest. With netlist_cells, cells
+    absent from the synthesized netlist (nextpnr-only feed-through LUTs, duplicates) are skipped too."""
     j = json.loads(Path(routed).read_text())
     m = j["modules"][next(iter(j["modules"]))]
-    rows, skipped = [], 0
+    rows, skipped, seen = [], 0, {}
     for name, c in m["cells"].items():
         bel = c["attributes"].get("NEXTPNR_BEL")
         if not bel or c["type"] in CONFIG["skip_types"] or "/" in name:
             skipped += 1
             continue
-        if c["type"] == "CARRY4" and name.endswith(CONFIG["carry_suffix"]):
-            name = name[:-len(CONFIG["carry_suffix"])]
-        rows.append((name, bel))
+        n = CARRY_SPLIT.sub("", name) if c["type"] == "CARRY4" else name
+        if netlist_cells is not None and n not in netlist_cells:
+            skipped += 1
+            continue
+        if n in seen:
+            skipped += 1
+            if "$muxcy0$" in name:
+                rows[seen[n]] = (n, bel)
+            continue
+        seen[n] = len(rows)
+        rows.append((n, bel))
     return rows, skipped
 
 

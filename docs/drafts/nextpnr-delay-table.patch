@@ -1,0 +1,657 @@
+diff --git a/common/place/placer_static.cc b/common/place/placer_static.cc
+index 72c8fea2..376ccaa8 100644
+--- a/common/place/placer_static.cc
++++ b/common/place/placer_static.cc
+@@ -1474,8 +1474,14 @@ class StaticPlacer
+             RealPair drv_loc = cell_loc(ni->driver.cell, false);
+             for (auto usr : ni->users.enumerate()) {
+                 RealPair usr_loc = cell_loc(usr.value.cell, false);
+-                delay_t est_delay = cfg.predict_delay(ctx, cfg, Loc(drv_loc.x, drv_loc.y, 0), ni->driver.port,
+-                                                      Loc(usr_loc.x, usr_loc.y, 0), usr.value.port);
++                delay_t est_delay =
++                        cfg.predict_arc
++                                ? cfg.predict_arc(ctx, ni->driver.cell, ni->driver.port,
++                                                  get_bel_loc(Loc(drv_loc.x, drv_loc.y, 0)), usr.value.cell,
++                                                  usr.value.port, get_bel_loc(Loc(usr_loc.x, usr_loc.y, 0)),
++                                                  int(ni->users.entries()))
++                                : cfg.predict_delay(ctx, cfg, Loc(drv_loc.x, drv_loc.y, 0), ni->driver.port,
++                                                    Loc(usr_loc.x, usr_loc.y, 0), usr.value.port);
+                 tmg.set_route_delay(CellPortKey(usr.value), DelayPair(est_delay));
+             }
+         }
+diff --git a/common/place/placer_static.h b/common/place/placer_static.h
+index e8c17547..07551713 100644
+--- a/common/place/placer_static.h
++++ b/common/place/placer_static.h
+@@ -102,6 +102,10 @@ struct PlacerStaticCfg
+ 
+     // override the default delay estimation formula (we can't use predictDelay because we don't have concrete bels)
+     std::function<delay_t(Context *, const PlacerStaticCfg &, Loc, IdString, Loc, IdString)> predict_delay;
++
++
++    std::function<delay_t(Context *, const CellInfo *, IdString, Loc, const CellInfo *, IdString, Loc, int)>
++            predict_arc;
+ };
+ 
+ extern bool placer_static(Context *ctx, PlacerStaticCfg cfg);
+diff --git a/himbaechel/uarch/xilinx/CMakeLists.txt b/himbaechel/uarch/xilinx/CMakeLists.txt
+index f720efbf..7f8db4ef 100644
+--- a/himbaechel/uarch/xilinx/CMakeLists.txt
++++ b/himbaechel/uarch/xilinx/CMakeLists.txt
+@@ -4,6 +4,7 @@ set(SOURCES
+     clock_tree.cc
+     constids.inc
+     delay_matrix.cc
++    dtab.cc
+     sa_refine.cc
+     extra_data.h
+     fasm.cc
+diff --git a/himbaechel/uarch/xilinx/dtab.cc b/himbaechel/uarch/xilinx/dtab.cc
+new file mode 100644
+index 00000000..ed128627
+--- /dev/null
++++ b/himbaechel/uarch/xilinx/dtab.cc
+@@ -0,0 +1,418 @@
++/*
++ *  nextpnr -- Next Generation Place and Route
++ *
++ *  Permission to use, copy, modify, and/or distribute this software for any
++ *  purpose with or without fee is hereby granted, provided that the above
++ *  copyright notice and this permission notice appear in all copies.
++ *
++ *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++#include <cmath>
++#include <fstream>
++#include <sstream>
++#include "log.h"
++#include "nextpnr.h"
++#include "timing.h"
++#include "util.h"
++#include "xilinx.h"
++
++#define HIMBAECHEL_CONSTIDS "uarch/xilinx/constids.inc"
++#include "himbaechel_constids.h"
++
++NEXTPNR_NAMESPACE_BEGIN
++
++namespace {
++const char *const dtab_src_names[] = {"LUT", "MUX", "FF", "CYO", "CYCO", "BRAM", "DSP", "IO"};
++const char *const dtab_dst_names[] = {"LUT", "FFD", "CE", "SR", "CYS", "CYDI", "CYCI", "MUXI",
++                                      "MUXS", "BYP", "BRA", "BRD", "BRC", "DSP", "IO"};
++bool starts(const std::string &s, const char *p) { return s.rfind(p, 0) == 0; }
++}
++
++void XilinxImpl::load_dtab(const std::string &file)
++{
++    std::ifstream in(file);
++    if (!in)
++        log_error("-o dtab: cannot read '%s'\n", file.c_str());
++    auto &t = dtab;
++    std::string line;
++    auto ints = [](std::istringstream &ss, std::vector<int> &v) {
++        int x;
++        while (ss >> x)
++            v.push_back(x);
++    };
++    auto floats = [](std::istringstream &ss, std::vector<float> &v) {
++        float x;
++        while (ss >> x)
++            v.push_back(x);
++    };
++    while (std::getline(in, line)) {
++        std::istringstream ss(line);
++        std::string key;
++        if (!(ss >> key))
++            continue;
++        if (key == "grid")
++            ss >> t.gw >> t.gh;
++        else if (key == "ix")
++            ints(ss, t.ix);
++        else if (key == "iy")
++            ints(ss, t.iy);
++        else if (key == "intx")
++            ints(ss, t.intx);
++        else if (key == "cx")
++            floats(ss, t.cx);
++        else if (key == "cy")
++            floats(ss, t.cy);
++        else if (key == "g") {
++            ss >> t.tx >> t.ty >> t.ex >> t.ey;
++            t.g.clear();
++            for (int i = 0; i < t.tx; i++) {
++                if (!std::getline(in, line))
++                    log_error("-o dtab: '%s' ends inside the table\n", file.c_str());
++                std::istringstream rs(line);
++                floats(rs, t.g);
++            }
++        } else if (key == "src" || key == "dst") {
++            std::string tok;
++            while (ss >> tok) {
++                auto eq = tok.find('=');
++                std::string name = tok.substr(0, eq);
++                float v = std::stof(tok.substr(eq + 1));
++                if (key == "src") {
++                    for (int i = 0; i < DTAB_NSRC; i++)
++                        if (name == dtab_src_names[i])
++                            t.src[i] = v;
++                } else {
++                    for (int i = 0; i < DTAB_NDST; i++)
++                        if (name == dtab_dst_names[i])
++                            t.dst[i] = v;
++                }
++            }
++        } else if (key == "direct")
++            ss >> t.direct;
++        else if (key == "site")
++            floats(ss, t.site);
++        else if (key == "tile")
++            floats(ss, t.tile);
++        else if (key == "fo") {
++            std::vector<float> v;
++            floats(ss, v);
++            for (int i = 0; i < 8 && i < int(v.size()); i++)
++                t.fo[i] = v[i];
++        }
++    }
++    const bool ok = t.gw > 0 && t.gh > 0 && int(t.ix.size()) == t.gw && int(t.intx.size()) == t.gw &&
++                    int(t.iy.size()) == t.gh && int(t.cx.size()) == t.gw + 1 && int(t.cy.size()) == t.gh + 1 &&
++                    t.tx > 0 && t.ty > 0 && int(t.g.size()) == t.tx * t.ty &&
++                    int(t.site.size()) == DTAB_NSRC * DTAB_NDST && int(t.tile.size()) == DTAB_NSRC * DTAB_NDST;
++    if (!ok)
++        log_error("-o dtab: '%s' is not a complete delay table\n", file.c_str());
++    t.ok = true;
++    if (ctx->args.options.count("dtab-fo"))
++        t.fo_scale = std::stof(ctx->args.options.at("dtab-fo").as<std::string>());
++    log_info("Arc delay table %s: %dx%d entries, direct %.0f ps, one INT column %.0f ps, one row %.0f ps, fanout term "
++             "x%.2f (%.0f ps at 16 sinks).\n",
++             file.c_str(), t.tx, t.ty, t.direct, t.g.at(1 * t.ty + 0), t.g.at(0 * t.ty + 1), t.fo_scale, t.fo[4]);
++}
++
++int XilinxImpl::dtab_src_class(const CellInfo *ci, IdString port) const
++{
++    if (ci->type == id_SLICE_LUTX)
++        return 0;
++    if (ci->type == id_SELMUX2_1)
++        return 1;
++    if (ci->type == id_SLICE_FFX)
++        return 2;
++    if (ci->type == id_CARRY4)
++        return starts(port.str(ctx), "CO") ? 4 : 3;
++    if (ci->type.in(id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1))
++        return 5;
++    if (ci->type == id_DSP48E1_DSP48E1)
++        return 6;
++    return 7;
++}
++
++int XilinxImpl::dtab_dst_class(const CellInfo *ci, IdString port) const
++{
++    if (ci->type == id_SLICE_LUTX) {
++        if (port.in(id_A1, id_A2, id_A3, id_A4, id_A5, id_A6))
++            return 0;
++        if (port == id_WE)
++            return 2;
++        const std::string p = port.str(ctx);
++        if (starts(p, "WA") && p.size() == 3 && p[2] >= '1' && p[2] <= '6')
++            return 0;
++        return 9;
++    }
++    if (ci->type == id_SLICE_FFX)
++        return port == id_D ? 1 : (port == id_CE ? 2 : 3);
++    if (ci->type == id_CARRY4) {
++        const std::string p = port.str(ctx);
++        if (starts(p, "S"))
++            return 4;
++        if (starts(p, "DI"))
++            return 5;
++        return 6;
++    }
++    if (ci->type == id_SELMUX2_1)
++        return port.in(id_I0, id_I1) ? 7 : 8;
++    if (ci->type.in(id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1)) {
++        const std::string p = port.str(ctx);
++        if (starts(p, "ADDR"))
++            return 10;
++        if (starts(p, "DI"))
++            return 11;
++        return 12;
++    }
++    if (ci->type == id_DSP48E1_DSP48E1)
++        return 13;
++    return 14;
++}
++
++bool XilinxImpl::dtab_direct_pin(const CellInfo *src, const CellInfo *dst, IdString dp) const
++{
++    if (src->type == id_SLICE_FFX)
++        return false;
++    if (dst->type == id_SLICE_FFX)
++        return dp == id_D;
++    if (dst->type == id_CARRY4)
++        return dp.in(id_S0, id_S1, id_S2, id_S3, id_DI0, id_DI1, id_DI2, id_DI3);
++    if (dst->type == id_SELMUX2_1)
++        return dp.in(id_I0, id_I1);
++    return false;
++}
++
++float XilinxImpl::dtab_between(int sx, int sy, int dx, int dy) const
++{
++    const auto &t = dtab;
++    sx = std::max(0, std::min(sx, t.gw - 1));
++    dx = std::max(0, std::min(dx, t.gw - 1));
++    sy = std::max(0, std::min(sy, t.gh - 1));
++    dy = std::max(0, std::min(dy, t.gh - 1));
++    int i = std::abs(t.ix[dx] - t.ix[sx]), j = std::abs(t.iy[dy] - t.iy[sy]);
++    float e = 0;
++    if (i >= t.tx) {
++        e += (i - t.tx + 1) * t.ex;
++        i = t.tx - 1;
++    }
++    if (j >= t.ty) {
++        e += (j - t.ty + 1) * t.ey;
++        j = t.ty - 1;
++    }
++    int a = std::min(t.intx[sx], t.intx[dx]), b = std::max(t.intx[sx], t.intx[dx]);
++    float c = b > a ? t.cx[b] - t.cx[a + 1] : 0.0f;
++    a = std::min(sy, dy);
++    b = std::max(sy, dy);
++    c += b > a ? t.cy[b] - t.cy[a + 1] : 0.0f;
++    return t.g[i * t.ty + j] + e + c;
++}
++
++delay_t XilinxImpl::dtab_delay(const CellInfo *src, IdString sp, int sx, int sy, const CellInfo *dst, IdString dp,
++                               int dx, int dy, int rel, int fanout) const
++{
++    if (dp == id_CIN && sp == id_CO3)
++        return 0;
++    const auto &t = dtab;
++    if (rel == DTAB_DIRECT)
++        return delay_t(t.direct);
++    const int sc = dtab_src_class(src, sp), dc = dtab_dst_class(dst, dp);
++    if (rel == DTAB_SITE)
++        return delay_t(t.site[sc * DTAB_NDST + dc]);
++    if (rel == DTAB_TILE)
++        return delay_t(t.tile[sc * DTAB_NDST + dc]);
++    float d = dtab_between(sx, sy, dx, dy) + t.src[sc] + t.dst[dc];
++    if (t.fo_scale != 0 && fanout > 1)
++        d += t.fo_scale * t.fo[std::min(7, int(std::log2(double(fanout))))];
++    return delay_t(std::max(0.0f, d));
++}
++
++delay_t XilinxImpl::dtab_bel_delay(const CellInfo *src, IdString sp, BelId sb, const CellInfo *dst, IdString dp,
++                                   BelId db, int fanout) const
++{
++    if (sb == BelId() || db == BelId())
++        return 0;
++    if (dp == id_CIN && sp == id_CO3)
++        return 0;
++    Loc sl = ctx->getBelLocation(sb), dl = ctx->getBelLocation(db);
++    int rel = DTAB_BETWEEN;
++    if (sb.tile == db.tile) {
++        if ((sl.z >> 6) != (dl.z >> 6))
++            rel = DTAB_TILE;
++        else if (!dtab_direct_pin(src, dst, dp))
++            rel = DTAB_SITE;
++        else if (src->type == id_SLICE_LUTX && dst->type == id_SLICE_FFX)
++            rel = (sl.z >> 4) == (dl.z >> 4) ? DTAB_DIRECT : DTAB_SITE;
++        else
++            rel = DTAB_DIRECT;
++    }
++    return dtab_delay(src, sp, sl.x, sl.y, dst, dp, dl.x, dl.y, rel, fanout);
++}
++
++void XilinxImpl::dtab_eval()
++{
++    if (!ctx->args.options.count("dtab-eval"))
++        return;
++
++    std::vector<int> px, py;
++    {
++        int w = 0, hgt = 0;
++        for (auto bel : ctx->getBels()) {
++            Loc l = ctx->getBelLocation(bel);
++            w = std::max(w, l.x + 1);
++            hgt = std::max(hgt, l.y + 1);
++        }
++        std::vector<char> uc(w, 0), ur(hgt, 0);
++        for (auto bel : ctx->getBels()) {
++            Loc l = ctx->getBelLocation(bel);
++            uc[l.x] = 1;
++            ur[l.y] = 1;
++        }
++        px.assign(w, 0);
++        py.assign(hgt, 0);
++        for (int i = 0, k = -1; i < w; i++)
++            px[i] = (k += uc[i]) < 0 ? 0 : k;
++        for (int i = 0, k = -1; i < hgt; i++)
++            py[i] = (k += ur[i]) < 0 ? 0 : k;
++    }
++    std::array<int, 5> sd{500, 48, 24, 24, 12};
++    if (ctx->args.options.count("static-delay")) {
++        std::string s = ctx->args.options.at("static-delay").as<std::string>();
++        sscanf(s.c_str(), "%d,%d,%d,%d,%d", &sd[0], &sd[1], &sd[2], &sd[3], &sd[4]);
++    }
++    double sa_site = 665, sa_other = 866, sa_tile = 682, sa_alpha = 489, sa_beta = 1.391;
++    if (ctx->args.options.count("sa-refine")) {
++        std::string v = ctx->args.options.at("sa-refine").as<std::string>();
++        std::istringstream ss(v);
++        std::string kv;
++        while (std::getline(ss, kv, ':')) {
++            auto eq = kv.find('=');
++            if (eq == std::string::npos)
++                continue;
++            std::string k = kv.substr(0, eq);
++            if (!(k == "site" || k == "siteother" || k == "tile" || k == "alpha" || k == "beta"))
++                continue;
++            double x = std::stod(kv.substr(eq + 1));
++            (k == "site" ? sa_site : k == "siteother" ? sa_other : k == "tile" ? sa_tile : k == "alpha" ? sa_alpha : sa_beta) = x;
++        }
++    }
++    auto m_static = [&](const NetInfo *ni, const PortRef &usr) -> delay_t {
++        if (usr.port == id_CIN && ni->driver.port == id_CO3)
++            return 0;
++        Loc a = ctx->getBelLocation(ni->driver.cell->bel), b = ctx->getBelLocation(usr.cell->bel);
++        int dx = std::abs(px.at(b.x) - px.at(a.x)), dy = std::abs(py.at(b.y) - py.at(a.y));
++        return sd[0] + sd[1] * std::min(dy, 6) + sd[2] * std::max(dy - 6, 0) + sd[3] * std::min(dx, 12) +
++               sd[4] * std::max(dx - 12, 0);
++    };
++    auto m_sa = [&](const NetInfo *ni, const PortRef &usr) -> delay_t {
++        BelId sb = ni->driver.cell->bel, db = usr.cell->bel;
++        IdString sp = ni->driver.port, dp = usr.port;
++        if (dp == id_CIN && sp == id_CO3)
++            return 0;
++        Loc sl = ctx->getBelLocation(sb), dl = ctx->getBelLocation(db);
++        if (sb.tile == db.tile) {
++            if ((sl.z >> 6) != (dl.z >> 6))
++                return delay_t(sa_tile);
++            const int st = sl.z & 0xF;
++            const bool ff_src = st == BEL_FF || st == BEL_FF2;
++            if (dp.in(id_A1, id_A2, id_A3, id_A4, id_A5, id_A6))
++                return delay_t(sa_site);
++            if (!ff_src && (dp == id_D || dp.in(id_S0, id_S1, id_S2, id_S3, id_DI0, id_DI1, id_DI2, id_DI3) ||
++                            dp.in(id_I0, id_I1)))
++                return 0;
++            return delay_t(sa_other);
++        }
++        delay_t m = delay_matrix_lookup(dl.x - sl.x, dl.y - sl.y);
++        if (m < 0) {
++            int ax = std::abs(dl.x - sl.x), ay = std::abs(dl.y - sl.y);
++            m = (3 * (30 * std::min(ax, 18) + 10 * std::max(ax - 18, 0) + 60 * std::min(ay, 6) +
++                      20 * std::max(ay - 6, 0) + 300)) /
++                2;
++        }
++        return delay_t(sa_alpha + sa_beta * m);
++    };
++    auto m_matrix = [&](const NetInfo *ni, const PortRef &usr) -> delay_t {
++        return predict_delay_base(ni->driver.cell->bel, ni->driver.port, usr.cell->bel, usr.port);
++    };
++    auto m_dtab = [&](const NetInfo *ni, const PortRef &usr) -> delay_t {
++        return dtab_bel_delay(ni->driver.cell, ni->driver.port, ni->driver.cell->bel, usr.cell, usr.port,
++                              usr.cell->bel, int(ni->users.entries()));
++    };
++    auto is_icap = [](const CellInfo *ci) { return ci->type.in(id_ICAPE2, id_ICAP_ICAP); };
++    TimingAnalyser tmg(ctx);
++    tmg.setup_only = true;
++    tmg.setup();
++    auto evaluate = [&](const char *name, std::function<delay_t(const NetInfo *, const PortRef &)> f) {
++        double worst[2] = {1e30, 1e30};
++        for (int noicap = 0; noicap < 2; noicap++) {
++            for (auto &n : ctx->nets) {
++                NetInfo *ni = n.second.get();
++                if (ni->driver.cell == nullptr || ni->driver.cell->bel == BelId())
++                    continue;
++                if (ni->driver.cell->type.in(id_BUFGCTRL, id_BUFHCE) || ni->driver.cell->isPseudo())
++                    continue;
++                bool clk = false;
++                for (auto &usr : ni->users) {
++                    int cnt = 0;
++                    if (usr.cell && ctx->getPortTimingClass(usr.cell, usr.port, cnt) == TMG_CLOCK_INPUT)
++                        clk = true;
++                }
++                if (clk)
++                    continue;
++                for (auto &usr : ni->users) {
++                    if (usr.cell == nullptr || usr.cell->bel == BelId())
++                        continue;
++                    delay_t d = (noicap && is_icap(ni->driver.cell)) ? delay_t(-1000000) : f(ni, usr);
++                    tmg.set_route_delay(CellPortKey(usr), DelayPair(d));
++                }
++            }
++            tmg.run(false);
++            for (auto &n : ctx->nets) {
++                NetInfo *ni = n.second.get();
++                if (ni->driver.cell == nullptr)
++                    continue;
++                for (auto &usr : ni->users) {
++                    if (usr.cell == nullptr || usr.cell->bel == BelId() || (noicap && is_icap(usr.cell)))
++                        continue;
++                    float sl = tmg.get_setup_slack(CellPortKey(usr));
++                    if (sl > -1e9 && sl < 1e9)
++                        worst[noicap] = std::min(worst[noicap], double(sl));
++                }
++            }
++        }
++        log_info("dtab-eval: %-7s worst setup slack %.3f ns, without ICAPE2 paths %.3f ns\n", name,
++                 ctx->getDelayNS(delay_t(worst[0])), ctx->getDelayNS(delay_t(worst[1])));
++    };
++    evaluate("static", m_static);
++    evaluate("sa", m_sa);
++    evaluate("matrix", m_matrix);
++    if (dtab.ok) {
++        evaluate("dtab", m_dtab);
++        float fs = dtab.fo_scale;
++        dtab.fo_scale = 0;
++        evaluate("dtab-nofo", m_dtab);
++        dtab.fo_scale = fs;
++    }
++}
++
++NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/sa_refine.cc b/himbaechel/uarch/xilinx/sa_refine.cc
+index 0601770d..69874f61 100755
+--- a/himbaechel/uarch/xilinx/sa_refine.cc
++++ b/himbaechel/uarch/xilinx/sa_refine.cc
+@@ -87,6 +87,8 @@ struct SARefine
+     double p_hard = 0.05;
+     int hard_win = 12;
+     int slicemask = 3;
++
++    int use_dtab = 0;
+ 
+     std::vector<NetInfo *> nets;
+     std::vector<int> saved_net_udata;
+@@ -189,6 +191,9 @@ struct SARefine
+ 
+     delay_t arc_delay(const NetInfo *ni, const PortRef &usr) const
+     {
++        if (use_dtab)
++            return impl->dtab_bel_delay(ni->driver.cell, ni->driver.port, ni->driver.cell->bel, usr.cell, usr.port,
++                                        usr.cell->bel, int(ni->users.entries()));
+         return arc_delay(ni->driver.cell->bel, ni->driver.port, usr.cell->bel, usr.port);
+     }
+ 
+@@ -975,6 +980,8 @@ struct SARefine
+                 kinds = int(x);
+             else if (k == "greedy")
+                 greedy_end = int(x);
++            else if (k == "dtab")
++                use_dtab = int(x);
+             else
+                 log_error("-o sa-refine: unknown key '%s'\n", k.c_str());
+         }
+@@ -987,6 +994,10 @@ struct SARefine
+         log_info("SA refinement: lambda %.2f, crit exponent %.1f, t0 %.3f, window %d, inner %.1f, criticality "
+                  "quantile %.3f, arc model %d + %.3f * matrix (site %d/%d, tile %d ps)\n",
+                  lambda, crit_exp, t0, rlim0, inner, quant, alpha_ps, beta, site_lut_ps, site_other_ps, tile_ps);
++        if (use_dtab && !impl->dtab.ok)
++            log_error("-o sa-refine key dtab=1 needs -o dtab=FILE\n");
++        if (use_dtab)
++            log_info("SA refinement: arc model from the -o dtab table\n");
+         init();
+         tmg.setup_only = true;
+         tmg.crit_quantile = quant;
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 005f0226..78d715b7 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -139,7 +139,14 @@ po::options_description XilinxImpl::getUArchOptions()
+                            "static placer: wirelength weight of a vertical tile step (default 1)");
+     specific.add_options()("static-delay", po::value<std::string>(),
+                            "static placer arc delay estimate C,Y1,Y2,X1,X2 in ps: C + Y1*min(dy,6) + Y2*max(dy-6,0) + "
+-                           "X1*min(dx,12) + X2*max(dx-12,0) (default 500,48,24,24,12)");
++                           "X1*min(dx,12) + X2*max(dx-12,0) (default 500,48,24,24,12); \"dtab\": the -o dtab table");
++    specific.add_options()("dtab", po::value<std::string>(),
++                           "arc delay table fitted against Vivado's routed delays (see dtab.cc); used by "
++                           "-o static-delay=dtab, -o sa-refine key dtab=1 and -o dtab-predict");
++    specific.add_options()("dtab-fo", po::value<std::string>(),
++                           "scale of the -o dtab table's fanout term (default 1, 0 = off)");
++    specific.add_options()("dtab-predict", "predictDelay (pre-route timing) from the -o dtab table");
++    specific.add_options()("dtab-eval", "log the worst setup slack of the final placement under each arc delay model");
+     specific.add_options()("predict-cal", po::value<std::string>(),
+                            "placer delay prediction SITE,TILE,ALPHA,BETA (ps, ps, ps, factor): a LUT input from the "
+                            "same slice costs SITE, another slice of the same tile TILE, and a connection between "
+@@ -1031,6 +1038,12 @@ void XilinxImpl::prePlace()
+                  "matrix.\n",
+                  site, tile, alpha, beta);
+     }
++    if (dm_args.options.count("dtab")) {
++        load_dtab(dm_args.options.at("dtab").as<std::string>());
++        dtab_predict = dm_args.options.count("dtab-predict") > 0;
++    } else if (dm_args.options.count("dtab-predict")) {
++        log_error("-o dtab-predict needs -o dtab=FILE\n");
++    }
+     std::string dm = dm_args.options.count("delay-matrix") ? dm_args.options["delay-matrix"].as<std::string>() : "build";
+     if (dm != "off") {
+         if (dm != "build")
+@@ -1239,6 +1252,7 @@ void XilinxImpl::postPlace()
+         lut6_first();
+     fixup_placement();
+     ctx->assignArchInfo();
++    dtab_eval();
+ }
+ 
+ // -o lut6-first: a LUT alone on a 5LUT bel moves to the 6LUT of its letter, and a flip-flop alone on an x5FF bel to
+@@ -1367,7 +1381,31 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+         std::string s = ctx->args.options.at("static-delay").as<std::string>();
+         // "matrix": the chipdb's measured delay matrix, through -o predict-cal when given -- the same estimate
+         // as predictDelay, so a recalibrated chipdb reaches the global placer too.
+-        if (s == "matrix") {
++        if (s == "dtab") {
++            if (!dtab.ok)
++                log_error("-o static-delay=dtab needs -o dtab=FILE\n");
++            log_info("Static placer delay estimate: the -o dtab table.\n");
++
++            cfg.predict_arc = [this](Context *ctx, const CellInfo *src, IdString sp, Loc sl, const CellInfo *dst,
++                                     IdString dp, Loc dl, int fanout) -> delay_t {
++                if (dp == id_CIN && sp == id_CO3)
++                    return 0;
++                int rel = DTAB_BETWEEN;
++                if (sl.x == dl.x && sl.y == dl.y) {
++                    const bool same_cluster = src->cluster != ClusterId() && src->cluster == dst->cluster;
++                    rel = !same_cluster ? DTAB_TILE : (dtab_direct_pin(src, dst, dp) ? DTAB_DIRECT : DTAB_SITE);
++                }
++                return dtab_delay(src, sp, sl.x, sl.y, dst, dp, dl.x, dl.y, rel, fanout);
++            };
++            cfg.predict_delay = [sd](Context *ctx, const PlacerStaticCfg &cfg, Loc src_loc, IdString src_pin,
++                                     Loc dst_loc, IdString dst_pin) -> delay_t {
++                if (dst_pin == id_CIN && src_pin == id_CO3)
++                    return 0;
++                int dist_x = std::abs(dst_loc.x - src_loc.x), dist_y = std::abs(dst_loc.y - src_loc.y);
++                return sd[0] + sd[1] * std::min(dist_y, 6) + sd[2] * std::max(dist_y - 6, 0) +
++                       sd[3] * std::min(dist_x, 12) + sd[4] * std::max(dist_x - 12, 0);
++            };
++        } else if (s == "matrix") {
+             log_info("Static placer delay estimate: the delay matrix%s.\n", pc_on ? " with -o predict-cal" : "");
+             cfg.predict_delay = [this](Context *ctx, const PlacerStaticCfg &cfg, Loc src_loc, IdString src_pin,
+                                        Loc dst_loc, IdString dst_pin) -> delay_t {
+@@ -2478,6 +2516,24 @@ delay_t XilinxImpl::estimateDelay(WireId src, WireId dst) const
+ }
+ 
+ delay_t XilinxImpl::predictDelay(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const
++{
++    if (dtab_predict && src_bel != BelId() && dst_bel != BelId()) {
++        delay_t clock_tree = predict_clock_tree_delay(src_bel, dst_bel);
++        if (clock_tree >= 0)
++            return clock_tree;
++        const CellInfo *src = ctx->getBoundBelCell(src_bel), *dst = ctx->getBoundBelCell(dst_bel);
++        if (src != nullptr && dst != nullptr) {
++            int fanout = 1;
++            auto fnd = dst->ports.find(dst_pin);
++            if (fnd != dst->ports.end() && fnd->second.net != nullptr)
++                fanout = int(fnd->second.net->users.entries());
++            return dtab_bel_delay(src, src_pin, src_bel, dst, dst_pin, dst_bel, fanout);
++        }
++    }
++    return predict_delay_base(src_bel, src_pin, dst_bel, dst_pin);
++}
++
++delay_t XilinxImpl::predict_delay_base(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const
+ {
+     bool both_bels_known = src_bel != BelId() && dst_bel != BelId();
+     if (!both_bels_known)
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 9111e4d1..6d56084f 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -342,6 +342,38 @@ struct XilinxImpl : HimbaechelAPI
+     bool pc_on = false;
+     delay_t pc_site = 0, pc_tile = 150, pc_alpha = 0;
+     float pc_beta = 1.0f;
++
++    static constexpr int DTAB_NSRC = 8, DTAB_NDST = 15;
++    enum DtabRel
++    {
++        DTAB_BETWEEN = 0,
++        DTAB_TILE = 1,
++        DTAB_SITE = 2,
++        DTAB_DIRECT = 3
++    };
++    struct DelayTable
++    {
++        bool ok = false;
++        int gw = 0, gh = 0, tx = 0, ty = 0;
++        float ex = 0, ey = 0, direct = 0, fo_scale = 1.0f;
++        std::vector<int> ix, iy, intx;
++        std::vector<float> cx, cy, g, site, tile;
++        std::array<float, DTAB_NSRC> src{};
++        std::array<float, DTAB_NDST> dst{};
++        std::array<float, 8> fo{};
++    } dtab;
++    bool dtab_predict = false;
++    void load_dtab(const std::string &file);
++    int dtab_src_class(const CellInfo *ci, IdString port) const;
++    int dtab_dst_class(const CellInfo *ci, IdString port) const;
++    bool dtab_direct_pin(const CellInfo *src, const CellInfo *dst, IdString dp) const;
++    float dtab_between(int sx, int sy, int dx, int dy) const;
++    delay_t dtab_delay(const CellInfo *src, IdString sp, int sx, int sy, const CellInfo *dst, IdString dp, int dx,
++                       int dy, int rel, int fanout) const;
++    delay_t dtab_bel_delay(const CellInfo *src, IdString sp, BelId sb, const CellInfo *dst, IdString dp, BelId db,
++                           int fanout) const;
++    void dtab_eval();
++    delay_t predict_delay_base(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const;
+     size_t dm_index(int dx, int dy) const
+     {
+         return size_t((dy + dm_window) * (2 * dm_window + 1) + (dx + dm_window));

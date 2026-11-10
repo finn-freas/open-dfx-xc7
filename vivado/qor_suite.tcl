@@ -73,6 +73,11 @@ proc dump_place {out} {
     close $fh
 }
 
+proc cpu_s {} {
+    if {[catch { exec powershell.exe -NoProfile -Command "(Get-Process -Id [pid]).TotalProcessorTime.TotalSeconds" } s]} { return "" }
+    return [string trim $s]
+}
+
 proc write_result {out kv} {
     set h [open $out/result.txt w]
     foreach {k v} $kv { puts $h "$k $v" }
@@ -97,6 +102,8 @@ proc run_free {name period i} {
     set top [readf $src/top.txt]
     array unset ::t
     set ::cur_step read
+    set c0 [cpu_s]
+    set c1 ""
     set t0 [clock milliseconds]
     set rc [catch {
         create_project -in_memory -part $part
@@ -113,11 +120,13 @@ proc run_free {name period i} {
         report_timing_summary -file $out/timing.rpt
         set pw [power]
         step bitstream { write_bitstream -force $out/$top.bit }
+        set c1 [cpu_s]
         if {$i == $::CONFIG_DUMP_RUN} { step dump { dump_place $out } }
     } err]
     set total [expr {([clock milliseconds] - $t0) / 1000.0}]
     if {[info exists ::t(dump)]} { set total [expr {$total - $::t(dump)}] }
     set kv [list rc $rc period $period part $part threads [get_param general.maxThreads] t_total $total]
+    if {$c0 ne "" && $c1 ne ""} { lappend kv cpu_total [expr {$c1 - $c0}] }
     foreach s {synth place route bitstream dump} { if {[info exists ::t($s)]} { lappend kv t_$s $::t($s) } }
     if {!$rc} {
         lappend kv wns $w
@@ -143,23 +152,28 @@ proc run_placed {name period tag} {
     set t0 [clock milliseconds]
     set rc [catch {
         create_project -in_memory -part $part
-        read_edif $src/netlist.edf
+        file copy -force $src/netlist.edf $out/$top.edf
+        read_edif $out/$top.edf
         link_design -top $top -part $part
         write_xdc_for $src $period $out/constraints.xdc
         read_xdc $out/constraints.xdc
         set placed 0
         set missed 0
         set fixed {}
+        set mlist {}
         set pf [open $src/place.txt]
         while {[gets $pf line] >= 0} {
             lassign $line cell loc
             set c [get_cells -quiet $cell]
-            if {$c eq ""} { incr missed; continue }
-            if {[catch { place_cell $c $loc }]} { incr missed; continue }
+            if {$c eq ""} { incr missed; lappend mlist "$cell not-found"; continue }
+            if {[catch { place_cell $c $loc } perr]} { incr missed; lappend mlist "$cell $loc [string map {\n " "} $perr]"; continue }
             incr placed
             lappend fixed $c
         }
         close $pf
+        set mf [open $out/place_missed.txt w]
+        foreach m $mlist { puts $mf $m }
+        close $mf
         if {[llength $fixed]} { set_property IS_LOC_FIXED 1 $fixed; set_property IS_BEL_FIXED 1 $fixed }
         step place { place_design }
         step route { route_design }
@@ -168,6 +182,89 @@ proc run_placed {name period tag} {
     } err]
     set kv [list rc $rc period $period part $part t_total [expr {([clock milliseconds] - $t0) / 1000.0}]]
     if {!$rc} { lappend kv wns $w placed $placed missed $missed } else { lappend kv step $::cur_step error [string map {\n " "} $err] }
+    write_result $out $kv
+    catch { close_project }
+}
+
+proc read_lines {path} {
+    set out {}
+    if {![file exists $path]} { return $out }
+    set f [open $path]
+    while {[gets $f line] >= 0} { if {[string trim $line] ne ""} { lappend out $line } }
+    close $f
+    return $out
+}
+
+proc place_exact {src out} {
+    set lf [open $out/place_log.txt w]
+    set nlock 0
+    foreach line [read_lines $src/lockpins.txt] {
+        lassign $line cell lp
+        set c [get_cells -quiet $cell]
+        if {$c eq ""} { puts $lf "lock_missing $cell"; continue }
+        set_property LOCK_PINS $lp $c
+        incr nlock
+    }
+    set placed 0
+    set nfail 0
+    set mfixed {}
+    foreach line [read_lines $src/macros.txt] {
+        set m [lindex $line 0]
+        set site [lindex [split [lindex $line 2] /] 0]
+        if {[catch { set_property LOC $site [get_cells $m] } err]} { puts $lf "macro_fail $m $err"; incr nfail; continue }
+        foreach {sub loc} [lrange $line 1 end] {
+            set c [get_cells $m/$sub]
+            set got [get_bels -quiet -of_objects $c]
+            if {$got ne $loc} { puts $lf "macro_bel $m/$sub want $loc got $got" }
+            lappend mfixed $c
+            incr placed
+        }
+    }
+    if {[llength $mfixed]} { set_property IS_LOC_FIXED 1 $mfixed }
+    set fixed {}
+    foreach line [read_lines $src/place.txt] {
+        lassign $line cell loc
+        set c [get_cells -quiet $cell]
+        if {$c eq ""} { puts $lf "missing $cell"; incr nfail; continue }
+        if {[catch { place_cell $c $loc } err]} { puts $lf "fail $cell $loc [string map {\n " "} $err]"; incr nfail; continue }
+        incr placed
+        lappend fixed $c
+    }
+    if {[llength $fixed]} {
+        set_property IS_LOC_FIXED 1 $fixed
+        set_property IS_BEL_FIXED 1 $fixed
+    }
+    puts $lf "placed $placed failed $nfail lockpins $nlock"
+    close $lf
+    return [list $placed $nfail $nlock]
+}
+
+proc run_placedx {name period tag} {
+    set src $::CONFIG_SRCROOT/${name}__placedx_$tag
+    set out $::CONFIG_OUTROOT/${name}__placedx_$tag/run0
+    if {[file exists $out/result.txt]} { puts "skip: $out/result.txt"; return }
+    file mkdir $out
+    set part [readf $src/part.txt]
+    set top [readf $src/top.txt]
+    array unset ::t
+    set ::cur_step read
+    set t0 [clock milliseconds]
+    set rc [catch {
+        create_project -in_memory -part $part
+        file copy -force $src/netlist.edf $out/$top.edf
+        read_edif $out/$top.edf
+        link_design -top $top -part $part
+        write_xdc_for $src $period $out/constraints.xdc
+        read_xdc $out/constraints.xdc
+        set pr [place_exact $src $out]
+        step place { place_design }
+        step route { route_design }
+        set w [wns]
+        report_timing_summary -file $out/timing.rpt
+        report_route_status -file $out/route_status.rpt
+    } err]
+    set kv [list rc $rc period $period part $part t_total [expr {([clock milliseconds] - $t0) / 1000.0}]]
+    if {!$rc} { lappend kv wns $w placed [lindex $pr 0] missed [lindex $pr 1] lockpins [lindex $pr 2] } else { lappend kv step $::cur_step error [string map {\n " "} $err] }
     write_result $out $kv
     catch { close_project }
 }
@@ -191,6 +288,8 @@ foreach line [split [readf $CONFIG_JOBS] \n] {
             if {abs($np - $p) < 0.05} { break }
             set p $np
         }
+    } elseif {$mode eq "placedx"} {
+        run_placedx $name $period $tag
     } else {
         run_placed $name $period $tag
     }

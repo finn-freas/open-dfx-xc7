@@ -1,0 +1,1966 @@
+diff --git a/common/kernel/command.cc b/common/kernel/command.cc
+index 6759ae12..d9b7288f 100644
+--- a/common/kernel/command.cc
++++ b/common/kernel/command.cc
+@@ -397,6 +397,22 @@ po::options_description CommandHandler::getGeneralOptions()
+     general.add_options()("placer-static-overlap-stop", po::value<float>(),
+                           "placer static: stop spreading and legalise the logic once its overlap is below this "
+                           "fraction (float, default: 0.1)");
++    general.add_options()("placer-static-arc-ratio", po::value<float>(),
++                          "placer static: driver->sink timing-arc term for critical arcs, scaled to this fraction of "
++                          "the wirelength gradient (float, default: off)");
++    general.add_options()("placer-static-crit-quantile", po::value<float>(),
++                          "placer static: criticality relative to the slack at this quantile of the port slacks, not "
++                          "the worst path (default: off)");
++    general.add_options()("placer-static-driver-crit-fanout", po::value<int>(),
++                          "placer static: a net driver takes its users' worst criticality below this fanout (default 5)");
++    general.add_options()("placer-static-anchor-init", po::value<int>(),
++                          "placer static: star-model relaxation iterations toward fixed cells before spreading (default: off)");
++    general.add_options()("placer-static-weighted-precond",
++                          "placer static: precondition by the summed timing net weights instead of the pin count");
++    general.add_options()("placer-static-arc-exp", po::value<float>(),
++                          "placer static: timing-arc weight criticality exponent (default: 8)");
++    general.add_options()("placer-static-timing-every", po::value<int>(),
++                          "placer static: re-run the timing analysis every N spreading iterations (default: 10)");
+     general.add_options()("placer1-critexp", po::value<float>(),
+                           "placer1 and placement refinement: criticality exponent of the timing cost (float, default: 8)");
+     general.add_options()("placer1-timing-tradeoff", po::value<float>(),
+@@ -641,6 +657,22 @@ void CommandHandler::setupContext(Context *ctx)
+         ctx->settings[ctx->id("placerStatic/ipLegaliseLogicOverlap")] = std::to_string(vm["placer-static-ip-wait"].as<float>());
+     if (vm.count("placer-static-overlap-stop"))
+         ctx->settings[ctx->id("placerStatic/logicOverlapStop")] = std::to_string(vm["placer-static-overlap-stop"].as<float>());
++    if (vm.count("placer-static-arc-ratio"))
++        ctx->settings[ctx->id("placerStatic/arcRatio")] = std::to_string(vm["placer-static-arc-ratio"].as<float>());
++    if (vm.count("placer-static-crit-quantile"))
++        ctx->settings[ctx->id("placerStatic/critQuantile")] =
++                std::to_string(vm["placer-static-crit-quantile"].as<float>());
++    if (vm.count("placer-static-driver-crit-fanout"))
++        ctx->settings[ctx->id("placerStatic/driverCritFanout")] =
++                std::to_string(vm["placer-static-driver-crit-fanout"].as<int>());
++    if (vm.count("placer-static-anchor-init"))
++        ctx->settings[ctx->id("placerStatic/anchorInit")] = std::to_string(vm["placer-static-anchor-init"].as<int>());
++    if (vm.count("placer-static-weighted-precond"))
++        ctx->settings[ctx->id("placerStatic/weightedPrecond")] = true;
++    if (vm.count("placer-static-arc-exp"))
++        ctx->settings[ctx->id("placerStatic/arcExp")] = std::to_string(vm["placer-static-arc-exp"].as<float>());
++    if (vm.count("placer-static-timing-every"))
++        ctx->settings[ctx->id("placerStatic/timingEvery")] = std::to_string(vm["placer-static-timing-every"].as<int>());
+     if (vm.count("placer1-critexp"))
+         ctx->settings[ctx->id("placer1/critExp")] = std::to_string(vm["placer1-critexp"].as<float>());
+     if (vm.count("placer1-timing-tradeoff"))
+diff --git a/common/kernel/timing.cc b/common/kernel/timing.cc
+index 39ad26b0..db619fc4 100644
+--- a/common/kernel/timing.cc
++++ b/common/kernel/timing.cc
+@@ -994,6 +994,19 @@ void TimingAnalyser::compute_slack()
+ 
+ void TimingAnalyser::compute_criticality()
+ {
++    dict<int, delay_t> ref_slack;
++    if (crit_quantile > 0) {
++        dict<int, std::vector<delay_t>> slacks;
++        for (auto p : topological_order)
++            for (auto &pdp : ports.at(p).domain_pairs)
++                slacks[int(pdp.first)].push_back(pdp.second.setup_slack);
++        for (auto &s : slacks) {
++            auto &v = s.second;
++            size_t k = std::min(v.size() - 1, size_t(float(v.size()) * crit_quantile));
++            std::nth_element(v.begin(), v.begin() + k, v.end());
++            ref_slack[s.first] = std::min<delay_t>(v.at(k), -1);
++        }
++    }
+     for (auto p : topological_order) {
+         auto &pd = ports.at(p);
+         for (auto &pdp : pd.domain_pairs) {
+@@ -1020,6 +1033,9 @@ void TimingAnalyser::compute_criticality()
+                     crit = crit_floor + (1.0f - crit_floor) * slack / worst;
+                 else
+                     crit = crit_floor * (1.0f - slack / float(budget));
++            } else if (crit_quantile > 0) {
++                float ref = float(ref_slack.at(int(pdp.first)));
++                crit = 1.0f - (float(pdp.second.setup_slack) - ref) / -ref;
+             } else {
+                 crit = 1.0f -
+                        (float(pdp.second.setup_slack) - float(dp.worst_setup_slack)) / float(-dp.worst_setup_slack);
+diff --git a/common/kernel/timing.h b/common/kernel/timing.h
+index 561f042a..5c47b1ec 100644
+--- a/common/kernel/timing.h
++++ b/common/kernel/timing.h
+@@ -112,6 +112,10 @@ struct TimingAnalyser
+ 
+     float crit_target = 0;
+     float crit_floor = 0.9f;
++
++
++
++    float crit_quantile = 0;
+ 
+     bool setup_only = false;
+     bool have_loops = false;
+diff --git a/common/place/placer_static.cc b/common/place/placer_static.cc
+index fc1f9fb5..29d37946 100644
+--- a/common/place/placer_static.cc
++++ b/common/place/placer_static.cc
+@@ -659,11 +659,12 @@ class StaticPlacer
+             const auto &cg = cfg.cell_groups.at(group);
+             const auto &g = groups.at(group);
+             double util = g.concrete_area / g.total_area;
++            double target_util = cg.target_util >= 0 ? cg.target_util : cfg.target_util;
+             log_info("⌁   group %s pre-spacer utilisation %.02f%% (target %.02f%%)\n", ctx->nameOf(cg.name),
+-                     (util * 100.0), (cfg.target_util * 100.0));
++                     (util * 100.0), (target_util * 100.0));
+             // TODO: better computation of spacer size and placement?
+             int inserted_spacers = 0;
+-            int spacer_count = (g.total_area * cfg.target_util - g.concrete_area) / cg.spacer_rect.area();
++            int spacer_count = (g.total_area * target_util - g.concrete_area) / cg.spacer_rect.area();
+             if (spacer_count <= 0)
+                 continue;
+             while (inserted_spacers < spacer_count) {
+@@ -925,7 +926,7 @@ class StaticPlacer
+ 
+     std::vector<std::pair<CellInfo *, RealPair>> gathered_wirelen_grad;
+ 
+-    float wirelen_grad(CellInfo *cell, Axis axis, bool ref)
++    float wirelen_grad(CellInfo *cell, Axis axis, bool ref, float *weight_sum = nullptr)
+     {
+         float gradient = 0;
+         if (cell->udata == -1)
+@@ -961,7 +962,7 @@ class StaticPlacer
+                 if (port.second.type == PORT_IN) {
+                     crit = tmg.get_criticality(CellPortKey(cell->name, port.first));
+                 } else if (port.second.type == PORT_OUT) {
+-                    if (ni && ni->users.entries() < 5) {
++                    if (ni && int(ni->users.entries()) < cfg.driver_crit_fanout) {
+                         for (auto usr : ni->users)
+                             crit = std::max(crit, tmg.get_criticality(CellPortKey(usr)));
+                     }
+@@ -969,13 +970,16 @@ class StaticPlacer
+             }
+             float weight = 1.0 + double(cfg.timing_weight) * std::pow(double(crit), double(cfg.crit_exp));
+             gradient += weight * (d_min - d_max);
++            if (weight_sum)
++                *weight_sum += weight;
+         }
+ 
+         NPNR_ASSERT(std::isfinite(gradient));
+-        return gradient;
++        return axis == Axis::Y ? gradient * cfg.grad_scale_y : gradient;
+     }
+ 
+     std::vector<float> dens_penalty;
++    std::vector<float> cell_weight_sum, mc_weight_sum;
+     float nesterov_a = 1.0f;
+ 
+     void update_gradients(bool ref = true, bool set_prev = true, bool init_penalty = false)
+@@ -1013,18 +1017,57 @@ class StaticPlacer
+                 gathered_wirelen_grad.emplace_back(ci, RealPair());
+             }
+         }
++        if (cfg.weighted_precond) {
++            cell_weight_sum.resize(gathered_wirelen_grad.size());
++            mc_weight_sum.resize(mcells.size());
++        }
+         // Compute wirelength gradients for cells in parallel, this is a slow part
+         pool.run(gathered_wirelen_grad.size(), [&](int i) {
+             auto &entry = gathered_wirelen_grad.at(i);
+             CellInfo *ci = entry.first;
+-            float wl_gx = wirelen_grad(ci, Axis::X, ref);
++            float ws = 0;
++            float wl_gx = wirelen_grad(ci, Axis::X, ref, cfg.weighted_precond ? &ws : nullptr);
++            if (cfg.weighted_precond)
++                cell_weight_sum.at(i) = ws;
+             float wl_gy = wirelen_grad(ci, Axis::Y, ref);
+             entry.second = RealPair(wl_gx, wl_gy);
+         });
+         // Second loop: sum up wirelength gradients across concrete cell instances
+-        for (auto entry : gathered_wirelen_grad) {
++        if (cfg.weighted_precond)
++            std::fill(mc_weight_sum.begin(), mc_weight_sum.end(), 0.0f);
++        for (int i = 0; i < int(gathered_wirelen_grad.size()); i++) {
++            auto &entry = gathered_wirelen_grad.at(i);
+             auto &mc = mcells.at(entry.first->udata);
+             (ref ? mc.ref_wl_grad : mc.wl_grad) += entry.second;
++            if (cfg.weighted_precond)
++                mc_weight_sum.at(entry.first->udata) += cell_weight_sum.at(i);
++        }
++        if (!timing_arcs.empty()) {
++
++            std::vector<RealPair> agrad(mcells.size(), RealPair(0, 0));
++            double asum = 0, wsum = 0;
++            for (auto &a : timing_arcs) {
++                RealPair pd = cell_loc(a.drv, ref), ps = cell_loc(a.usr, ref);
++                float gx = a.w * std::tanh(wl_coeff.x * (pd.x - ps.x));
++                float gy = a.w * std::tanh(wl_coeff.y * (pd.y - ps.y));
++                agrad.at(a.drv->udata) += RealPair(-gx, -gy);
++                agrad.at(a.usr->udata) += RealPair(gx, gy);
++            }
++            for (int i = 0; i < int(mcells.size()); i++) {
++                auto &mc = mcells.at(i);
++                auto &wg = ref ? mc.ref_wl_grad : mc.wl_grad;
++                wsum += std::abs(wg.x) + std::abs(wg.y);
++                asum += std::abs(agrad.at(i).x) + std::abs(agrad.at(i).y);
++            }
++            if (asum > 0) {
++
++                float r = std::min(cfg.arc_ratio, 0.1f * float(arc_updates));
++                float beta = float(r * wsum / asum);
++                for (int i = 0; i < int(mcells.size()); i++) {
++                    auto &mc = mcells.at(i);
++                    (ref ? mc.ref_wl_grad : mc.wl_grad) += agrad.at(i) * beta;
++                }
++            }
+         }
+         if (init_penalty) {
+             // set initial density penalty
+@@ -1053,7 +1096,12 @@ class StaticPlacer
+ #endif
+             // Preconditioner from replace for now
+ 
+-            float precond = std::max(1.0f, float(cell.pin_count) + dens_penalty[cell.group] * cell.rect.area());
++            float pins = float(cell.pin_count);
++            if (cfg.weighted_precond && !mc_weight_sum.empty()) {
++                int mi = int(&cell - &mcells.front());
++                pins = std::max(pins, mc_weight_sum.at(mi));
++            }
++            float precond = std::max(1.0f, pins + dens_penalty[cell.group] * cell.rect.area());
+             if (ref) {
+                 cell.ref_total_grad =
+                         ((cell.ref_wl_grad * -1) - cell.ref_dens_grad * dens_penalty[cell.group]) / precond;
+@@ -1156,6 +1204,46 @@ class StaticPlacer
+         }
+     }
+ 
++
++
++
++    void anchor_initial(int iters)
++    {
++        for (int it = 0; it < iters; it++) {
++            std::vector<RealPair> np(ccells.size());
++            for (int i = 0; i < int(ccells.size()); i++) {
++                auto &mc = mcells.at(i);
++                np.at(i) = mc.pos;
++                if (mc.is_fixed)
++                    continue;
++                CellInfo *ci = ccells.at(i).base_cell;
++                RealPair sum(0, 0);
++                int n = 0;
++                for (auto &port : ci->ports) {
++                    NetInfo *ni = port.second.net;
++                    if (!ni || ni->driver.cell == nullptr || ni->users.entries() > 16)
++                        continue;
++                    auto add = [&](CellInfo *o) {
++                        if (o == ci || (o->udata == -1 && o->bel == BelId()))
++                            return;
++                        sum += cell_loc(o, false);
++                        n++;
++                    };
++                    add(ni->driver.cell);
++                    for (auto &usr : ni->users)
++                        add(usr.cell);
++                }
++                if (n > 0)
++                    np.at(i) = clamp_loc(RealPair(0.5f * mc.pos.x + 0.5f * sum.x / n, 0.5f * mc.pos.y + 0.5f * sum.y / n));
++            }
++            for (int i = 0; i < int(ccells.size()); i++) {
++                mcells.at(i).pos = np.at(i);
++                mcells.at(i).ref_pos = np.at(i);
++            }
++        }
++        log_info("Anchored initial placement: %d relaxation iterations.\n", iters);
++    }
++
+     void initialise()
+     {
+         float initial_steplength = 0.01f;
+@@ -1278,10 +1366,19 @@ class StaticPlacer
+         }
+         log_info("   system potential: %f hpwl: %f\n", system_potential(), system_hpwl());
+         compute_overlap();
+-        if ((iter % 10) == 0)
++        if ((iter % std::max(1, cfg.timing_every)) == 0)
+             update_timing();
+     }
+ 
++    struct TimingArc
++    {
++        CellInfo *drv, *usr;
++        float w;
++    };
++    std::vector<TimingArc> timing_arcs;
++    int arc_updates = 0;
++    bool arcs_active = false;
++
+     void update_timing()
+     {
+         if (!cfg.timing_driven)
+@@ -1299,10 +1396,138 @@ class StaticPlacer
+             }
+         }
+         tmg.run(false);
++        if (cfg.arc_ratio > 0) {
++            float max_logic_overlap = 0;
++            for (auto &g : groups)
++                max_logic_overlap = std::max(max_logic_overlap, g.overlap);
++            if (!arcs_active && iter > 0 && max_logic_overlap < cfg.arc_start_overlap)
++                arcs_active = true;
++            timing_arcs.clear();
++            if (arcs_active) {
++                arc_updates++;
++                for (auto &net : nets) {
++                    NetInfo *ni = net.ni;
++                    if (ni->driver.cell == nullptr || ni->driver.cell->udata == -1)
++                        continue;
++                    for (auto usr : ni->users) {
++                        if (usr.cell->udata == -1 || usr.cell == ni->driver.cell)
++                            continue;
++                        float c = tmg.get_criticality(CellPortKey(usr));
++                        if (c < cfg.arc_min_crit)
++                            continue;
++                        timing_arcs.push_back({ni->driver.cell, usr.cell, float(std::pow(double(c), double(cfg.arc_exp)))});
++                    }
++                }
++                log_info("   timing arcs: %d (update %d)\n", int(timing_arcs.size()), arc_updates);
++            }
++        }
++    }
++
++
++    void assign_legalise()
++    {
++        std::vector<int> cells;
++        for (int i = 0; i < int(ccells.size()); i++) {
++            auto &mc = mcells.at(i);
++            auto &cc = ccells.at(i);
++            if (mc.group < cfg.logic_groups || !cfg.cell_groups.at(mc.group).assign_legalise)
++                continue;
++            if (mc.is_fixed || cc.macro_idx != -1 || cc.base_cell->bel != BelId())
++                continue;
++            cells.push_back(i);
++        }
++        if (cells.empty())
++            return;
++        dict<IdString, std::vector<BelId>> bels_of_type;
++        for (int i : cells) {
++            CellInfo *ci = ccells.at(i).base_cell;
++            if (bels_of_type.count(ci->type))
++                continue;
++            auto &v = bels_of_type[ci->type];
++            for (auto bel : ctx->getBels())
++                if (ctx->isValidBelForCellType(ci->type, bel))
++                    v.push_back(bel);
++        }
++        struct Arc
++        {
++            Loc other;
++            IdString port, other_port;
++            bool is_driver;
++            float w;
++        };
++        struct Cand
++        {
++            float cost;
++            int cell;
++            BelId bel;
++        };
++        std::vector<Cand> cands;
++        for (int i : cells) {
++            CellInfo *ci = ccells.at(i).base_cell;
++            std::vector<Arc> arcs;
++            for (auto &port : ci->ports) {
++                NetInfo *ni = port.second.net;
++                if (ni == nullptr || ni->driver.cell == nullptr || ni->users.entries() > 64)
++                    continue;
++                if (cfg.glbBufTypes.count(ni->driver.cell->type))
++                    continue;
++                auto loc_of = [&](CellInfo *o) {
++                    RealPair p = cell_loc(o, false);
++                    return Loc(int(p.x), int(p.y), 0);
++                };
++                if (ni->driver.cell == ci) {
++                    for (auto usr : ni->users) {
++                        if (usr.cell == ci || (usr.cell->udata == -1 && usr.cell->bel == BelId()))
++                            continue;
++                        float c = cfg.timing_driven ? tmg.get_criticality(CellPortKey(usr)) : 0;
++                        arcs.push_back({loc_of(usr.cell), port.first, usr.port, true,
++                                        float(1.0 + cfg.timing_weight * std::pow(double(c), double(cfg.crit_exp)))});
++                    }
++                } else if (port.second.type == PORT_IN) {
++                    CellInfo *drv = ni->driver.cell;
++                    if (drv->udata == -1 && drv->bel == BelId())
++                        continue;
++                    float c = cfg.timing_driven ? tmg.get_criticality(CellPortKey(ci->name, port.first)) : 0;
++                    arcs.push_back({loc_of(drv), port.first, ni->driver.port, false,
++                                    float(1.0 + cfg.timing_weight * std::pow(double(c), double(cfg.crit_exp)))});
++                }
++            }
++            for (auto bel : bels_of_type.at(ci->type)) {
++                if (!ci->testRegion(bel))
++                    continue;
++                Loc pl = get_place_loc(ctx->getBelLocation(bel));
++                float cost = 0;
++                for (auto &a : arcs)
++                    cost += a.w * float(a.is_driver ? cfg.predict_delay(ctx, cfg, pl, a.port, a.other, a.other_port)
++                                                    : cfg.predict_delay(ctx, cfg, a.other, a.other_port, pl, a.port));
++                cands.push_back({cost, i, bel});
++            }
++        }
++        std::stable_sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) { return a.cost < b.cost; });
++        int placed = 0;
++        for (auto &c : cands) {
++            CellInfo *ci = ccells.at(c.cell).base_cell;
++            if (ci->bel != BelId() || !ctx->checkBelAvail(c.bel))
++                continue;
++            ctx->bindBel(c.bel, ci, STRENGTH_WEAK);
++            if (!ctx->isBelLocationValid(c.bel)) {
++                ctx->unbindBel(c.bel);
++                continue;
++            }
++            auto &mc = mcells.at(c.cell);
++            Loc loc = get_place_loc(ctx->getBelLocation(c.bel));
++            mc.pos = mc.ref_pos = RealPair(loc, 0.5);
++            mc.is_fixed = true;
++            placed++;
++        }
++        log_info("Assignment-legalised %d of %d cells (block RAMs) to their cheapest free sites.\n", placed,
++                 int(cells.size()));
+     }
+ 
+     void legalise_step(bool dsp_bram)
+     {
++        if (dsp_bram)
++            assign_legalise();
+         for (int i = 0; i < int(ccells.size()); i++) {
+             auto &mc = mcells.at(i);
+             auto &cc = ccells.at(i);
+@@ -1638,6 +1863,7 @@ class StaticPlacer
+     {
+         groups.resize(cfg.cell_groups.size());
+         tmg.setup_only = true;
++        tmg.crit_quantile = cfg.crit_quantile;
+         tmg.setup();
+         dump_density = ctx->setting<bool>("static/dump_density", false);
+     };
+@@ -1649,6 +1875,8 @@ class StaticPlacer
+         prepare_cells();
+         init_cells();
+         init_nets();
++        if (cfg.anchor_init > 0)
++            anchor_initial(cfg.anchor_init);
+         insert_dark();
+         insert_spacer();
+ 
+@@ -1725,6 +1953,15 @@ PlacerStaticCfg::PlacerStaticCfg(Context *ctx)
+     target_util = ctx->setting_or<double>("placerStatic/targetUtil", 0.7);
+     ip_legalise_logic_overlap = ctx->setting_or<float>("placerStatic/ipLegaliseLogicOverlap", 2.0f);
+     logic_overlap_stop = ctx->setting_or<float>("placerStatic/logicOverlapStop", 0.1f);
++    timing_every = ctx->setting_or<int>("placerStatic/timingEvery", 10);
++    arc_ratio = ctx->setting_or<float>("placerStatic/arcRatio", 0.0f);
++    weighted_precond = ctx->setting_or<bool>("placerStatic/weightedPrecond", false);
++    anchor_init = ctx->setting_or<int>("placerStatic/anchorInit", 0);
++    crit_quantile = ctx->setting_or<float>("placerStatic/critQuantile", 0.0f);
++    driver_crit_fanout = ctx->setting_or<int>("placerStatic/driverCritFanout", 5);
++    arc_exp = ctx->setting_or<float>("placerStatic/arcExp", 8.0f);
++    arc_min_crit = ctx->setting_or<float>("placerStatic/arcMinCrit", 0.5f);
++    arc_start_overlap = ctx->setting_or<float>("placerStatic/arcStartOverlap", 0.3f);
+ 
+     hpwl_scale_x = 1;
+     hpwl_scale_y = 1;
+diff --git a/common/place/placer_static.h b/common/place/placer_static.h
+index 9dad4961..e8c17547 100644
+--- a/common/place/placer_static.h
++++ b/common/place/placer_static.h
+@@ -48,6 +48,12 @@ struct StaticCellGroupCfg
+     pool<IdString> zero_area_cells;
+     // size of spacers to insert
+     StaticRect spacer_rect{0.5, 0.5};
++
++    double target_util = -1;
++
++
++
++    bool assign_legalise = false;
+ };
+ 
+ struct PlacerStaticCfg
+@@ -68,6 +74,23 @@ struct PlacerStaticCfg
+     double target_util = 0.7;
+     float ip_legalise_logic_overlap = 2.0f;
+     float logic_overlap_stop = 0.1f;
++    int timing_every = 10;
++
++
++    float grad_scale_y = 1.0f;
++
++    int anchor_init = 0;
++
++
++    float crit_quantile = 0;
++
++
++    int driver_crit_fanout = 5;
++
++
++
++    bool weighted_precond = false;
++    float arc_ratio = 0.0f, arc_exp = 8.0f, arc_min_crit = 0.5f, arc_start_overlap = 0.3f;
+     // groups of cells that should be placed together.
+     // groups < logic_groups are logic like LUTs and FFs, further groups for BRAM/DSP/misc
+     std::vector<StaticCellGroupCfg> cell_groups;
+diff --git a/himbaechel/uarch/xilinx/CMakeLists.txt b/himbaechel/uarch/xilinx/CMakeLists.txt
+index a10d35db..7d7352c0 100644
+--- a/himbaechel/uarch/xilinx/CMakeLists.txt
++++ b/himbaechel/uarch/xilinx/CMakeLists.txt
+@@ -4,6 +4,7 @@ set(SOURCES
+     clock_tree.cc
+     constids.inc
+     delay_matrix.cc
++    sa_refine.cc
+     extra_data.h
+     fasm.cc
+     hardblock_timing.cc
+diff --git a/himbaechel/uarch/xilinx/sa_refine.cc b/himbaechel/uarch/xilinx/sa_refine.cc
+new file mode 100755
+index 00000000..0601770d
+--- /dev/null
++++ b/himbaechel/uarch/xilinx/sa_refine.cc
+@@ -0,0 +1,1119 @@
++/*
++ *  nextpnr -- Next Generation Place and Route
++ *
++ *  Permission to use, copy, modify, and/or distribute this software for any
++ *  purpose with or without fee is hereby granted, provided that the above
++ *  copyright notice and this permission notice appear in all copies.
++ *
++ *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <fstream>
++#include <tuple>
++#include "log.h"
++#include "nextpnr.h"
++#include "timing.h"
++#include "util.h"
++#include "xilinx.h"
++
++#define HIMBAECHEL_CONSTIDS "uarch/xilinx/constids.inc"
++#include "himbaechel_constids.h"
++
++NEXTPNR_NAMESPACE_BEGIN
++
++namespace {
++struct SARefine
++{
++    Context *ctx;
++    XilinxImpl *impl;
++    TimingAnalyser tmg;
++
++    double lambda = 0.7;
++    float crit_exp = 4.0f;
++    double t0 = 0.05;
++    int rlim0 = 8;
++    int rmin = 1;
++    double inner = 4.0;
++    float quant = 0.02f;
++    int alpha_ps = 489;
++    double beta = 1.391;
++    int site_lut_ps = 665, site_other_ps = 866, tile_ps = 682;
++    int wl_fanout = 256;
++    double p_crit = 0.3, p_cent = 0.3, p_slice = 0.3;
++    int max_temps = 300;
++    double time_limit = 900;
++    float crit_min = 0.5f;
++    int greedy_end = 2;
++    int kinds = 31;
++    std::string dump_file;
++    double p_chain = 0.5;
++    double p_hard = 0.05;
++    int hard_win = 12;
++    int slicemask = 3;
++
++    std::vector<NetInfo *> nets;
++    std::vector<int> saved_net_udata;
++    std::vector<CellInfo *> cells;
++    std::vector<int> saved_cell_udata;
++    std::vector<char> net_wl, net_tm;
++    std::vector<int> net_bb;
++    std::vector<std::vector<delay_t>> arc_d;
++    std::vector<std::vector<float>> arc_w;
++    std::vector<int> net_stamp, cell_stamp;
++    int stamp = 0;
++
++    double wl_total = 0, t_total = 0;
++
++    std::vector<CellInfo *> movable_cells, crit_cells;
++    int max_x = 0, max_y = 0;
++    std::vector<std::vector<std::vector<BelId>>> tile_luts, tile_ffs;
++    std::vector<std::vector<std::array<bool, 2>>> tile_slice;
++
++    long n_move = 0, n_accept = 0, n_illegal = 0;
++    long kind_try[5] = {0, 0, 0, 0, 0}, kind_acc[5] = {0, 0, 0, 0, 0};
++    std::vector<CellInfo *> hard_cells;
++    dict<IdString, std::vector<BelId>> hard_bels;
++
++    static bool hard_type(const CellInfo *ci)
++    {
++        return ci->type.in(id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1, id_DSP48E1_DSP48E1);
++    }
++
++
++    SARefine(Context *ctx, XilinxImpl *impl) : ctx(ctx), impl(impl), tmg(ctx) {}
++
++    double rnd() { return ctx->rngf(1.0f); }
++
++    static bool slice_type(IdString t) { return t.in(id_SLICE_LUTX, id_SLICE_FFX, id_CARRY4, id_SELMUX2_1); }
++
++    bool fixed(const CellInfo *ci) const
++    {
++        return ci->belStrength > STRENGTH_STRONG || ci->region != nullptr || ci->isPseudo();
++    }
++
++    bool single_movable(const CellInfo *ci) const
++    {
++        if (ci == nullptr || ci->bel == BelId() || fixed(ci))
++            return false;
++        if (!ci->type.in(id_SLICE_LUTX, id_SLICE_FFX) || ci->cluster != ClusterId())
++            return false;
++        if (ci->attrs.count(id_X_LUT_AS_DRAM) || ci->attrs.count(id_X_LUT_AS_SRL))
++            return false;
++        return true;
++    }
++
++    bool cluster_movable(const CellInfo *root) const
++    {
++        if (root == nullptr || root->bel == BelId() || root->cluster != root->name || root->constr_children.empty())
++            return false;
++        if (root->constr_children.size() > 3 || fixed(root))
++            return false;
++        if (root->type != id_SLICE_LUTX || root->attrs.count(id_X_LUT_AS_DRAM) || root->attrs.count(id_X_LUT_AS_SRL))
++            return false;
++        for (auto *ch : root->constr_children)
++            if (!ch->type.in(id_SLICE_LUTX, id_SLICE_FFX) || ch->bel == BelId() || fixed(ch) ||
++                !ch->constr_children.empty())
++                return false;
++        return true;
++    }
++
++
++    delay_t arc_delay(BelId sb, IdString sp, BelId db, IdString dp) const
++    {
++        if (sb == BelId() || db == BelId())
++            return 0;
++        if (dp == id_CIN && sp == id_CO3)
++            return 0;
++        if (sb.tile == db.tile) {
++            Loc sl = ctx->getBelLocation(sb), dl = ctx->getBelLocation(db);
++            const bool same_slice = (sl.z >> 6) == (dl.z >> 6);
++            if (!same_slice)
++                return tile_ps;
++            const int st = sl.z & 0xF;
++            const bool ff_src = st == BEL_FF || st == BEL_FF2;
++            const bool lut_in = dp.in(id_A1, id_A2, id_A3, id_A4, id_A5, id_A6);
++            if (lut_in)
++                return site_lut_ps;
++            if (!ff_src && (dp == id_D || dp.in(id_S0, id_S1, id_S2, id_S3, id_DI0, id_DI1, id_DI2, id_DI3) ||
++                            dp.in(id_I0, id_I1)))
++                return 0;
++            return site_other_ps;
++        }
++        Loc sl = ctx->getBelLocation(sb), dl = ctx->getBelLocation(db);
++        delay_t m = impl->delay_matrix_lookup(dl.x - sl.x, dl.y - sl.y);
++        if (m < 0) {
++            int ax = std::abs(dl.x - sl.x), ay = std::abs(dl.y - sl.y);
++            m = (3 * (30 * std::min(ax, 18) + 10 * std::max(ax - 18, 0) + 60 * std::min(ay, 6) +
++                      20 * std::max(ay - 6, 0) + 300)) /
++                2;
++        }
++        return alpha_ps + delay_t(beta * m);
++    }
++
++    delay_t arc_delay(const NetInfo *ni, const PortRef &usr) const
++    {
++        return arc_delay(ni->driver.cell->bel, ni->driver.port, usr.cell->bel, usr.port);
++    }
++
++    int bbox(const NetInfo *ni) const
++    {
++        Loc d = ctx->getBelLocation(ni->driver.cell->bel);
++        int x0 = d.x, x1 = d.x, y0 = d.y, y1 = d.y;
++        for (auto &usr : ni->users) {
++            if (usr.cell == nullptr || usr.cell->bel == BelId())
++                continue;
++            Loc l = ctx->getBelLocation(usr.cell->bel);
++            x0 = std::min(x0, l.x);
++            x1 = std::max(x1, l.x);
++            y0 = std::min(y0, l.y);
++            y1 = std::max(y1, l.y);
++        }
++        return (x1 - x0) + (y1 - y0);
++    }
++
++    float weight(float crit) const { return std::pow(std::max(0.0f, crit), crit_exp); }
++
++
++    void init()
++    {
++        for (auto &n : ctx->nets) {
++            NetInfo *ni = n.second.get();
++            saved_net_udata.push_back(ni->udata);
++            ni->udata = int(nets.size());
++            nets.push_back(ni);
++        }
++        for (auto &c : ctx->cells) {
++            CellInfo *ci = c.second.get();
++            saved_cell_udata.push_back(ci->udata);
++            ci->udata = int(cells.size());
++            cells.push_back(ci);
++        }
++        int nn = int(nets.size());
++        net_wl.assign(nn, 0);
++        net_tm.assign(nn, 0);
++        net_bb.assign(nn, 0);
++        arc_d.resize(nn);
++        arc_w.resize(nn);
++        net_stamp.assign(nn, 0);
++        cell_stamp.assign(cells.size(), 0);
++        for (auto *ni : nets) {
++            if (ni->driver.cell == nullptr || ni->driver.cell->bel == BelId())
++                continue;
++            if (ni->driver.cell->type.in(id_BUFGCTRL, id_BUFHCE) || ni->driver.cell->isPseudo())
++                continue;
++            bool clk = false;
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true) {
++                int cnt = 0;
++                if (usr.cell && ctx->getPortTimingClass(usr.cell, usr.port, cnt) == TMG_CLOCK_INPUT)
++                    clk = true;
++            }
++            if (clk)
++                continue;
++            net_tm[ni->udata] = 1;
++            net_wl[ni->udata] = int(ni->users.entries()) <= wl_fanout;
++            arc_d[ni->udata].assign(ni->users.capacity(), 0);
++            arc_w[ni->udata].assign(ni->users.capacity(), 0);
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true)
++                if (usr.cell && usr.cell->bel != BelId())
++                    arc_d[ni->udata][ue.index.idx()] = arc_delay(ni, usr);
++            if (net_wl[ni->udata])
++                net_bb[ni->udata] = bbox(ni);
++        }
++        for (auto bel : ctx->getBels()) {
++            Loc l = ctx->getBelLocation(bel);
++            max_x = std::max(max_x, l.x);
++            max_y = std::max(max_y, l.y);
++        }
++        tile_luts.assign(max_x + 1, std::vector<std::vector<BelId>>(max_y + 1));
++        tile_ffs.assign(max_x + 1, std::vector<std::vector<BelId>>(max_y + 1));
++        tile_slice.assign(max_x + 1, std::vector<std::array<bool, 2>>(max_y + 1, {false, false}));
++        for (auto bel : ctx->getBels()) {
++            Loc l = ctx->getBelLocation(bel);
++            if (ctx->isValidBelForCellType(id_SLICE_LUTX, bel)) {
++                tile_luts[l.x][l.y].push_back(bel);
++                if ((l.z & 0xF) == BEL_6LUT && ((l.z >> 4) & 3) == 0)
++                    tile_slice[l.x][l.y][(l.z >> 6) & 1] = true;
++            } else if (ctx->isValidBelForCellType(id_SLICE_FFX, bel)) {
++                tile_ffs[l.x][l.y].push_back(bel);
++            }
++        }
++        for (auto *ci : cells)
++            if (ci->bel != BelId() && !fixed(ci) && slice_type(ci->type) && tile_slice_of(ci->bel))
++                movable_cells.push_back(ci);
++        for (auto *ci : cells)
++            if (ci->bel != BelId() && !fixed(ci) && hard_type(ci) && ci->cluster == ClusterId()) {
++                hard_cells.push_back(ci);
++                if (!hard_bels.count(ci->type)) {
++                    auto &v = hard_bels[ci->type];
++                    for (auto bel : ctx->getBels())
++                        if (ctx->isValidBelForCellType(ci->type, bel))
++                            v.push_back(bel);
++                }
++            }
++    }
++
++    bool tile_slice_of(BelId b) const
++    {
++        Loc l = ctx->getBelLocation(b);
++        return l.x <= max_x && l.y <= max_y && tile_slice[l.x][l.y][(l.z >> 6) & 1];
++    }
++
++    void restore()
++    {
++        for (size_t i = 0; i < nets.size(); i++)
++            nets[i]->udata = saved_net_udata[i];
++        for (size_t i = 0; i < cells.size(); i++)
++            cells[i]->udata = saved_cell_udata[i];
++    }
++
++    void totals()
++    {
++        wl_total = 0;
++        t_total = 0;
++        for (auto *ni : nets) {
++            int n = ni->udata;
++            if (!net_tm[n])
++                continue;
++            if (net_wl[n]) {
++                net_bb[n] = bbox(ni);
++                wl_total += net_bb[n];
++            }
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true)
++                if (usr.cell && usr.cell->bel != BelId()) {
++                    arc_d[n][ue.index.idx()] = arc_delay(ni, usr);
++                    t_total += double(arc_w[n][ue.index.idx()]) * arc_d[n][ue.index.idx()];
++                }
++        }
++    }
++
++    delay_t worst_slack = 0;
++    std::vector<delay_t> slacks;
++    double slack_q(double q)
++    {
++        if (slacks.empty())
++            return 0;
++        size_t k = std::min(slacks.size() - 1, size_t(q * slacks.size()));
++        std::nth_element(slacks.begin(), slacks.begin() + k, slacks.end());
++        return ctx->getDelayNS(slacks[k]);
++    }
++
++    void analyse()
++    {
++        for (auto *ni : nets) {
++            int n = ni->udata;
++            if (!net_tm[n])
++                continue;
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true)
++                if (usr.cell && usr.cell->bel != BelId())
++                    tmg.set_route_delay(CellPortKey(usr), DelayPair(arc_delay(ni, usr)));
++        }
++        tmg.run(false);
++        worst_slack = std::numeric_limits<delay_t>::max();
++        slacks.clear();
++        crit_cells.clear();
++        std::vector<char> seen(cells.size(), 0);
++        for (auto *ni : nets) {
++            int n = ni->udata;
++            if (!net_tm[n])
++                continue;
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true) {
++                if (!usr.cell || usr.cell->bel == BelId())
++                    continue;
++                CellPortKey k(usr);
++                float cr = tmg.get_criticality(k);
++                arc_w[n][ue.index.idx()] = weight(cr);
++                delay_t sl = tmg.get_setup_slack(k);
++                if (sl > -1000000000 && sl < 1000000000)
++                {
++                    worst_slack = std::min<delay_t>(worst_slack, sl);
++                    slacks.push_back(sl);
++                }
++                if (cr >= crit_min) {
++                    for (CellInfo *c : {usr.cell, ni->driver.cell})
++                        if (!seen[c->udata] && !fixed(c) && slice_type(c->type) && c->bel != BelId()) {
++                            seen[c->udata] = 1;
++                            crit_cells.push_back(c);
++                        }
++                }
++            }
++        }
++        totals();
++    }
++
++
++    std::vector<std::pair<CellInfo *, BelId>> mv_old;
++    std::vector<int> touched_nets;
++    struct ArcChange
++    {
++        int net, idx;
++        delay_t d;
++    };
++    std::vector<ArcChange> arc_changes;
++    std::vector<std::pair<int, int>> bb_changes;
++
++    bool rebind(const std::vector<std::pair<CellInfo *, BelId>> &target)
++    {
++        mv_old.clear();
++        for (auto &t : target)
++            mv_old.emplace_back(t.first, t.first->bel);
++        for (auto &o : mv_old)
++            ctx->unbindBel(o.second);
++        bool ok = true;
++        for (auto &t : target) {
++            if (t.second == BelId() || !ctx->checkBelAvail(t.second) ||
++                !ctx->isValidBelForCellType(t.first->type, t.second)) {
++                ok = false;
++                break;
++            }
++
++
++            if (t.first->attrs.count(id_X_LUT_AS_DRAM) || t.first->attrs.count(id_X_LUT_AS_SRL)) {
++                IdString tt = impl->bel_tile_type(t.second);
++                if (!tt.in(id_CLBLM_L, id_CLBLM_R) || (ctx->getBelLocation(t.second).z >> 6) != 0) {
++                    ok = false;
++                    break;
++                }
++            }
++            ctx->bindBel(t.second, t.first, STRENGTH_WEAK);
++        }
++        if (ok) {
++            for (auto &t : target)
++                if (!ctx->isBelLocationValid(t.second)) {
++                    ok = false;
++                    break;
++                }
++            if (ok)
++                for (auto &o : mv_old)
++                    if (!ctx->isBelLocationValid(o.second)) {
++                        ok = false;
++                        break;
++                    }
++        }
++        if (!ok)
++            undo();
++        return ok;
++    }
++
++    void undo()
++    {
++        for (auto &o : mv_old)
++            if (o.first->bel != BelId())
++                ctx->unbindBel(o.first->bel);
++        for (auto &o : mv_old)
++            ctx->bindBel(o.second, o.first, STRENGTH_WEAK);
++    }
++
++
++    void delta(double &dwl, double &dt)
++    {
++        ++stamp;
++        dwl = 0;
++        dt = 0;
++        arc_changes.clear();
++        bb_changes.clear();
++        touched_nets.clear();
++        for (auto &o : mv_old)
++            cell_stamp[o.first->udata] = stamp;
++        for (auto &o : mv_old)
++            for (auto &port : o.first->ports) {
++                NetInfo *ni = port.second.net;
++                if (ni == nullptr || !net_tm[ni->udata] || net_stamp[ni->udata] == stamp)
++                    continue;
++                net_stamp[ni->udata] = stamp;
++                touched_nets.push_back(ni->udata);
++            }
++        for (int n : touched_nets) {
++            NetInfo *ni = nets[n];
++            if (net_wl[n]) {
++                int b = bbox(ni);
++                dwl += b - net_bb[n];
++                bb_changes.emplace_back(n, b);
++            }
++            const bool drv_moved = cell_stamp[ni->driver.cell->udata] == stamp;
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true) {
++                if (!usr.cell || usr.cell->bel == BelId())
++                    continue;
++                if (!drv_moved && cell_stamp[usr.cell->udata] != stamp)
++                    continue;
++                int i = ue.index.idx();
++                delay_t d = arc_delay(ni, usr);
++                if (d != arc_d[n][i]) {
++                    dt += double(arc_w[n][i]) * (d - arc_d[n][i]);
++                    arc_changes.push_back({n, i, d});
++                }
++            }
++        }
++    }
++
++    void commit()
++    {
++        for (auto &b : bb_changes) {
++            wl_total += b.second - net_bb[b.first];
++            net_bb[b.first] = b.second;
++        }
++        for (auto &a : arc_changes) {
++            t_total += double(arc_w[a.net][a.idx]) * (a.d - arc_d[a.net][a.idx]);
++            arc_d[a.net][a.idx] = a.d;
++        }
++    }
++
++    double temp = 0, wl_norm = 1, t_norm = 1;
++    int rlim = 8;
++    bool probing = false;
++    std::vector<double> probe_up;
++
++
++    bool decide(int kind)
++    {
++        double dwl, dt;
++        delta(dwl, dt);
++        double c = (1.0 - lambda) * dwl / wl_norm + lambda * dt / t_norm;
++        n_move++;
++        kind_try[kind]++;
++        if (probing) {
++            if (c > 0)
++                probe_up.push_back(c);
++            undo();
++            return false;
++        }
++        if (c <= 0 || (temp > 0 && rnd() < std::exp(-c / temp))) {
++            commit();
++            n_accept++;
++            kind_acc[kind]++;
++            return true;
++        }
++        undo();
++        return false;
++    }
++
++    bool centroid(const std::vector<CellInfo *> &mem, int &cx, int &cy)
++    {
++        double sx = 0, sy = 0, sw = 0;
++        ++stamp;
++        for (auto *c : mem)
++            cell_stamp[c->udata] = stamp;
++        for (auto *c : mem)
++            for (auto &port : c->ports) {
++                NetInfo *ni = port.second.net;
++                if (ni == nullptr || !net_tm[ni->udata] || int(ni->users.entries()) > 64)
++                    continue;
++                auto add = [&](CellInfo *o, float w) {
++                    if (o == nullptr || o->bel == BelId() || cell_stamp[o->udata] == stamp)
++                        return;
++                    Loc l = ctx->getBelLocation(o->bel);
++                    sx += w * l.x;
++                    sy += w * l.y;
++                    sw += w;
++                };
++                if (port.second.type == PORT_IN)
++                    add(ni->driver.cell, 0.05f + arc_w[ni->udata][port.second.user_idx.idx()]);
++                else if (port.second.type == PORT_OUT)
++                    for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true)
++                        add(usr.cell, 0.05f + arc_w[ni->udata][ue.index.idx()]);
++            }
++        if (sw <= 0)
++            return false;
++        cx = int(std::lround(sx / sw));
++        cy = int(std::lround(sy / sw));
++        return true;
++    }
++
++    bool pick_tile(const std::vector<CellInfo *> &mem, int &tx, int &ty)
++    {
++        Loc cur = ctx->getBelLocation(mem.front()->bel);
++        int cx = cur.x, cy = cur.y;
++        if (rnd() < p_cent) {
++            int x, y;
++            if (centroid(mem, x, y)) {
++                cx = x;
++                cy = y;
++            }
++        }
++        for (int tries = 0; tries < 8; tries++) {
++            int x = cx + ctx->rng(2 * rlim + 1) - rlim;
++            int y = cy + ctx->rng(2 * rlim + 1) - rlim;
++            if (x < 0 || y < 0 || x > max_x || y > max_y)
++                continue;
++            if (!tile_slice[x][y][0] && !tile_slice[x][y][1])
++                continue;
++            tx = x;
++            ty = y;
++            return true;
++        }
++        return false;
++    }
++
++    void move_single(CellInfo *ci)
++    {
++        if (!(kinds & 1))
++            return;
++        int tx, ty;
++        if (!pick_tile({ci}, tx, ty))
++            return;
++        auto &cand = ci->type == id_SLICE_LUTX ? tile_luts[tx][ty] : tile_ffs[tx][ty];
++        if (cand.empty())
++            return;
++        BelId nb = cand[ctx->rng(int(cand.size()))];
++        if (nb == ci->bel)
++            return;
++        CellInfo *other = ctx->getBoundBelCell(nb);
++        std::vector<std::pair<CellInfo *, BelId>> target{{ci, nb}};
++        if (other != nullptr) {
++            if (!single_movable(other) || other->type != ci->type)
++                return;
++            target.emplace_back(other, ci->bel);
++        }
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(0);
++    }
++
++    void move_cluster(CellInfo *root)
++    {
++        if (!(kinds & 2))
++            return;
++        std::vector<CellInfo *> mem{root};
++        for (auto *ch : root->constr_children)
++            mem.push_back(ch);
++        int tx, ty;
++        if (!pick_tile(mem, tx, ty))
++            return;
++        auto &cand = tile_luts[tx][ty];
++        if (cand.empty())
++            return;
++        BelId nb = cand[ctx->rng(int(cand.size()))];
++        if (nb == root->bel)
++            return;
++        std::vector<std::pair<CellInfo *, BelId>> target;
++
++
++        if (!ctx->getClusterPlacement(root->cluster, nb, target) || target.size() != mem.size())
++            return;
++        for (auto &t : target) {
++            if (t.second == BelId())
++                return;
++            CellInfo *o = ctx->getBoundBelCell(t.second);
++            if (o != nullptr && std::find(mem.begin(), mem.end(), o) == mem.end())
++                return;
++        }
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(1);
++    }
++
++
++    struct SK
++    {
++        int x, y, s;
++        bool operator==(const SK &o) const { return x == o.x && y == o.y && s == o.s; }
++    };
++
++    int slice_index(const std::vector<SK> &g, BelId b) const
++    {
++        if (b == BelId())
++            return -1;
++        Loc l = ctx->getBelLocation(b);
++        for (int i = 0; i < int(g.size()); i++)
++            if (g[i].x == l.x && g[i].y == l.y && g[i].s == (l.z >> 6))
++                return i;
++        return -1;
++    }
++
++
++
++    bool group_cells(const std::vector<SK> &g, std::vector<std::tuple<CellInfo *, int, int>> &out)
++    {
++        out.clear();
++        for (int i = 0; i < int(g.size()); i++)
++            for (BelId b : ctx->getBelsByTile(g[i].x, g[i].y)) {
++                Loc l = ctx->getBelLocation(b);
++                if ((l.z >> 6) != g[i].s)
++                    continue;
++                CellInfo *c = ctx->getBoundBelCell(b);
++                if (c == nullptr)
++                    continue;
++                const int f = l.z & 0xF;
++                if (fixed(c) || !slice_type(c->type) ||
++                    !(f == BEL_6LUT || f == BEL_5LUT || f == BEL_FF || f == BEL_FF2 || f == BEL_F7MUX ||
++                      f == BEL_F8MUX || f == BEL_CARRY4))
++                    return false;
++                if ((c->type == id_CARRY4 && !(slicemask & 1)) || (c->type == id_SELMUX2_1 && !(slicemask & 2)) ||
++                    ((c->attrs.count(id_X_LUT_AS_DRAM) || c->attrs.count(id_X_LUT_AS_SRL)) && !(slicemask & 4)))
++                    return false;
++                out.emplace_back(c, i, l.z & 0x3F);
++            }
++        for (auto &e : out) {
++            CellInfo *c = std::get<0>(e);
++            if (c->cluster == ClusterId())
++                continue;
++            CellInfo *root = ctx->getClusterRootCell(c->cluster);
++            if (slice_index(g, root->bel) < 0)
++                return false;
++            for (auto *ch : root->constr_children) {
++                if (slice_index(g, ch->bel) < 0)
++                    return false;
++                for (auto *gch : ch->constr_children)
++                    if (slice_index(g, gch->bel) < 0)
++                        return false;
++            }
++        }
++        return true;
++    }
++
++    std::vector<std::tuple<CellInfo *, int, int>> ga_cells, gb_cells;
++
++
++    bool slice_cells(int x, int y, int s, std::vector<std::pair<CellInfo *, int>> &out)
++    {
++        out.clear();
++        if (!group_cells({SK{x, y, s}}, ga_cells))
++            return false;
++        for (auto &e : ga_cells)
++            out.emplace_back(std::get<0>(e), std::get<2>(e));
++        return true;
++    }
++
++
++
++
++    void collect(CellInfo *c, std::vector<CellInfo *> &m)
++    {
++        m.push_back(c);
++        for (auto *ch : c->constr_children)
++            collect(ch, m);
++    }
++
++    void move_chain(CellInfo *root)
++    {
++        if (!(kinds & 8))
++            return;
++        std::vector<CellInfo *> mem;
++        collect(root, mem);
++        std::vector<SK> src;
++        for (auto *c : mem) {
++            if (c->bel == BelId() || fixed(c))
++                return;
++            Loc l = ctx->getBelLocation(c->bel);
++            SK k{l.x, l.y, l.z >> 6};
++            if (std::find(src.begin(), src.end(), k) == src.end())
++                src.push_back(k);
++        }
++        if (!group_cells(src, ga_cells))
++            return;
++        std::vector<CellInfo *> all{root};
++        for (auto &e : ga_cells)
++            if (std::get<0>(e) != root)
++                all.push_back(std::get<0>(e));
++        int tx, ty;
++        if (!pick_tile(all, tx, ty))
++            return;
++        Loc rl = ctx->getBelLocation(root->bel);
++        int dx = tx - rl.x, dy = ty - rl.y, ds = ctx->rng(2) - (rl.z >> 6);
++        if (dx == 0 && dy == 0 && ds == 0)
++            return;
++        std::vector<SK> dst;
++        for (auto &k : src) {
++            SK t{k.x + dx, k.y + dy, k.s + ds};
++            if (t.x < 0 || t.y < 0 || t.x > max_x || t.y > max_y || t.s < 0 || t.s > 1 || !tile_slice[t.x][t.y][t.s])
++                return;
++            if (std::find(src.begin(), src.end(), t) != src.end())
++                return;
++            dst.push_back(t);
++        }
++        auto shifted = [&](BelId b) {
++            Loc l = ctx->getBelLocation(b);
++            int i = slice_index(src, b);
++            if (i < 0)
++                return BelId();
++            return ctx->getBelByLocation(Loc(dst[i].x, dst[i].y, (dst[i].s << 6) | (l.z & 0x3F)));
++        };
++        BelId nb = shifted(root->bel);
++        std::vector<std::pair<CellInfo *, BelId>> plc;
++        if (nb == BelId() || !ctx->getClusterPlacement(root->cluster, nb, plc))
++            return;
++        for (auto &p : plc)
++            if (p.first->bel == BelId() || p.second != shifted(p.first->bel))
++                return;
++        if (!group_cells(dst, gb_cells))
++            return;
++        std::vector<std::pair<CellInfo *, BelId>> target;
++        for (auto &e : ga_cells) {
++            const SK &t = dst[std::get<1>(e)];
++            target.emplace_back(std::get<0>(e), ctx->getBelByLocation(Loc(t.x, t.y, (t.s << 6) | std::get<2>(e))));
++        }
++        for (auto &e : gb_cells) {
++            const SK &t = src[std::get<1>(e)];
++            target.emplace_back(std::get<0>(e), ctx->getBelByLocation(Loc(t.x, t.y, (t.s << 6) | std::get<2>(e))));
++        }
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(3);
++    }
++
++    std::vector<std::pair<CellInfo *, int>> sa_cells, sb_cells;
++
++    void move_slice(CellInfo *ci)
++    {
++        if (!(kinds & 4))
++            return;
++        Loc cur = ctx->getBelLocation(ci->bel);
++        int s0 = (cur.z >> 6) & 1;
++        if (!slice_cells(cur.x, cur.y, s0, sa_cells) || sa_cells.empty())
++            return;
++        std::vector<CellInfo *> mem;
++        for (auto &e : sa_cells)
++            mem.push_back(e.first);
++        int tx, ty;
++        if (!pick_tile(mem, tx, ty))
++            return;
++        int s1 = ctx->rng(2);
++        if (!tile_slice[tx][ty][s1])
++            s1 ^= 1;
++        if (!tile_slice[tx][ty][s1] || (tx == cur.x && ty == cur.y && s1 == s0))
++            return;
++        if (!slice_cells(tx, ty, s1, sb_cells))
++            return;
++        std::vector<std::pair<CellInfo *, BelId>> target;
++        for (auto &e : sa_cells)
++            target.emplace_back(e.first, ctx->getBelByLocation(Loc(tx, ty, (s1 << 6) | e.second)));
++        for (auto &e : sb_cells)
++            target.emplace_back(e.first, ctx->getBelByLocation(Loc(cur.x, cur.y, (s0 << 6) | e.second)));
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(2);
++    }
++
++
++
++    void move_hard(CellInfo *ci)
++    {
++        if (!(kinds & 16))
++            return;
++        Loc cur = ctx->getBelLocation(ci->bel);
++        int cx = cur.x, cy = cur.y;
++        if (rnd() < p_cent) {
++            int x, y;
++            if (centroid({ci}, x, y)) {
++                cx = x;
++                cy = y;
++            }
++        }
++        auto &all = hard_bels[ci->type];
++        std::vector<BelId> cand;
++        for (BelId b : all) {
++            Loc l = ctx->getBelLocation(b);
++            if (std::abs(l.x - cx) <= hard_win && std::abs(l.y - cy) <= hard_win && b != ci->bel)
++                cand.push_back(b);
++        }
++        if (cand.empty())
++            return;
++        BelId nb = cand[ctx->rng(int(cand.size()))];
++        CellInfo *other = ctx->getBoundBelCell(nb);
++        std::vector<std::pair<CellInfo *, BelId>> target{{ci, nb}};
++        if (other != nullptr) {
++            if (other->type != ci->type || fixed(other) || other->cluster != ClusterId())
++                return;
++            target.emplace_back(other, ci->bel);
++        }
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(4);
++    }
++
++    void one_move()
++    {
++        CellInfo *ci;
++        if (!hard_cells.empty() && rnd() < p_hard) {
++            move_hard(hard_cells[ctx->rng(int(hard_cells.size()))]);
++            return;
++        }
++        if (!crit_cells.empty() && rnd() < p_crit)
++            ci = crit_cells[ctx->rng(int(crit_cells.size()))];
++        else
++            ci = movable_cells[ctx->rng(int(movable_cells.size()))];
++        if (ci->bel == BelId())
++            return;
++        if (rnd() < p_slice) {
++            move_slice(ci);
++            return;
++        }
++        if (single_movable(ci)) {
++            move_single(ci);
++            return;
++        }
++        if (ci->cluster != ClusterId()) {
++            CellInfo *root = ctx->getClusterRootCell(ci->cluster);
++            if (cluster_movable(root)) {
++                move_cluster(root);
++                return;
++            }
++            if (root->type == id_CARRY4 && rnd() < p_chain) {
++                move_chain(root);
++                return;
++            }
++        }
++        move_slice(ci);
++    }
++
++    double total_hpwl()
++    {
++        double h = 0;
++        for (auto *ni : nets)
++            if (net_wl[ni->udata])
++                h += bbox(ni);
++        return h;
++    }
++
++    void parse(const std::string &v)
++    {
++        size_t p = 0;
++        while (p < v.size()) {
++            size_t e = v.find(':', p);
++            std::string kv = v.substr(p, e == std::string::npos ? std::string::npos : e - p);
++            p = e == std::string::npos ? v.size() : e + 1;
++            auto eq = kv.find('=');
++            if (eq == std::string::npos)
++                log_error("-o sa-refine: expected key=value, got '%s'\n", kv.c_str());
++            std::string k = kv.substr(0, eq);
++            if (kv.substr(0, eq) == "dump") {
++                dump_file = kv.substr(eq + 1);
++                continue;
++            }
++            double x = std::stod(kv.substr(eq + 1));
++            if (k == "lambda")
++                lambda = x;
++            else if (k == "exp")
++                crit_exp = float(x);
++            else if (k == "t0")
++                t0 = x;
++            else if (k == "rlim")
++                rlim0 = std::max(1, int(x));
++            else if (k == "inner")
++                inner = x;
++            else if (k == "quant")
++                quant = float(x);
++            else if (k == "alpha")
++                alpha_ps = int(x);
++            else if (k == "site")
++                site_lut_ps = int(x);
++            else if (k == "siteother")
++                site_other_ps = int(x);
++            else if (k == "tile")
++                tile_ps = int(x);
++            else if (k == "beta")
++                beta = x;
++            else if (k == "pcrit")
++                p_crit = x;
++            else if (k == "pcent")
++                p_cent = x;
++            else if (k == "pslice")
++                p_slice = x;
++            else if (k == "temps")
++                max_temps = int(x);
++            else if (k == "time")
++                time_limit = x;
++            else if (k == "critmin")
++                crit_min = float(x);
++            else if (k == "slicemask")
++                slicemask = int(x);
++            else if (k == "phard")
++                p_hard = x;
++            else if (k == "hardwin")
++                hard_win = int(x);
++            else if (k == "pchain")
++                p_chain = x;
++            else if (k == "rmin")
++                rmin = std::max(1, int(x));
++            else if (k == "kinds")
++                kinds = int(x);
++            else if (k == "greedy")
++                greedy_end = int(x);
++            else
++                log_error("-o sa-refine: unknown key '%s'\n", k.c_str());
++        }
++    }
++
++    void run(const std::string &opts)
++    {
++        parse(opts);
++        auto t_start = std::chrono::steady_clock::now();
++        log_info("SA refinement: lambda %.2f, crit exponent %.1f, t0 %.3f, window %d, inner %.1f, criticality "
++                 "quantile %.3f, arc model %d + %.3f * matrix (site %d/%d, tile %d ps)\n",
++                 lambda, crit_exp, t0, rlim0, inner, quant, alpha_ps, beta, site_lut_ps, site_other_ps, tile_ps);
++        init();
++        tmg.setup_only = true;
++        tmg.crit_quantile = quant;
++        tmg.setup();
++        analyse();
++        double hpwl0 = total_hpwl();
++        delay_t ws0 = worst_slack;
++        double q0 = slack_q(0.005);
++        int n_single = 0, n_clu = 0;
++        for (auto *c : movable_cells) {
++            n_single += single_movable(c);
++            n_clu += cluster_movable(c);
++        }
++        log_info("SA refinement: %d slice cells (%d single LUT/FF, %d small clusters), %d critical; model worst slack "
++                 "%.3f ns, HPWL %.0f, timing cost %.0f\n",
++                 int(movable_cells.size()), n_single, n_clu, int(crit_cells.size()), ctx->getDelayNS(ws0), hpwl0,
++                 t_total);
++        if (movable_cells.empty()) {
++            restore();
++            return;
++        }
++        long moves_per_temp = long(inner * movable_cells.size());
++        rlim = rlim0;
++        wl_norm = std::max(1.0, wl_total);
++        t_norm = std::max(1.0, t_total);
++        probing = true;
++        for (int i = 0; i < std::min<long>(4000, 2 * movable_cells.size()); i++)
++            one_move();
++        probing = false;
++        auto acc_at = [&](double T) {
++            double a = 0;
++            for (double c : probe_up)
++                a += std::exp(-c / T);
++            return probe_up.empty() ? 0.0 : a / probe_up.size();
++        };
++        double lo = 1e-12, hi = 1.0;
++        for (int i = 0; i < 100; i++) {
++            double mid = std::sqrt(lo * hi);
++            (acc_at(mid) < t0 ? lo : hi) = mid;
++        }
++        temp = probe_up.empty() ? 0.0 : hi;
++        double temp0 = temp;
++        log_info("SA refinement: %d uphill moves in the sample, start temperature %.3g (uphill acceptance %.3f)\n",
++                 int(probe_up.size()), temp, acc_at(std::max(temp, 1e-30)));
++        n_move = n_accept = 0;
++        int greedy_left = greedy_end;
++        int quiet = 0;
++        for (int it = 1; it <= max_temps; it++) {
++            n_move = n_accept = 0;
++            wl_norm = std::max(1.0, wl_total);
++            t_norm = std::max(1.0, t_total);
++            double c_before = (1.0 - lambda) + lambda;
++            double wl_b = wl_total, t_b = t_total;
++            for (long m = 0; m < moves_per_temp; m++)
++                one_move();
++            double ra = n_move ? double(n_accept) / n_move : 0;
++            double c_after = (1.0 - lambda) * wl_total / wl_b + lambda * t_total / std::max(1.0, t_b);
++            double wl_inc = wl_total, t_inc = t_total;
++            totals();
++            double drift_wl = wl_total - wl_inc, drift_t = t_total - t_inc;
++            analyse();
++            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
++            if (it == 1 || it % 5 == 0 || temp == 0)
++                log_info("  SA temp #%d: T %.3g, window %d, accepted %.1f %%, cost x%.4f, HPWL %.0f, timing cost "
++                         "%.0f, model slack worst/0.5%%/2%% %.3f/%.3f/%.3f ns, %.1f s (drift %.0f / %.0f)\n",
++                         it, temp, rlim, 100 * ra, c_after / c_before, total_hpwl(), t_total,
++                         ctx->getDelayNS(worst_slack), slack_q(0.005), slack_q(0.02), secs, drift_wl, drift_t);
++            if (temp == 0) {
++                if (--greedy_left <= 0)
++                    break;
++                continue;
++            }
++            rlim = std::max(rmin, std::min(rlim0, int(rlim * (1.0 - 0.44 + ra) + 0.5)));
++            if (ra > 0.96)
++                temp *= 0.5;
++            else if (ra > 0.8)
++                temp *= 0.9;
++            else if (ra > 0.15 && rlim > 1)
++                temp *= 0.95;
++            else
++                temp *= 0.8;
++            quiet = (c_after > 0.999) ? quiet + 1 : 0;
++            if (temp < temp0 * 1e-3 || quiet >= 5 || secs > time_limit)
++                temp = 0;
++        }
++        double hpwl1 = total_hpwl();
++        if (!dump_file.empty()) {
++
++            std::ofstream df(dump_file);
++            for (auto *ci : cells) {
++                if (ci->bel == BelId() || !ci->type.in(id_SLICE_FFX, id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1,
++                                                        id_DSP48E1_DSP48E1))
++                    continue;
++                for (auto &port : ci->ports) {
++                    if (port.second.type != PORT_IN || port.second.net == nullptr ||
++                        !net_tm[port.second.net->udata])
++                        continue;
++                    delay_t sl = tmg.get_setup_slack(CellPortKey(ci->name, port.first));
++                    if (sl > -1000000000 && sl < 1000000000)
++                        df << ci->name.str(ctx) << "\t" << port.first.str(ctx) << "\t" << sl << "\n";
++                }
++            }
++        }
++        int bad = 0;
++        for (auto *c : cells)
++            if (c->bel != BelId() && !ctx->isBelLocationValid(c->bel))
++                bad++;
++        if (bad)
++            log_error("SA refinement left %d cells on invalid bels\n", bad);
++        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
++        log_info("SA refinement done: model slack worst %.3f -> %.3f ns, 0.5%% %.3f -> %.3f ns, HPWL %.0f -> %.0f, moves "
++                 "kept: %ld/%ld single, %ld/%ld cluster, %ld/%ld slice, %ld/%ld chain, %ld/%ld RAM/DSP; %.2f s\n",
++                 ctx->getDelayNS(ws0), ctx->getDelayNS(worst_slack), q0, slack_q(0.005), hpwl0, hpwl1, kind_acc[0],
++                 kind_try[0],
++                 kind_acc[1], kind_try[1], kind_acc[2], kind_try[2], kind_acc[3], kind_try[3], kind_acc[4], kind_try[4], secs);
++        restore();
++    }
++};
++}
++
++void XilinxImpl::sa_refine()
++{
++    const bool asked = ctx->args.options.count("sa-refine");
++    const bool replay = ctx->args.options.count("preplaced") || ctx->args.options.count("prerouted");
++    if (!asked || replay)
++        return;
++    SARefine(ctx, this).run(ctx->args.options.at("sa-refine").as<std::string>());
++}
++
++NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 49201d4e..3c845d7f 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -82,9 +82,17 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("hold-fix", po::value<std::string>()->implicit_value(""),
+                            "after routing, fix hold-time (min-delay) violations: small deficits by a routing "
+                            "detour, larger ones by a feedthrough LUT; optional value sets the max passes (default 8)");
++    specific.add_options()("lut6-first", "after placement, move a LUT alone on a 5LUT to its 6LUT and a flip-flop alone on "
++                           "an x5FF to its xFF where the tile stays legal (their outputs then avoid the slower xMUX pin)");
++    specific.add_options()("lut-a6-perm", "with a chipdb that has the A6 LUT permutation pips: let the router put "
++                           "an input of a LUT that sits alone on the 6LUT on the A6 pin (off: those pips are unused)");
+     specific.add_options()("carry-di-bypass", po::value<std::string>()->implicit_value(""),
+                            "feed a carry DI that no LUT of its own position drives through the slice X pin "
+                            "(AX..DX), as Vivado does, instead of a feed-through LUT; the S LUT may then be a LUT6");
++    specific.add_options()("sa-refine", po::value<std::string>()->implicit_value(""),
++                           "timing-driven simulated-annealing refinement after legalisation (VPR style), "
++                           "key=value:... (lambda, exp, t0, rlim, inner, quant, alpha, beta, pcrit, pcent, pslice, "
++                           "temps, time, critmin, greedy)");
+     specific.add_options()("preplaced", po::value<std::string>(),
+                            "before placing, pin the cells named in this file to the bels they had in a reference "
+                            "build (scripts/routing_dump.py from that build's --write JSON), packer-made cells included");
+@@ -118,6 +126,24 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("static-ff-area", po::value<float>(),
+                            "static placer: area of a flipflop in slice-bel units of 1/16 (default 1.4: control-set "
+                            "and input-pin limits keep a slice from filling up)");
++    specific.add_options()("static-grad-y", po::value<float>(),
++                           "static placer: weight of the vertical wirelength gradient (default 1); >1 flattens the placement");
++    specific.add_options()("static-hpwl-y", po::value<int>(),
++                           "static placer: wirelength weight of a vertical tile step (default 1)");
++    specific.add_options()("static-delay", po::value<std::string>(),
++                           "static placer arc delay estimate C,Y1,Y2,X1,X2 in ps: C + Y1*min(dy,6) + Y2*max(dy-6,0) + "
++                           "X1*min(dx,12) + X2*max(dx-12,0) (default 500,48,24,24,12)");
++    specific.add_options()("predict-cal", po::value<std::string>(),
++                           "placer delay prediction SITE,TILE,ALPHA,BETA (ps, ps, ps, factor): a LUT input from the "
++                           "same slice costs SITE, another slice of the same tile TILE, and a connection between "
++                           "tiles ALPHA + BETA * the delay matrix (off by default)");
++    specific.add_options()("static-ram-assign",
++                           "static placer: legalise the block RAMs by a global assignment to sites, cheapest "
++                           "(timing-weighted predicted delay to their neighbours) first, instead of the nearest free "
++                           "site");
++    specific.add_options()("static-group-util", po::value<std::string>(),
++                           "static placer: target utilisation per cell group COMB,FF,RAM,DSP (spacers fill each group "
++                           "up to it); default: --placer-static-target-util for all");
+     specific.add_options()("hardblock-timing", po::value<std::string>()->implicit_value(""),
+                            "time the DSP48E1 and ICAPE2 pins with the prjxray-db SDF arcs (off by default: they are "
+                            "untimed); see hardblock_timing.cc");
+@@ -592,6 +618,26 @@ if (cell.second->type.in(id_BUFR, id_BUFR_BUFR)) {
+                 return true;
+         }
+     } else if (pip_type == PIP_LUT_PERMUTATION) {
++        const bool a6_for_another_input = ((extra_data.pip_config >> 4) & 0xF) == 5 && (extra_data.pip_config & 0xF) != 5;
++        if (a6_for_another_input) {
++
++
++            if (!lut_a6_perm)
++                return true;
++            const auto &a6_lts = tile_status[pip.tile].lts;
++            if (!a6_lts)
++                return true;
++            int a6_eight = (extra_data.pip_config >> 8) & 0xF;
++            if (a6_lts->cells[(a6_eight << 4) | BEL_5LUT] != nullptr)
++                return true;
++            const CellInfo *a6_lut = a6_lts->cells[(a6_eight << 4) | BEL_6LUT];
++            if (a6_lut == nullptr || a6_lut->getPort(id_A6) != nullptr)
++                return true;
++            auto a6_tags = get_tags(a6_lut);
++            if (a6_tags && (a6_tags->lut.is_memory || a6_tags->lut.is_srl))
++                return true;
++            return false;
++        }
+         const auto &lts = tile_status[pip.tile].lts;
+         if (!lts)
+             return false;
+@@ -963,6 +1009,21 @@ void XilinxImpl::prePlace()
+     // on a given device it leaves dm_valid false and the formula stands, so an
+     // untested device degrades rather than breaks.
+     const ArchArgs &dm_args = ctx->args;
++    if (dm_args.options.count("predict-cal")) {
++        std::string s = dm_args.options.at("predict-cal").as<std::string>();
++        int site = 0, tile = 0, alpha = 0;
++        float beta = 0;
++        if (sscanf(s.c_str(), "%d,%d,%d,%f", &site, &tile, &alpha, &beta) != 4 || beta <= 0)
++            log_error("-o predict-cal expects SITE,TILE,ALPHA,BETA, got '%s'\n", s.c_str());
++        pc_on = true;
++        pc_site = site;
++        pc_tile = tile;
++        pc_alpha = alpha;
++        pc_beta = beta;
++        log_info("Placer delay prediction: same-slice LUT input %d ps, same tile %d ps, between tiles %d + %.3f * "
++                 "matrix.\n",
++                 site, tile, alpha, beta);
++    }
+     std::string dm = dm_args.options.count("delay-matrix") ? dm_args.options["delay-matrix"].as<std::string>() : "build";
+     if (dm != "off") {
+         if (dm != "build")
+@@ -1149,6 +1210,7 @@ void XilinxImpl::postPlace()
+     // 30), with the measured delay matrix giving its estimates.  Off unless asked for, until it is measured on xc7
+     // (docs/physopt-pass-proposal.md in the tools repository).
+     replace_around_brams();
++    sa_refine();
+     const bool timing_opt_asked = ctx->args.options.count("timing-opt");
+     if (timing_opt_asked) {
+         std::string v = ctx->args.options.at("timing-opt").as<std::string>();
+@@ -1163,10 +1225,61 @@ void XilinxImpl::postPlace()
+         log_info("timing-opt: radius %d tiles, %d rounds\n", cfg.radius, cfg.iterations);
+         timing_opt(ctx, cfg);
+     }
++    if (ctx->args.options.count("lut6-first"))
++        lut6_first();
+     fixup_placement();
+     ctx->assignArchInfo();
+ }
+ 
++
++
++
++
++void XilinxImpl::lut6_first()
++{
++    int moved_luts = 0, moved_ffs = 0, kept = 0;
++    auto try_move = [&](CellInfo *ci, int to_bel) {
++        if (ci == nullptr || ci->cluster != ClusterId() || ci->belStrength >= STRENGTH_LOCKED)
++            return false;
++        BelId from = ci->bel;
++        Loc loc = ctx->getBelLocation(from);
++        loc.z = (loc.z & ~0xF) | to_bel;
++        BelId to = ctx->getBelByLocation(loc);
++        if (to == BelId() || !ctx->checkBelAvail(to) || !ctx->isValidBelForCellType(ci->type, to))
++            return false;
++        PlaceStrength strength = ci->belStrength;
++        ctx->unbindBel(from);
++        ctx->bindBel(to, ci, strength);
++        if (isBelLocationValid(to)) {
++            return true;
++        }
++        ctx->unbindBel(to);
++        ctx->bindBel(from, ci, strength);
++        ++kept;
++        return false;
++    };
++    for (int pass = 0; pass < 2; pass++) {
++        for (size_t ti = 0; ti < tile_status.size(); ti++) {
++            if (!tile_status.at(ti).lts)
++                continue;
++            for (int z = 0; z < 8; z++) {
++                auto &lts = *tile_status.at(ti).lts;
++                if (pass == 0) {
++                    CellInfo *l5 = lts.cells[(z << 4) | BEL_5LUT];
++                    if (l5 != nullptr && lts.cells[(z << 4) | BEL_6LUT] == nullptr && try_move(l5, BEL_6LUT))
++                        ++moved_luts;
++                } else {
++                    CellInfo *f2 = lts.cells[(z << 4) | BEL_FF2];
++                    if (f2 != nullptr && lts.cells[(z << 4) | BEL_FF] == nullptr && try_move(f2, BEL_FF))
++                        ++moved_ffs;
++                }
++            }
++        }
++    }
++    log_info("lut6-first: %d LUTs 5LUT -> 6LUT, %d flip-flops x5FF -> xFF, %d moves refused by legality\n", moved_luts,
++             moved_ffs, kept);
++}
++
+ void XilinxImpl::configureRouter2(Router2Cfg &cfg)
+ {
+     // Routing configuration proven on xc7 by nextpnr-xilinx
+@@ -1219,7 +1332,13 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+     cfg.hpwl_scale_x = ctx->args.options.count("static-hpwl-x")
+                                ? std::max(1, ctx->args.options.at("static-hpwl-x").as<int>())
+                                : 2;
+-    cfg.hpwl_scale_y = 1;
++
++
++    cfg.hpwl_scale_y = ctx->args.options.count("static-hpwl-y")
++                               ? std::max(1, ctx->args.options.at("static-hpwl-y").as<int>())
++                               : 1;
++    if (ctx->args.options.count("static-grad-y"))
++        cfg.grad_scale_y = ctx->args.options.at("static-grad-y").as<float>();
+ 
+     cfg.glbBufTypes.insert(id_PSEUDO_GND);
+     cfg.glbBufTypes.insert(id_PSEUDO_VCC);
+@@ -1230,6 +1349,44 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+     cfg.timing_mx = 25;
+     cfg.timing_my = 50;
+ 
++
++
++
++    std::array<int, 5> sd{500, 48, 24, 24, 12};
++    if (ctx->args.options.count("static-delay")) {
++        std::string s = ctx->args.options.at("static-delay").as<std::string>();
++
++
++        if (s == "matrix") {
++            log_info("Static placer delay estimate: the delay matrix%s.\n", pc_on ? " with -o predict-cal" : "");
++            cfg.predict_delay = [this](Context *ctx, const PlacerStaticCfg &cfg, Loc src_loc, IdString src_pin,
++                                       Loc dst_loc, IdString dst_pin) -> delay_t {
++                if (dst_pin == id_CIN && src_pin == id_CO3)
++                    return 0;
++                int dx = dst_loc.x - src_loc.x, dy = dst_loc.y - src_loc.y;
++                if (dx == 0 && dy == 0)
++                    return pc_on ? pc_tile : 150;
++                delay_t m = delay_matrix_lookup(dx, dy);
++                if (m < 0)
++                    m = 500 + 48 * std::min(std::abs(dy), 6) + 24 * std::abs(dx);
++                return pc_on ? delay_t(pc_alpha + pc_beta * m) : m;
++            };
++        } else {
++        if (sscanf(s.c_str(), "%d,%d,%d,%d,%d", &sd[0], &sd[1], &sd[2], &sd[3], &sd[4]) != 5)
++            log_error("-o static-delay expects C,Y1,Y2,X1,X2 (ps), got '%s'\n", s.c_str());
++        log_info("Static placer delay estimate: %d + %d*min(dy,6) + %d*max(dy-6,0) + %d*min(dx,12) + "
++                 "%d*max(dx-12,0) ps.\n",
++                 sd[0], sd[1], sd[2], sd[3], sd[4]);
++        cfg.predict_delay = [sd](Context *ctx, const PlacerStaticCfg &cfg, Loc src_loc, IdString src_pin,
++                                 Loc dst_loc, IdString dst_pin) -> delay_t {
++            if (dst_pin == id_CIN && src_pin == id_CO3)
++                return 0;
++            int dist_x = std::abs(dst_loc.x - src_loc.x), dist_y = std::abs(dst_loc.y - src_loc.y);
++            return sd[0] + sd[1] * std::min(dist_y, 6) + sd[2] * std::max(dist_y - 6, 0) +
++                   sd[3] * std::min(dist_x, 12) + sd[4] * std::max(dist_x - 12, 0);
++        };
++        }
++    } else
+     cfg.predict_delay = [](Context *ctx, const PlacerStaticCfg &cfg, Loc src_loc, IdString src_pin, Loc dst_loc,
+                            IdString dst_pin) -> delay_t {
+         if (dst_pin == id_CIN && src_pin == id_CO3)
+@@ -1280,6 +1437,7 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+         comb.cell_area[id_RAMB36E1_RAMB36E1] = StaticRect(1.0f, 6.0f);
+         comb.bel_area[id_RAMB36E1_RAMB36E1] = StaticRect(0.0f, 0.0f);
+         comb.spacer_rect = StaticRect(1.0f, 3.0f);
++        comb.assign_legalise = ctx->args.options.count("static-ram-assign") > 0;
+     }
+     {
+         cfg.cell_groups.emplace_back();
+@@ -1289,6 +1447,18 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+         comb.bel_area[id_DSP48E1_DSP48E1] = StaticRect(1.0f, 3.0f);
+         comb.spacer_rect = StaticRect(1.0f, 3.0f);
+     }
++
++
++    if (ctx->args.options.count("static-group-util")) {
++        std::string s = ctx->args.options.at("static-group-util").as<std::string>();
++        double u[4];
++        if (sscanf(s.c_str(), "%lf,%lf,%lf,%lf", &u[0], &u[1], &u[2], &u[3]) != 4)
++            log_error("-o static-group-util expects COMB,FF,RAM,DSP, got '%s'\n", s.c_str());
++        for (int i = 0; i < 4 && i < int(cfg.cell_groups.size()); i++)
++            cfg.cell_groups.at(i).target_util = u[i];
++        log_info("Static placer target utilisation per group: COMB %.2f FF %.2f RAM %.2f DSP %.2f.\n", u[0], u[1], u[2],
++                 u[3]);
++    }
+     cfg.get_cell_area_override = [this](Context *ctx, const CellInfo *ci) -> std::optional<StaticRect> {
+         if (ci->type != id_SLICE_LUTX)
+             return {};
+@@ -1320,6 +1490,7 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+ 
+ void XilinxImpl::preRoute()
+ {
++    lut_a6_perm = ctx->args.options.count("lut-a6-perm");
+     if (!cell_tags_set) {
+         // We loaded a pre-placed design. Need to set tags and update bel-cell map
+         assign_cell_tags();
+@@ -2319,17 +2490,18 @@ delay_t XilinxImpl::predictDelay(BelId src_bel, IdString src_pin, BelId dst_bel,
+         Loc dl = ctx->getBelLocation(src_bel), sl = ctx->getBelLocation(dst_bel);
+         bool same_slice = (dl.z >> 4) == (sl.z >> 4);
+         bool source_is_ff2 = (dl.z & 0xF) == BEL_FF2;
+-        if (same_slice)
+-            return 0;
+-        else if (source_is_ff2)
+-            return 700; // penalize FF2 as it makes routing harder
++        if (same_slice) {
++            bool lut_input = dst_pin.in(id_A1, id_A2, id_A3, id_A4, id_A5, id_A6);
++            return (pc_on && lut_input) ? pc_site : 0;
++        } else if (source_is_ff2)
++            return pc_on ? std::max<delay_t>(700, pc_tile) : 700;
+         else
+-            return 150;
++            return pc_on ? pc_tile : 150;
+     }
+     delay_t measured = delay_matrix_lookup(dx - sx, dy - sy);
+     bool have_measured_delay = measured >= 0;
+     if (have_measured_delay)
+-        return measured; // in or out of window -- extrapolated when out
++        return pc_on ? delay_t(pc_alpha + pc_beta * measured) : measured;
+     int dist_x = std::abs(dx - sx), dist_y = std::abs(dy - sy);
+     delay_t base = 30 * std::min(dist_x, 18) + 10 * std::max(dist_x - 18, 0) + 60 * std::min(dist_y, 6) +
+                    20 * std::max(dist_y - 6, 0) + 300;
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index cc8c3442..347989d6 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -174,6 +174,9 @@ struct XilinxImpl : HimbaechelAPI
+     // (RCLK_BEFORE_DIV -> RCLK_OUT -> RCLK2RCLK -> CK_BUFRCLK) runs through a
+     // BUFR, so those wires are a buffer's output rather than general routing.
+     // Cached: is_pip_unavail is on the router's hot path.
++    void lut6_first();
++
++    bool lut_a6_perm = false;
+     mutable bool design_has_bufr = false;
+     mutable bool design_has_bufr_valid = false;
+     bool checkPipAvail(PipId pip) const override { return !is_pip_unavail(pip); }
+@@ -334,6 +337,11 @@ struct XilinxImpl : HimbaechelAPI
+     // connections identically, and there is no arbitrary formula left in
+     // the path.
+     float dm_rate_x = 0.0f, dm_rate_y = 0.0f;
++
++
++    bool pc_on = false;
++    delay_t pc_site = 0, pc_tile = 150, pc_alpha = 0;
++    float pc_beta = 1.0f;
+     size_t dm_index(int dx, int dy) const
+     {
+         return size_t((dy + dm_window) * (2 * dm_window + 1) + (dx + dm_window));
+@@ -388,6 +396,7 @@ struct XilinxImpl : HimbaechelAPI
+     bool is_movable_bram(const CellInfo *ci) const;
+     bool place_brams_by_group();
+     void replace_around_brams();
++    void sa_refine();
+ 
+     delay_t predictDelay(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const override;
+     delay_t estimateDelay(WireId src, WireId dst) const override;

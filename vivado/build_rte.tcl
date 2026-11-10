@@ -3,6 +3,7 @@ set CONFIG_SRCROOT   [lindex $argv 0]
 set CONFIG_OUTROOT   [lindex $argv 1]
 set CONFIG_NAMES     [lrange $argv 2 end]
 set CONFIG_STYLES    {abs rel}
+set CONFIG_ROUTE_DUMP [expr {[info exists ::env(RTE_ROUTE_DUMP)] && $::env(RTE_ROUTE_DUMP) eq "1"}]
 
 proc step {fh name script} {
     set ::cur_step $name
@@ -101,6 +102,18 @@ proc dump_cells {fn} {
     close $f
 }
 
+proc dump_paths_cells {fn n} {
+    set f [open $fn w]
+    foreach p [get_timing_paths -setup -max_paths $n -nworst 1 -unique_pins] {
+        set cells {}
+        foreach c [get_cells -of_objects $p] { lappend cells [get_property NAME $c] }
+        puts $f [join [list [get_property SLACK $p] [get_property DATAPATH_DELAY $p] [get_property DATAPATH_LOGIC_DELAY $p] \
+                           [get_property DATAPATH_NET_DELAY $p] [get_property STARTPOINT_PIN $p] [get_property ENDPOINT_PIN $p] \
+                           [join $cells " "]] "\t"]
+    }
+    close $f
+}
+
 proc place_fixed {src out} {
     set lf [open $out/place_log.txt w]
     set nlock 0
@@ -182,6 +195,44 @@ proc set_routes {src out} {
     close $rf
 }
 
+proc dump_lut_arcs {fn} {
+    set f [open $fn w]
+    foreach c [get_cells -hierarchical -filter {PRIMITIVE_GROUP == LUT}] {
+        set bel [get_property BEL $c]
+        set ref [get_property REF_NAME $c]
+        set init [get_property INIT $c]
+        foreach a [get_timing_arcs -quiet -of_objects $c] {
+            set fp [get_property FROM_PIN $a]
+            set tp [get_property TO_PIN $a]
+            set bp [get_bel_pins -quiet -of_objects $fp]
+            puts $f "$c\t$ref\t$bel\t$init\t[get_property REF_PIN_NAME $fp]\t[lindex [split $bp /] end]\t[get_property REF_PIN_NAME $tp]\t[get_property DELAY_SLOW_MAX_RISE $a]\t[get_property DELAY_SLOW_MAX_FALL $a]"
+        }
+    }
+    close $f
+}
+
+proc dump_routes {fn} {
+    set f [open $fn w]
+    set t0 [clock milliseconds]
+    foreach n [get_nets -hierarchical -top_net_of_hierarchical_group -filter {TYPE == SIGNAL}] {
+        set pips [get_pips -quiet -of_objects $n]
+        if {[llength $pips] == 0} { continue }
+        set loads [get_pins -quiet -leaf -of_objects $n -filter {DIRECTION == IN}]
+        puts $f "N	$n	[llength $loads]"
+        foreach dp [get_pins -quiet -leaf -of_objects $n -filter {DIRECTION == OUT}] {
+            puts $f "D	$dp	[get_nodes -quiet -of_objects [get_site_pins -quiet -of_objects $dp]]"
+        }
+        foreach p $pips {
+            puts $f "P	[get_nodes -quiet -uphill -of_objects $p]	[get_nodes -quiet -downhill -of_objects $p]"
+        }
+        foreach lp $loads {
+            puts $f "S	$lp	[get_nodes -quiet -of_objects [get_site_pins -quiet -of_objects $lp]]"
+        }
+    }
+    puts $f "T	[expr {[clock milliseconds] - $t0}]"
+    close $f
+}
+
 file mkdir $CONFIG_OUTROOT
 foreach name $CONFIG_NAMES {
     set src $CONFIG_SRCROOT/$name
@@ -200,10 +251,26 @@ foreach name $CONFIG_NAMES {
         read_edif $out/$top.edf
         link_design -top $top -part $CONFIG_PART
         read_xdc $src/constraints.xdc
-        if {$mode eq "vref"} {
+        if {$mode eq "vref" || $mode eq "vref_po"} {
             step $tf place { place_design }
+            if {$mode eq "vref_po"} { step $tf physopt { phys_opt_design -fanout_opt -critical_cell_opt } }
             step $tf route { route_design }
             dump_cells $out/cells.txt
+        } elseif {$mode eq "fixed_po"} {
+            step $tf place { place_fixed $src $out; place_design }
+            step $tf physopt {
+                set_property IS_LOC_FIXED 0 [get_cells -hierarchical -filter {IS_LOC_FIXED}]
+                set_property IS_BEL_FIXED 0 [get_cells -hierarchical -filter {IS_BEL_FIXED}]
+                phys_opt_design -fanout_opt -critical_cell_opt
+            }
+            step $tf route { route_design }
+        } elseif {$mode eq "fixed_rt" || $mode eq "fixed_unfix"} {
+            step $tf place { place_fixed $src $out; place_design }
+            if {$mode eq "fixed_unfix"} {
+                set_property IS_LOC_FIXED 0 [get_cells -hierarchical -filter {IS_LOC_FIXED}]
+                set_property IS_BEL_FIXED 0 [get_cells -hierarchical -filter {IS_BEL_FIXED}]
+            }
+            step $tf route { route_design }
         } else {
             step $tf place { place_fixed $src $out; place_design }
             step $tf setroute { set_routes $src $out }
@@ -213,6 +280,10 @@ foreach name $CONFIG_NAMES {
         report_timing_summary -file $out/timing.rpt
         report_timing -setup -max_paths 20 -nworst 1 -file $out/paths_setup.rpt
         write_slack $out/slack.txt
+        if {[file exists $src/dump.flag]} {
+            dump_cells $out/cells.txt
+            dump_paths_cells $out/paths.txt 1000
+        }
         set seqc [get_cells -hierarchical -filter {IS_SEQUENTIAL && REF_NAME != ICAPE2}]
         report_timing -setup -max_paths 10 -nworst 1 -from $seqc -to $seqc -file $out/paths_noicap.rpt
         set pf [open $out/paths_noicap.txt w]
@@ -231,6 +302,8 @@ foreach name $CONFIG_NAMES {
             }
         }
         close $df
+        if {$::CONFIG_ROUTE_DUMP} { catch { dump_routes $out/routes_dump.txt } }
+        if {[info exists ::env(RTE_LUT_ARCS)] && $::env(RTE_LUT_ARCS) eq "1"} { catch { dump_lut_arcs $out/lut_arcs.txt } }
     } err]
     close $tf
     set sf [open $out/status.txt w]

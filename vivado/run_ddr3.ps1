@@ -3,7 +3,8 @@ param(
     [string]$Tag = "ddr3",
     [string]$Script = "build_gap.tcl",
     [string]$SrcSub = "designs\ddr3",
-    [switch]$Run
+    [switch]$Run,
+    [switch]$Slotted
 )
 $Names = @($Names | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
@@ -39,7 +40,7 @@ if ($CONFIG.DryRun -and -not $Run) {
     Write-Output "add -Run to build"
     exit 0
 }
-if (Get-Process -Name vivado -ErrorAction SilentlyContinue) { throw "another vivado process is running; not starting" }
+if (-not $Slotted -and (Get-Process -Name vivado -ErrorAction SilentlyContinue)) { throw "another vivado process is running; not starting" }
 New-Item -ItemType Directory -Force $outRoot | Out-Null
 $t0 = Get-Date
 & $vivado @vargs

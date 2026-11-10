@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Mon, 9 Nov 2026 22:05:00 -0500
+Subject: [PATCH] xilinx: gen --lut-a6-perm and --lut-pin-delay
+
+- --lut-a6-perm: LUT permutation pseudo-pips from physical pin A6 to
+  logical inputs 1-5 as well (for -o lut-a6-perm; a nextpnr without that
+  option must not be given such a chipdb).
+- --lut-pin-delay A1,...,A6: every LUT input permutation pip from physical
+  pin Aj gets its own timing class LUT_PIN_Aj with 20 + Aj ps instead of
+  SITE_NULL, so the router sees that routes into A1/A2 are slower than
+  into A5/A6 (Vivado-timed arc delays per pin).
+
+Without the options the generated chipdb is byte-identical.
+---
+ himbaechel/uarch/xilinx/gen/xilinx_gen.py | 26 ++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/himbaechel/uarch/xilinx/gen/xilinx_gen.py b/himbaechel/uarch/xilinx/gen/xilinx_gen.py
+index 3a718788..da357ad3 100644
+--- a/himbaechel/uarch/xilinx/gen/xilinx_gen.py
++++ b/himbaechel/uarch/xilinx/gen/xilinx_gen.py
+@@ -306,8 +306,8 @@ def import_tiletype(ch: Chip, tile: xilinx_device.Tile):
+                 if len(swn) == 2 and swn[0] in "ABCDEFGH" and swn[1] in "123456":
+                     i = int(swn[1])
+                     for j in range(1, 7):
+-                        if (i == 6) != (j == 6):
+-                            continue # don't allow permutation of input 6
++                        if (i == 6) != (j == 6) and not (LUT_A6_PERM and j == 6):
++                            continue
+                         pip_config = ("ABCDEFGH".index(swn[0]) << 8) | ((j - 1) << 4) | (i - 1)
+                         if s.rel_xy()[0] == 1:
+                             pip_config |= (4 << 8)
+@@ -315,7 +315,7 @@ def import_tiletype(ch: Chip, tile: xilinx_device.Tile):
+                             pip_class=PipClass.LUT_PERMUTATION,
+                             pip_config=pip_config,
+                             site_key=(s.index << 8),
+-                            timing="SITE_NULL"
++                            timing=(f"LUT_PIN_A{j}" if LUT_PIN_DELAY else "SITE_NULL")
+                         )
+                     # Add LUT route-through pseudo-pip
+                     rt_config = ("ABCDEFGH".index(swn[0]) << 8)
+@@ -569,7 +569,15 @@ def import_bram_timings(timing, sdf, is_virtex7=False):
+                 if entry.to_pin == "DOBDOU": import_bus_clkq(bram36, "DOBDO", 32, "CLKARDCLK" if rsdp else "CLKBWRCLK", entry)
+                 if entry.to_pin == "DOPBDOPU": import_bus_clkq(bram36, "DOPBDOP", 4, "CLKARDCLK" if rsdp else "CLKBWRCLK", entry)
+ 
++
++LUT_A6_PERM = False
++
++
++LUT_PIN_DELAY = None
++
++
+ def main():
++    global LUT_A6_PERM, LUT_PIN_DELAY
+     xlbase = path.join(path.dirname(path.realpath(__file__)), "..")
+ 
+     parser = argparse.ArgumentParser()
+@@ -583,7 +591,16 @@ def main():
+     parser.add_argument("--route-timing", help="JSON file with per-wire-class additive pip delays in ps (classes: "
+                         "[name, regex on the pip's destination wire]; pip_add: name -> [fast, slow]), e.g. fitted "
+                         "against Vivado on identical routes; off by default", type=str, default=None)
++    parser.add_argument("--lut-a6-perm", help="also add LUT permutation pips from physical pin A6 to logical inputs "
++                        "1-5 (only for a nextpnr with -o lut-a6-perm); off by default", action="store_true")
++    parser.add_argument("--lut-pin-delay", help="A1,A2,A3,A4,A5,A6: extra ps on every LUT input permutation pip "
++                        "from physical pin Aj; off by default", type=str, default=None)
+     args = parser.parse_args()
++    LUT_A6_PERM = args.lut_a6_perm
++    if args.lut_pin_delay:
++        LUT_PIN_DELAY = [int(x) for x in args.lut_pin_delay.split(",")]
++        if len(LUT_PIN_DELAY) != 6:
++            parser.error("--lut-pin-delay takes six values, A1 to A6")
+     if args.route_timing:
+         with open(args.route_timing) as f:
+             ROUTE_CAL.update(json.load(f))
+@@ -677,6 +694,9 @@ def main():
+                 seen_nodes.add(uid)
+     # Stub timing class
+     ch.timing.set_pip_class("DEFAULT", "SITE_NULL", delay=TimingValue(20))
++    if LUT_PIN_DELAY:
++        for j in range(1, 7):
++            ch.timing.set_pip_class("DEFAULT", f"LUT_PIN_A{j}", delay=TimingValue(20 + LUT_PIN_DELAY[j - 1]))
+     for k, v in sorted(CELL_CAL.get("site_pips", {}).items()):
+         ch.timing.set_pip_class("DEFAULT", k, delay=TimingValue(*v))
+     # Stub bel timings. On virtex7 the LUT comb delay and the FF D/CK->Q

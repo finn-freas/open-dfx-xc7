@@ -1,0 +1,134 @@
+diff --git a/common/place/placer_static.cc b/common/place/placer_static.cc
+index 29d37946..72c8fea2 100644
+--- a/common/place/placer_static.cc
++++ b/common/place/placer_static.cc
+@@ -270,8 +270,78 @@ class StaticPlacer
+     std::vector<int> place_x_to_bel_x, place_y_to_bel_y;
+     std::vector<int> bel_x_to_place_x, bel_y_to_place_y;
+ 
++
++    BelId root_bel_of_pinned_members(CellInfo *root, CellInfo *member)
++    {
++        Loc ml = ctx->getBelLocation(member->bel);
++        Loc off = ctx->getClusterOffset(member);
++        const int rx = ml.x - off.x, ry = ml.y - off.y;
++        const bool root_tile_is_off_the_grid =
++                rx < 0 || ry < 0 || rx >= ctx->getGridDimX() || ry >= ctx->getGridDimY();
++        if (root_tile_is_off_the_grid)
++            return BelId();
++        std::vector<std::pair<CellInfo *, BelId>> placement;
++        for (BelId bel : ctx->getBelsByTile(rx, ry)) {
++            if (!ctx->isValidBelForCellType(root->type, bel))
++                continue;
++            if (!ctx->getClusterPlacement(root->cluster, bel, placement))
++                continue;
++            const bool every_bound_member_stays =
++                    std::all_of(placement.begin(), placement.end(), [](const std::pair<CellInfo *, BelId> &pb) {
++                        return pb.first->bel == BelId() || pb.first->bel == pb.second;
++                    });
++            if (every_bound_member_stays)
++                return bel;
++        }
++        return BelId();
++    }
++
++
++
++
++
++
++    void place_pinned_clusters(const std::vector<CellInfo *> &pinned)
++    {
++        NEXTPNR_NAMESPACE_PREFIX pool<ClusterId> seen;
++        int carried = 0;
++        std::vector<std::pair<CellInfo *, BelId>> placement;
++        for (CellInfo *ci : pinned) {
++            const bool not_in_a_new_cluster = ci->cluster == ClusterId() || seen.count(ci->cluster);
++            if (not_in_a_new_cluster)
++                continue;
++            seen.insert(ci->cluster);
++            CellInfo *root = ctx->getClusterRootCell(ci->cluster);
++            BelId root_bel = root->bel;
++            const bool root_is_free = (root_bel == BelId());
++            if (root_is_free)
++                root_bel = root_bel_of_pinned_members(root, ci);
++            const bool cluster_fits_its_pinned_members =
++                    root_bel != BelId() && ctx->getClusterPlacement(root->cluster, root_bel, placement);
++            if (!cluster_fits_its_pinned_members)
++                log_error("the cluster of '%s' (root '%s') has no placement that keeps '%s' on its bel '%s'\n",
++                          ctx->nameOf(ci), ctx->nameOf(root), ctx->nameOf(ci), ctx->nameOfBel(ci->bel));
++            for (auto &pb : placement) {
++                const bool member_already_has_a_bel = (pb.first->bel != BelId());
++                if (member_already_has_a_bel)
++                    continue;
++                CellInfo *holder = ctx->getBoundBelCell(pb.second);
++                const bool wanted_bel_is_taken = (holder != nullptr);
++                if (wanted_bel_is_taken)
++                    log_error("cluster member '%s' of pinned '%s' needs bel '%s', which '%s' holds\n",
++                              ctx->nameOf(pb.first), ctx->nameOf(ci), ctx->nameOfBel(pb.second),
++                              ctx->nameOf(holder));
++                ctx->bindBel(pb.second, pb.first, STRENGTH_USER);
++                carried++;
++            }
++        }
++        if (carried)
++            log_info("Placed %d cluster member(s) with their pinned cluster.\n", carried);
++    }
++
+     void prepare_cells()
+     {
++        std::vector<CellInfo *> pinned;
+         for (auto &cell : ctx->cells) {
+             CellInfo *ci = cell.second.get();
+             ci->udata = -1;
+@@ -279,11 +349,25 @@ class StaticPlacer
+             if (ci->attrs.count(ctx->id("BEL")) && ci->bel == BelId()) {
+                 std::string loc_name = ci->attrs.at(ctx->id("BEL")).as_string();
+                 BelId bel = ctx->getBelByNameStr(loc_name);
+-                NPNR_ASSERT(ctx->isValidBelForCellType(ci->type, bel));
+-                NPNR_ASSERT(ctx->checkBelAvail(bel));
++                const bool bel_name_is_unknown = (bel == BelId());
++                if (bel_name_is_unknown)
++                    log_error("No Bel named '%s' located for this chip (processing BEL attribute on '%s')\n",
++                              loc_name.c_str(), ctx->nameOf(ci));
++                const bool bel_does_not_take_this_cell_type = !ctx->isValidBelForCellType(ci->type, bel);
++                if (bel_does_not_take_this_cell_type)
++                    log_error("Bel '%s' of type '%s' does not match cell '%s' of type '%s'\n", loc_name.c_str(),
++                              ctx->getBelType(bel).c_str(ctx), ctx->nameOf(ci), ci->type.c_str(ctx));
++                const bool bel_is_taken = !ctx->checkBelAvail(bel);
++                if (bel_is_taken) {
++                    CellInfo *holder = ctx->getBoundBelCell(bel);
++                    log_error("Cell '%s' cannot be bound to bel '%s' since it is already bound to cell '%s'\n",
++                              ctx->nameOf(ci), loc_name.c_str(), holder ? ctx->nameOf(holder) : "?");
++                }
+                 ctx->bindBel(bel, ci, STRENGTH_USER);
++                pinned.push_back(ci);
+             }
+         }
++        place_pinned_clusters(pinned);
+ 
+         // Determine bounding boxes of region constraints in both bel and placer coordinates
+         for (auto &region : ctx->region) {
+@@ -1738,8 +1822,9 @@ class StaticPlacer
+                         if (ctx->checkBelAvail(sz) || (radius > ripup_radius || ctx->rng(20000) < 10)) {
+                             CellInfo *bound = ctx->getBoundBelCell(sz);
+                             if (bound != nullptr) {
+-                                // Only rip up cells without constraints
+-                                if (bound->cluster != ClusterId())
++
++
++                                if (bound->cluster != ClusterId() || bound->belStrength > STRENGTH_STRONG)
+                                     continue;
+                                 ctx->unbindBel(bound->bel);
+                             }
+@@ -1804,6 +1889,10 @@ class StaticPlacer
+                             // Check it satisfies the region constraint if applicable
+                             if (!target.first->testRegion(target.second))
+                                 goto fail;
++
++
++                            if (target.first->bel != BelId())
++                                goto fail;
+                             CellInfo *bound = ctx->getBoundBelCell(target.second);
+                             // Chains cannot overlap; so if we have to ripup a cell make sure it isn't part of a chain
+                             if (bound != nullptr)

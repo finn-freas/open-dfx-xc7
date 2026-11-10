@@ -1,5 +1,51 @@
 # Where to resume (updated 2026-11-06 night, long run)
 
+## RESUMED 2026-11-10 evening (user: "continue where we left off", long run) - start here
+- 7 agents, each keeps its own note current (read these first after an abrupt stop):
+  replication / FF split -> docs/wip/replication.md; Vivado-calibrated delay table -> docs/wip/delay-table.md;
+  packing / legaliser gap decomposition on the exact import (new) -> docs/wip/packing-decomposition.md;
+  synthesis area -> docs/wip/synthesis-area.md; EQY `ofx check equiv` -> docs/wip/equiv.md; Bambu HLS -> docs/wip/hls.md;
+  DFX exact-import table + partition-pin default -> docs/wip/dfx-gaps.md.
+- DECIDED by the user (2026-11-10 evening): carry-DI chipdb patch GOES INTO the release, but only after the replication,
+  delay-table and packing agents have reported (they use the current chipdb as their control); then as its own commit
+  behind the full release regression (draft docs/drafts/nextpnr-carry-di-arcs.patch, worktree build/src/nextpnr-cb2rel).
+  If the delay table and the packing decomposition both come back flat: stop option tuning and tell the user that the
+  remaining gap needs a structural packing / legalisation change.
+- Still waiting on the user: pushes (none since 099c2ee).
+
+## WRAP-UP 2026-11-10 afternoon (user asked to wrap up)
+- Committed today (local only, nothing pushed): e4a5125 release placer stack 0033-0039 + placer_tuning default;
+  503e8b9 `seeds` + `ofx hls`; 9d6e660 placement experiments/drafts/xdc tests; 5ffdd16 RESUME; 0638c76 seeds = "auto" default
+  (seed 1 alone, seeds 2-3 only if it misses timing or fails; regression ofx stage PASS).
+- Uncommitted on purpose: docs/wip/user-assumptions.md, docs/wip/guess-requests.md (user's assumed values; repo goes public),
+  examples/dbg_ila/build_run.log. Plus each agent's WIP below (review, then commit).
+- Placement levers queued, in order (background reading is kept local and gitignored, never published): 1 Vivado-calibrated segment-aware
+  (dx,dy) delay table, 2 per-arc adaptive-exponent timing weights, 3 replication, 4 carry macros absorbing peripheral LUT/FF,
+  5 critical-path DP detailed placement. Caution: Vivado's own phys_opt declined to replicate rv_mul's pcpi_rs2 nets.
+- STOPPED HARD (user: "stop everything right now"): all 5 agents killed mid-work, every nextpnr/yosys/Vivado/bench
+  loop killed, Vivado locks removed. Nothing running. C: 119 GB free. The agents did NOT get to write their notes;
+  their state is only what is on disk:
+  - Replication for rv_mul: builds build/nextpnr-build/split, split2 (source: build/src/nextpnr-afo, uncommitted edits),
+    bench variants cb2_splc_dq / cb2_splcr_dq in flow/place_bench.py, probes in build/split_probe/. No result recorded;
+    check whether vivado/build_rte.tcl *_po (Vivado phys_opt replication oracle) was run on cb_all2 rv_mul first.
+  - Calibrated delay model: worktree build/src/nextpnr-dtab, build build/nextpnr-build/dtab, data in build/dtab/.
+    No result recorded.
+  - Synthesis area: flow/synth_area.py, tools/mt_lut/mt_lut.cpp (mockturtle LUT tool), build/mt_lut/, Vivado runs in
+    build/qor/synarea/. docs/wip/synthesis-area.md was not written yet.
+  - EQY equivalence: flow/equiv.py, flow/equiv_bench.py, flow/bit2netlist.sh (modified), ofx/cli.py (+47 lines, an
+    equiv command), build/equiv/. No docs yet; was working on constant-pin handling after reconcile.
+  - Bambu: BUILT OK (toolchain/bambu/install/bin/bambu, 2026-11-10 10:48). docs/hls.md, ofx/hls.py, flow/hls_compare.py,
+    install/bambu.sh (example submodules + a clang-19 workaround) modified; agent was updating docs/hls.md's install
+    section. Vitis-vs-Bambu comparison status: see docs/hls.md "Bambu vs Vitis HLS".
+  - Next session: review each of these diffs, rerun the agent briefs from where they stopped, commit what passes.
+- Waiting on the user: carry-DI patch into the release (changes every chipdb sha, needs full regression); pushes (none today).
+- Hardware: no 7-series board yet; the biggest unproven area is on-silicon DFX / bitstreams (docs/hardware-test-plan.md, Arty A7-35T).
+
+## Earlier 2026-11-10 (morning)
+- Not adopted: timing weight sweep, twrepl / twcdirepl (rv_soc to 81 % of Vivado but rv_mul loses), fanout-aware arc delay (afo), sa-refine chain overlap, chain-aware global placement / legalisation (item 0b below).
+- Experimental code only in worktrees build/src/nextpnr-afo (uncommitted: arc-fanout, fo, chainovl, chain-* options) and build/src/nextpnr-cb2rel (a4b08d86 carry-DI arcs, patch in docs/drafts/nextpnr-carry-di-arcs.patch).
+- Friendbot (separate repo, for reference): ~/friendbot main e60c1e0 (link version 4 "run" mode, ~5 s replies, in flash); pushed by user request to github finn-freas/roastbot-fpga 95d1e2d. One uncommitted edit left: ~/friendbot/scripts/fast_upload.sh.
+
 ## Goal and priorities (user)
 - An open-source Vivado for the 7-series. **Artix-7 first**; the other families come after Artix is finished.
 - The goal is whole builds on par with Vivado or better: Fmax, area, power, build time and routability, weighted about equally.
@@ -191,3 +237,130 @@ All agents were told to commit and stop. Each workstream's exact state is in doc
 - The writer from our placement+routing to a DCP sets all 34875 PIPs on rv_mul offline, including the RAM32M macros behind most of the 294 import errors. Whether Vivado opens it fully routed is untested: run vivado/rw_check.tcl first.
 - The Vivado DCP -> nextpnr replay path is written but untested (vivado/rw_vref.tcl for rv_soc).
 - RapidWright cannot route 7-series.
+
+## FINAL STOP 2026-11-07 (~87-88 % usage; the machine slept 11:10-18:30)
+Morning session results (all opt-in, no-op verified, committed):
+- **Vivado lock fixed** (826eb38): vivado/vivado_slot.sh creates the lock dirs through Windows `cmd mkdir`, which is atomic. A `vivado.lock` dir may be left over from before the sleep; check that no vivado.exe is running, then rmdir it.
+- **Published:** GitHub master = dbf3e37 (from e8232b7). The publish_strip proof (c) false positive is fixed (e8232b7).
+- **Global placer diagnosis (aea2a3c, flow/place_diag.py):**
+  - Vivado builds around the fixed ICAP/RAMs in a flat, wide shape: sd_y 5.5 vs our 16.9. Our top-100 paths take 65.7 hops vs 20.0.
+  - The y-weighted wirelength failed.
+  - The anchored start `--placer-static-anchor-init 20 --placer-static-ip-wait 0.5` gives Vivado's shape on rv_soc. Vivado timer, 3 seeds, rcal chipdb: rv_soc 119.22 (+2.1 % vs stub base 116.81), bram 151.44, rv_big 101.41. That is +1.4..+8.1 % against the same chipdb without anchoring.
+  - **Next:**
+    1. Vivado-time the stub-chipdb anchored placements (sources `{rv_soc,bram}_p5_pl11_anc20ipw_stub_s{1,2,3}_placed`; nextpnr timer looks slightly positive on rv_soc).
+    2. Target-density spreading.
+    3. Combine with carry-di-bypass.
+    4. Optionally try DREAMPlaceFPGA as an external placer for about 1 week.
+- **Router Finding 16:** Vivado's timer over 3 seeds shows no confirmed gain from critSeedDelay+critRipupIters (small, design-dependent). The options stay off.
+- **QoR scoreboard:** PARTIAL, Vivado done on 11 of 21 (c774b9c); placed mode in progress.
+- 18 uncommitted paths remain in the work tree (other agents' scratch). Check `git status` before trusting them.
+- **Packing that follows the global placement (d7f70a3, Finding 15 round 2):** cluster-aware detailed placement (dp4) cuts slices further (rv_soc 462 -> 440, Vivado 398), but Vivado-timed Fmax moves -5 / -4 / +3 %, inside the seed spread. Conclusion: the remaining gap is global placement plus the delay model, not slice composition. The dp2dp seeds 2-3 Vivado runs are pending (build/qor/dpl/xsrc).
+- **Router final (6f0d60f):** Vivado timer, 3 seeds: critSeedDelay+critRipupIters average +1.9 % (rv_soc 0.0, rv_mul +4.0, rv_big +0.5, bram +3.1 %). Small, design-dependent, stays opt-in. The rv_soc critRipupIters=3 run was cut off; rerun it.
+
+## Router + packing session 2026-11-08 (router/dpl agent)
+- **Router share is ~5 %, not 15-20 %** (Finding 16, Vivado timer, exact placement via xroute, 3 seeds x 4 designs): Vivado routing the identical placement is +4.9 % on average (rv_soc +3.7, rv_mul +5.4, rv_big +4.7, bram +5.7 %). The 15-20 % came from place_xtime imports with the qor_xtime cell-miss bug (fixed efcb64f).
+- Per-arc tool (vivado/build_rte.tcl RTE_ROUTE_DUMP=1, flow/rte_dump_vivado.sh, flow/route_arcs.py): LUT route-throughs (free in the chipdb) carry most of nextpnr's excess delay on the CPUs' critical arcs; Vivado uses none. Draft `-o no-lut-routethru` (nextpnr-router-timing.patch, opt-in, no-op on 4 designs): +2.0/+1.8/+2.4/-1.0 % (rv_soc/rv_mul/rv_big/bram, 3 seeds), router2 faster. Not a default yet.
+- rv_soc critRipupIters=3 s1 finished: identical routes to the base (keep-best), 101.40 MHz.
+- **carry-di-bypass**: re-timed with the fixed export, +1.7 % mean Fmax, slices -6..-16 %, no-op on a carry-free design (fir), rv_soc decode+sim 3/3 seeds. Proposed as default (Finding 15 round 3); eth re-timed: 0.0 %, slices -2 %. dp2dp re-timed: no gain over dp1.
+- Vivado slot rules now: slot 2 = global placer only; my runners take slot 1 only.
+- **Evening 2026-11-08 (router/dpl agent):** (1) flow/exact_src.py = exact placement import for Vivado (the dpl/place "placed" mode is 7-21 % optimistic: it drops nextpnr's feed-through LUTs/split carries, leaves LUT-RAMs and LUT pins to Vivado). (2) With it, carry-di-bypass is -1.0 % mean Fmax, so the ofx default went back to off (822fe36); patch 0031 stays opt-in; release patch 0032 (fixes agent) committed, TREE 591d1144. (3) Router share excluded LUT pin choice: with free pins Vivado routing is +17 % on rv_soc s1. LUT-pin drafts (docs/drafts/nextpnr-lut-a6-perm*.patch, chipdb variants build/chipdb-rcal-a6{,pd}): s1 exact-import Vivado gains lpA +3.0 %, lpB +5.5 %, lpAB +6.1 % mean on 4 designs; s2/s3 and `-o lut6-first` (lpX/lpXAB) queued (build/exact/lpa_viv2.sh, lpx_viv.sh). See docs/wip/router.md.
+
+## WIND-DOWN 2026-11-08 ~22:30 (session 2 of the placement push)
+Every agent finished its in-flight runs, committed docs/wip/*.md with resume commands, and stopped. Nothing pushed today after dbf3e37.
+
+**Measurement:** use ONLY flow/exact_src.py (the exact import: Vivado only routes our implementation). It is validated: Vivado's own placement re-imported gives -1.713 vs -1.720 ns. Placed mode was 7-21 % optimistic, and Findings 15-17 placed-mode rows are superseded.
+**Vivado reference** (same netlists, Vivado places itself: place_design + route_design, no opt/phys_opt): rv_soc 136.0
+incl. ICAPE2 / **148.8 excl. ICAPE2** (the like-for-like number: our Fmax figures exclude ICAPE2), bram 164.1,
+rv_big 110.9 MHz. cb_all2 6-seed means against it: rv_soc 116.2 (78 %), bram 147.6 (90 %), rv_big 98.0 (88 %).
+Earlier "83 % of Vivado" for rv_soc used the incl.-ICAPE2 reference. rv_mul and syn2-netlist references: vref_add.sh.
+
+**Results (Vivado timer, exact import):**
+- Combined stack `cb_all` (tu10 + SA v4 + LUT pins + lut6-first) vs `cb_off`, 3 seeds:
+  - rv_soc 107.1 -> 112.8 (+5.3 %, 83 % of Vivado);
+  - bram 142.3 -> 147.6 (+3.7 %, 90 %);
+  - rv_big 92.4 -> 94.1 (+1.8 %, 85 %);
+  - rv_mul +4.1 % (2 seeds).
+  - Commit 672ea50, docs/wip/placement-global.md "FINAL STATE".
+- 2026-11-09: new best stack `cb_all2` = cb_all + `-o static-delay=816,40,40,18,18` (the user's alpha 816 ps with the
+  measured y/x slopes): +2.6 % mean over 6 seeds x 4 designs (rv_soc +3.0, bram -0.1, rv_big +3.0, rv_mul +4.5).
+  Equal LUT pin costs contradicted (-3.9 %); target util 0.75, 400 ps crit window, y-weighted HPWL neutral.
+  docs/wip/user-assumptions.md. LUT-pin s1-s3 complete: lpXAB +7.7 %, 12/12 runs (docs/wip/router.md).
+- 2026-11-09 evening: **cb_all2 promoted into the release (uncommitted working tree).** nextpnr patches 0033-0038
+  (four combo layers + chipdb generator `--route-timing`, `--lut-a6-perm`/`--lut-pin-delay`), TREE 9488cf16, install.sh
+  builds `share/nextpnr/himbaechel/xilinx/tuned/chipdb-<dev>.bin` (sha b913385a for xc7a50t), ofx/defaults.py key
+  `placer_tuning` (default on, xc7a35t-1 only, static placer only, graceful off for old installs). Checks: key off =
+  12/12 frames identical to rel04 (release prjxray-db); ofx default rv_soc frames identical to place_bench cb_all2;
+  decode + firmware 11/11; blinky builds. Scratch build/promote_cb2/, test install ~/ofx-test/prefix-cb2.
+  Caveats: install/gen_patch_series.sh is stale (lists 0001-0028 only; running it would delete 0029-0038); full
+  release_regress.sh not run; the bench's rv_soc .frames are 0 bytes (nightly prjxray-db lacks ICAP.IN_USE), so
+  rv_soc no-op checks must compare FASM or use the release prjxray-db.
+- 2026-11-09 evening: **static placer + partition pins fixed** (docs/drafts/nextpnr-static-preplaced.patch + .md,
+  worktree build/src/nextpnr-dfxfix, binary build/nextpnr-build/dfxfix, evidence build/dfxfix/). Cause: carry clusters
+  pinned only in part by `-o preplaced` (free root -> pinned members bound twice; pinned root -> unpinned DI
+  feed-through LUTs never placed). Flat no-op: FASM identical to cb_all2 on rv_soc + bram s1-3 (rechecked). rv_ppt
+  partpin flow at s1-3 with pp3pl_tu and with cb_all2: every build completes, STATIC IDENTICAL / partpin_check pass,
+  native_check 30/0, region2v SIM-PASS. `git apply --check` clean on the release tree (cb2rel).
+  **Next:** add it as release patch 0039 after the running release_regress (build/promote_cb2/regress.log) finishes,
+  rebuild the test install, rerun the regression. Open: HeAP also moves the pinned members of a free-root chain
+  (place_constraints; same root-bel rule would fix it); sa-refine stays off under -o preplaced (its replay gate).
+  2026-11-10 ~00:00: added as install/patches/nextpnr/0039 (TREE 114b9705); test install rebuild + full regression:
+  build/promote_cb2/add_0039.log, regress_0039.log. **All 9 stages PASS** (revalidate first failed on rv_ppa only
+  because the crash left 0-byte outputs that the skip logic reused; after removing that dir: PASS,
+  regress_0039_reval.log). Release tree 0001-0039 + ofx placer_tuning default is ready to commit (not committed).
+- 2026-11-09 23:16: **WSL crashed on a full C: drive** (ext4.vhdx 307 GB; the Bambu AppImage unpack tipped it).
+  Cleaned (user-approved): old ~/ofx-test installs, ~/.cache uv/pip/huggingface, toolchain/dreamplacefpga, ~/ofx-rel01,
+  ~/deployed-cnn-fpga; build/qor/oxc7 *.frames/*.bit/check *.db + routed JSON of variants older than 2026-11-08;
+  *.bit and pre-11-08 *_routed.json in other build/ experiment dirs (not build/patched, build/openxc7); *.o of
+  nextpnr builds older than 2026-11-08 (binaries kept). vhdx compacted to 182 GB, C: 150 GB free. After the restart
+  \\wsl.localhost is broken on the Windows side (\\wsl$ works): Windows exes from a Linux cwd fail "Invalid argument";
+  vivado/vivado_slot.sh now runs them from /mnt/c. dpl_check.sh's default DB prefix (~/ofx-test/prefix) is gone: pass
+  DB=~/ofx-test/prefix-cb2/share/nextpnr/external/prjxray-db/artix7. Agents stop if C: < 40 GB free.
+- 2026-11-10: **driver replication pass** (docs/drafts/nextpnr-replicate.patch + .md; worktree build/src/nextpnr-repl,
+  binary build/nextpnr-build/repl; place_bench variants cb2_repl / cb2_repl_dq). No-op FASM identical; rv_soc
+  decode + firmware 11/11 (s1, s3); copies 10-31 per design (bram 0). nextpnr timer ~flat; Vivado timing running
+  (build/exact/repl_viv.log). Motivation: Vivado replication on our placements +7.9 % rv_soc (docs/wip/gap-analysis.md).
+  dpl_check cannot decode DSP tiles (KeyError DSP_L): rv_mul/rv_big have no functional check that way.
+- 2026-11-10: replication v2 (critical-cell, cc=1) rv_soc +5.1 % (3/3 seeds) but mean +0.2; carry-DI arcs in the
+  chipdb (build/chipdb-rcal-a6pd-cdi) QoR-neutral, a correctness fix; global-placer timing weight sweep
+  (tw10/tw20/ce1/tw20ce4) mean -2.2..+0.3, none adopted. All three help rv_soc and hurt rv_mul: a stronger timing
+  pull stretches high-fanout critical arcs on rv_mul (dy 3 -> 10-14 rows) and the placer's estimate cannot see it
+  (est. vs Vivado -8.6 % -> -16..-20 %). Details + tables: docs/wip/gap-analysis.md.
+  Later the same night, all with the same split (none adopted): tw20ce4 + replication +1.2 % mean (rv_soc +6.7,
+  rv_mul -4.0), + carry-DI chipdb +1.4 % (rv_soc +7.8 = 81 % of Vivado); fanout-aware arc delay (-o arc-fanout,
+  worktree nextpnr-afo) K 100 +-0.0 %, K 200 -3.9 %; sa-refine chain-move effort / overlapping chain shifts
+  (chainovl): no more chain moves accepted. rv_mul's losing paths all zig-zag between two carry chains whose
+  relative position global placement fixes: chain-aware global placement / legalisation is the next real lever.
+- 2026-11-10: **`seeds = N`** (ofx.toml; flow/build_openxc7.py --seeds): N seeds in parallel, keep the best routed
+  Fmax. Best of 3 = +2.8 % mean Vivado-timed Fmax (all 4 designs up), best of 4 +3.7 %. Tested on axi_xbar (frames
+  identical to a plain build of the kept seed); release_regress.sh ofx stage builds blinky with seeds = 2 (PASS,
+  regress_seeds_ofx.log). Default 1 (user: default 3?).
+  The draft generator fix for carry DI arcs is docs/drafts/nextpnr-carry-di-arcs.patch (release worktree
+  build/src/nextpnr-cb2rel a4b08d86, not yet in install/patches: needs chipdb shas + full regression).
+- LUT pins (packing agent, 84c601e), seed 1, A6 + per-pin delay + lut6-first ("full"): rv_soc +17.3 %, rv_mul +12.1 %, rv_big +11.0 %, bram +3.4 %. Seed 2: rv_soc +14.1 %. Seed 3 is pending. lut6-first=2 gives rv_soc +17.2 % and rv_mul +18.6 % (s1 only). The drafts need rebasing onto 0032; the A6 chipdb needs the patched binary.
+- SA refine sa_v4 (`site=750:tile=850`) vs tu: rv_soc +6.0 %, rv_big +5.1 % (3/3 seeds each); bram s1 +0.9 %. Commits f59e01f, ddd2d29.
+- Synthesis preset x1_cal_syn2 (216f796): rv_soc +17.3 %, rv_mul +12.4 %, rv_big flat, bram lower. Mixed on the QoR suite, so NOT a default. Idea: apply it only when LUT depth bounds the critical path. All 4 netlists verified (bram seq-equiv proven).
+- carry-di-bypass: -1.0 % mean on the exact import, so its default is back to OFF (patch 0031 stays opt-in).
+- Router share with free LUT pins is about +17 % on rv_soc. The LUT-input policy is the router-side lever.
+- VPR (removed from disk) and DREAMPlaceFPGA (installed in toolchain/dreamplacefpga, no gain) are both dropped as placers. DREAMPlace showed that our LEGALISER loses its 21-30 % better global placement. Ring legaliser draft `nextpnr-legal-ring`: nextpnr-side only so far.
+- Vivado-strategy rules: docs/vivado-placement-strategy.md (8df8702).
+- DFX phase 17 (1e4c98a): greybox in anchors mode, multi-partition child runs, timed ICAP, USE_MULT bits. Partition pins disagree on Vivado's timer. The new placer options crash the partpin flow (reproducers in phase17 §3).
+- Release fixes: rel03 prefix (all 21 suite designs build in the open flow, incl. fir/raygentop/diffeq2); patch 0032 SLICEM legality fix; TREE 591d1144.
+- QoR scoreboard (33d92cc): PARTIAL; Fmax still on nextpnr's timer, so verdicts are too high. Run placedx (exact) first.
+
+**Next session, in order:**
+0. User decisions: commit the release tree 0001-0039 + placer_tuning + seeds; `seeds` default 1 or 3; carry-DI
+   generator patch (docs/drafts/nextpnr-carry-di-arcs.patch) into the release (changes every chipdb sha).
+0b. DONE 2026-11-10, not adopted: chain-aware global placement / legalisation (opt-in `chain-legal`, `chain-net-w`, `chain-snap`, `chain-rigid`, `chain-log` in worktree nextpnr-afo) all neutral, all lose rv_mul. Chains already stay rigid and close; the long hops are fanout-28 pcpi_rs1/rs2 FF -> first chain and second chain -> LUT3/LUT4/FF. Next lever: critical-cell replication of pcpi operand FFs (phys_opt-style), see gap-analysis "Carry chains in global placement".
+1. LUT-pin rebase onto 0032 (s1-s3 done 2026-11-09); carry cb_all2 static-delay into the release defaults with it.
+2. cb_all_syn2 exact (sources ready).
+3. Ring legaliser exact + merge.
+4. QoR scoreboard placedx.
+5. DFX vs Vivado per-RM comparison (validation queue 1).
+6. Remaining validation queues 2-9.
+**Infrastructure:**
+- 3 Vivado slots (vivado/vivado_slot.sh; slot 1 also needs >= 1.5 GB free).
+- Memory: WSL page cache starves Windows; a drop_caches watcher helps. Consider lowering .wslconfig memory=12GB to about 9GB (user to decide).
+**Leftover runners at wind-down (the user may stop them):**
+- DFX queues build/dfxgaps/job_exact{p,q2,q3}.sh (the classifier refused the agent's kill);
+- old-import qor quick variants (pdens/p16base, superseded);
+- job_reg3.sh (nextpnr finishing).

@@ -1,0 +1,55 @@
+diff --git a/dreamplacefpga/PlaceDB.py b/dreamplacefpga/PlaceDB.py
+index f26d103..7e75b84 100644
+--- a/dreamplacefpga/PlaceDB.py
++++ b/dreamplacefpga/PlaceDB.py
+@@ -348,7 +348,11 @@ class PlaceDBFPGA (object):
+         if "io_pl" in params.__dict__ and params.io_pl:
+             self.read_pl(params, params.io_pl)
+ 
+-        self.loc2site_map = self.create_loc2site_map(params)
++        try:
++            self.loc2site_map = self.create_loc2site_map(params)
++        except (IndexError, KeyError) as e:
++            logging.warning("loc2site_map not built (non-UltraScale site map): %s" % e)
++            self.loc2site_map = {}
+ 
+     def create_loc2site_map(self, params):
+         """
+diff --git a/dreamplacefpga/ops/CMakeLists.txt b/dreamplacefpga/ops/CMakeLists.txt
+index f39bd1b..5035732 100644
+--- a/dreamplacefpga/ops/CMakeLists.txt
++++ b/dreamplacefpga/ops/CMakeLists.txt
+@@ -11,6 +11,7 @@ add_subdirectory(hpwl)
+ add_subdirectory(move_boundary)
+ add_subdirectory(weighted_average_wirelength)
+ add_subdirectory(timing_net_wirelength)
++add_subdirectory(timing)
+ #add_subdirectory(rmst_wl)
+ add_subdirectory(place_io)
+ add_subdirectory(precondWL)
+diff --git a/dreamplacefpga/ops/timing/CMakeLists.txt b/dreamplacefpga/ops/timing/CMakeLists.txt
+new file mode 100644
+index 0000000..69a79f8
+--- /dev/null
++++ b/dreamplacefpga/ops/timing/CMakeLists.txt
+@@ -0,0 +1,8 @@
++set(OP_NAME timing)
++set(TARGET_NAME ${OP_NAME})
++set(INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/..)
++set(LINK_LIBS utility_cxx OpenMP::OpenMP_CXX)
++add_pytorch_extension(timer_cpp src/timer.cpp EXTRA_INCLUDE_DIRS ${INCLUDE_DIRS} EXTRA_LINK_LIBRARIES ${LINK_LIBS})
++install(TARGETS timer_cpp DESTINATION dreamplacefpga/ops/${OP_NAME})
++file(GLOB INSTALL_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.py)
++install(FILES ${INSTALL_SRCS} DESTINATION dreamplacefpga/ops/${OP_NAME})
+diff --git a/dreamplacefpga/ops/timing/timing_graph.py b/dreamplacefpga/ops/timing/timing_graph.py
+index 7c17c25..95b8571 100644
+--- a/dreamplacefpga/ops/timing/timing_graph.py
++++ b/dreamplacefpga/ops/timing/timing_graph.py
+@@ -650,6 +650,7 @@ class TimingGraph():
+         flat_vertex2succ_start = [0]
+         vertex_logic_delays = [0]*self.num_vertices
+         self.vertex_levelization()
++        self.max_level = max(self.max_level, max(self.tgraph.vs[i]['obj'].topo_level for i in range(self.num_vertices+2)) - 1)
+         levelized_vertices_unique = {l :[] for l in range(self.max_level+2)}
+         is_high_fanout = [0]*self.num_vertices
+         ## traverse based on the order of vertex list including super source and sink

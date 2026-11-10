@@ -1,9 +1,12 @@
 import argparse
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -19,6 +22,9 @@ CONFIG = {
     "dry_run": True,
     "nextpnr": None,
     "chipdb": None,
+    "seed_jobs": int(os.environ.get("OFX_SEED_JOBS") or 4),
+    "fmax_re": r"Max frequency for clock '([^']+)': ([\d.]+) MHz \((?:PASS|FAIL) at ([\d.]+) MHz\)",
+    "drop": (".fasm", "_routed.json", "delay_matrix.txt"),
 }
 
 ROOT = CONFIG["root"]
@@ -49,6 +55,99 @@ def stage(name, out, cmd, log, dry):
         sys.exit(f"{name} failed, see {log}")
 
 
+def seed_score(log):
+    """Worst routed Fmax / target over the clocks (last report per clock), or None without a timing report."""
+    try:
+        text = Path(log).read_text(errors="ignore")
+    except OSError:
+        return None, {}
+    clocks = {c: (float(f), float(t)) for c, f, t in re.findall(CONFIG["fmax_re"], text)}
+    if not clocks:
+        return None, {}
+    return min(f / t for f, t in clocks.values()), {c: f for c, (f, _) in clocks.items()}
+
+
+def best_of_seeds(a, npnr, js, xdc, top, out, extra, dm_key, dry):
+    """Place and route seeds a.seed .. a.seed+a.seeds-1 in parallel (out/seeds/s<N>), keep the one with the best
+    worst-clock routed Fmax / target, and copy its nextpnr outputs into out. Measured on the exact placement import
+    (Vivado routes our placement): best of 3 +2.8 % mean Fmax over rv_soc/bram/rv_big/rv_mul, best of 4 +3.7 %.
+    With a.seeds_auto, a.seed runs alone first and the other seeds only run when it misses timing or fails."""
+    seeds = list(range(a.seed, a.seed + a.seeds))
+    batches = [seeds[:1], seeds[1:]] if a.seeds_auto else [seeds]
+    names = (f"{top}_routed.json", f"{top}.fasm", "report.json", "nextpnr.log")
+
+    def one(s):
+        d = out / "seeds" / f"s{s}"
+        d.mkdir(parents=True, exist_ok=True)
+        ex = list(extra)
+        dm = dm_cache.prepare(dm_key, d)
+        if dm:
+            ex += ["-o", f"delay-matrix={dm}"]
+        cmd = [npnr, "--device", a.part, "--json", str(js), "-o", f"xdc={xdc}", "--seed", str(s), "--freq", str(a.freq),
+               "--write", str(d / names[0]), "-o", f"fasm={d / names[1]}", "--report", str(d / names[2])] + ex
+        if dry:
+            print(f"[dry] nextpnr seed {s}: {' '.join(cmd)}")
+            return s, False, None, {}, None
+        with open(d / names[3], "w") as f:
+            rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
+        done = rc == 0 and (d / names[1]).exists()
+        if done:
+            dm_cache.publish(dm_key, d)
+        return s, done, *seed_score(d / names[3]), rc
+
+    def show(r):
+        s, done, score, clk, rc = r
+        txt = ", ".join(f"{c} {f:.2f} MHz" for c, f in clk.items()) or "no clock report"
+        if not done:
+            txt = f"failed (rc {rc}" + ("; misses timing: " + txt if score is not None and score < 1.0 else "") + ")"
+        return txt
+
+    def record(best):
+        (out / "seeds.json").write_text(json.dumps({"kept": best, "auto": bool(a.seeds_auto), "max": a.seeds, "runs": [
+            {"seed": s, "ok": done, "score": score, "fmax_mhz": clk or None, "rc": rc}
+            for s, done, score, clk, rc in res]}, indent=1) + "\n")
+
+    how = "the others only if it misses timing" if a.seeds_auto else "keeping the best routed Fmax"
+    print(f"[{'dry' if dry else 'run'}] nextpnr: seeds {seeds[0]}..{seeds[-1]}, {how}")
+    t0 = time.time()
+    res = []
+    for i, batch in enumerate(batches):
+        if not batch:
+            break
+        if i:
+            if dry:
+                print(f"[dry] seeds {batch[0]}..{batch[-1]} only if seed {seeds[0]} misses timing or fails")
+                break
+            _, done, score, _, _ = res[0]
+            if done and (score is None or score >= 1.0):
+                break
+            why = f"misses timing ({score:.3f} of the target)" if score is not None and score < 1.0 else "failed"
+            print(f"        seed {seeds[0]} {why}, trying seeds {batch[0]}..{batch[-1]}")
+        with ThreadPoolExecutor(max_workers=max(1, min(CONFIG["seed_jobs"], len(batch)))) as ex:
+            res += list(ex.map(one, batch))
+    if dry:
+        return
+    ok = [r for r in res if r[1]]
+    if not ok:
+        for r in res:
+            print(f"        seed {r[0]}: {show(r)}")
+        record(None)
+        sys.exit(f"nextpnr failed for every seed, see {out / 'seeds'}/s*/nextpnr.log and {out / 'seeds.json'}")
+    best = max(ok, key=lambda r: (r[2] if r[2] is not None else float("-inf"), -r[0]))[0]
+    for r in res:
+        print(f"        seed {r[0]}: {show(r)}" + ("  <- kept" if r[0] == best else ""))
+    src = out / "seeds" / f"s{best}"
+    for n in names:
+        shutil.copyfile(src / n, out / n)
+    for s, *_ in res:
+        if s != best:
+            for p in (out / "seeds" / f"s{s}").iterdir():
+                if p.name.endswith(CONFIG["drop"]):
+                    p.unlink()
+    record(best)
+    print(f"        {time.time() - t0:.1f}s, kept seed {best}")
+
+
 def versions():
     info = json.loads((ROOT / "toolchain" / "openxc7-BUILD-INFO.json").read_text())
     ys = subprocess.run([tool("yosys"), "-V"], capture_output=True, text=True).stdout.strip()
@@ -73,6 +172,10 @@ def main():
                                      "other than the configured one)")
     ap.add_argument("--freq", default=CONFIG["freq_mhz"], help="nextpnr --freq target in MHz")
     ap.add_argument("--seed", type=int, default=CONFIG["seed"])
+    ap.add_argument("--seeds", type=int, default=1, help="place and route this many seeds (--seed upwards) in "
+                    "parallel and keep the one with the best routed Fmax")
+    ap.add_argument("--seeds-auto", action="store_true", help="with --seeds N: run --seed alone first, and the "
+                    "other N-1 seeds only if it misses timing (or fails)")
     ap.add_argument("--rtl", nargs="+", help="source files relative to the design dir (default: all .v/.sv)")
     ap.add_argument("--name", help="build name (default: <part>_s<seed>)")
     ap.add_argument("--opt", action="append", default=[], help="extra nextpnr -o option, e.g. preplaced=FILE")
@@ -124,6 +227,7 @@ def main():
     if a.stop_after == "yosys":
         return
     dm_key = None
+    base_extra = extra
     if not dry and not fasm.exists():
         try:
             dm_key = dm_cache.key(npnr, a.part, device.resolve(a.part)["fabric"], extra, a.chipdb)
@@ -132,6 +236,10 @@ def main():
         dm_file = dm_cache.prepare(dm_key, out)
         if dm_file:
             extra = extra + ["-o", f"delay-matrix={dm_file}"]
+    if a.seeds > 1 and not fasm.exists():
+        best_of_seeds(a, npnr, js, xdc, top, out, base_extra, dm_key, dry)
+        if dry:
+            return
     stage("nextpnr", fasm, [npnr, "--device", a.part, "--json", str(js), "-o", f"xdc={xdc}",
                             "--seed", str(a.seed), "--freq", str(a.freq),
                             "--write", str(rjs), "-o", f"fasm={fasm}", "--report", str(out / "report.json")] + extra,

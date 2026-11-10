@@ -23,7 +23,7 @@ TMG = ["-o", "hardblock-timing", "--placer", "static"]
 
 CONFIG = {
     "out": ROOT / "build" / "qor" / "dpl",
-    "vivado_tag": "dpl_xtime",
+    "vivado_tag": "dpl_xtime2",
     "vivado_chunk_minutes": 18,
     "vivado_minutes": {"eth": 9, "default": 2.5},
     "binaries": {
@@ -39,6 +39,7 @@ CONFIG = {
         "dp2cb": {"bin": "dpl2", "args": TMG + ["-o", "carry-di-bypass"], "cal": True, "rcal": True},
         "dp2dp": {"bin": "dpl2", "args": TMG + ["-o", "carry-di-bypass", "-o", "dpl"], "cal": True, "rcal": True},
         "dp3": {"bin": "dpl2", "args": TMG + ["-o", "carry-di-bypass", "-o", "dpl=2,2,0,1"], "cal": True, "rcal": True},
+        "dp4": {"bin": "dpl2", "args": TMG + ["-o", "carry-di-bypass", "-o", "dpl=2,2,0,1,1"], "cal": True, "rcal": True},
         "dp2w": {"bin": "dpl2", "args": TMG + ["-o", "carry-di-bypass", "-o", "dpl=3,4,0.5,3"], "cal": True, "rcal": True},
     },
 }

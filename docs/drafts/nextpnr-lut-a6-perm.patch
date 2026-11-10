@@ -1,0 +1,155 @@
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 49201d4e..7ebcbc44 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -82,6 +82,11 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("hold-fix", po::value<std::string>()->implicit_value(""),
+                            "after routing, fix hold-time (min-delay) violations: small deficits by a routing "
+                            "detour, larger ones by a feedthrough LUT; optional value sets the max passes (default 8)");
++    specific.add_options()("lut6-first", po::value<std::string>()->implicit_value(""), "after placement, move a LUT alone on a 5LUT to its 6LUT and a flip-flop alone on "
++                           "an x5FF to its xFF where the tile stays legal (their outputs then avoid the slower xMUX pin); '2' also moves the 5LUT "
++                           "of a LUT pair to an empty letter of its slice half");
++    specific.add_options()("lut-a6-perm", "with a chipdb that has the A6 LUT permutation pips: let the router put "
++                           "an input of a LUT that sits alone on the 6LUT on the A6 pin (off: those pips are unused)");
+     specific.add_options()("carry-di-bypass", po::value<std::string>()->implicit_value(""),
+                            "feed a carry DI that no LUT of its own position drives through the slice X pin "
+                            "(AX..DX), as Vivado does, instead of a feed-through LUT; the S LUT may then be a LUT6");
+@@ -592,6 +597,26 @@ if (cell.second->type.in(id_BUFR, id_BUFR_BUFR)) {
+                 return true;
+         }
+     } else if (pip_type == PIP_LUT_PERMUTATION) {
++        const bool a6_for_another_input = ((extra_data.pip_config >> 4) & 0xF) == 5 && (extra_data.pip_config & 0xF) != 5;
++        if (a6_for_another_input) {
++
++
++            if (!lut_a6_perm)
++                return true;
++            const auto &a6_lts = tile_status[pip.tile].lts;
++            if (!a6_lts)
++                return true;
++            int a6_eight = (extra_data.pip_config >> 8) & 0xF;
++            if (a6_lts->cells[(a6_eight << 4) | BEL_5LUT] != nullptr)
++                return true;
++            const CellInfo *a6_lut = a6_lts->cells[(a6_eight << 4) | BEL_6LUT];
++            if (a6_lut == nullptr || a6_lut->getPort(id_A6) != nullptr)
++                return true;
++            auto a6_tags = get_tags(a6_lut);
++            if (a6_tags && (a6_tags->lut.is_memory || a6_tags->lut.is_srl))
++                return true;
++            return false;
++        }
+         const auto &lts = tile_status[pip.tile].lts;
+         if (!lts)
+             return false;
+@@ -1163,10 +1188,89 @@ void XilinxImpl::postPlace()
+         log_info("timing-opt: radius %d tiles, %d rounds\n", cfg.radius, cfg.iterations);
+         timing_opt(ctx, cfg);
+     }
++    if (ctx->args.options.count("lut6-first"))
++        lut6_first(ctx->args.options.at("lut6-first").as<std::string>() == "2");
+     fixup_placement();
+     ctx->assignArchInfo();
+ }
+ 
++
++
++
++
++void XilinxImpl::lut6_first(bool split_pairs)
++{
++    int moved_luts = 0, moved_ffs = 0, kept = 0, split = 0;
++    auto try_move_to = [&](CellInfo *ci, int to_z) {
++        if (ci == nullptr || ci->cluster != ClusterId() || ci->belStrength >= STRENGTH_LOCKED)
++            return false;
++        BelId from = ci->bel;
++        Loc loc = ctx->getBelLocation(from);
++        loc.z = to_z;
++        BelId to = ctx->getBelByLocation(loc);
++        if (to == BelId() || !ctx->checkBelAvail(to) || !ctx->isValidBelForCellType(ci->type, to))
++            return false;
++        PlaceStrength strength = ci->belStrength;
++        ctx->unbindBel(from);
++        ctx->bindBel(to, ci, strength);
++        if (isBelLocationValid(to)) {
++            return true;
++        }
++        ctx->unbindBel(to);
++        ctx->bindBel(from, ci, strength);
++        ++kept;
++        return false;
++    };
++    auto try_move = [&](CellInfo *ci, int to_bel) {
++        if (ci == nullptr)
++            return false;
++        return try_move_to(ci, (ctx->getBelLocation(ci->bel).z & ~0xF) | to_bel);
++    };
++    for (int pass = 0; pass < 2; pass++) {
++        for (size_t ti = 0; ti < tile_status.size(); ti++) {
++            if (!tile_status.at(ti).lts)
++                continue;
++            for (int z = 0; z < 8; z++) {
++                auto &lts = *tile_status.at(ti).lts;
++                if (pass == 0) {
++                    CellInfo *l5 = lts.cells[(z << 4) | BEL_5LUT];
++                    if (l5 != nullptr && lts.cells[(z << 4) | BEL_6LUT] == nullptr && try_move(l5, BEL_6LUT))
++                        ++moved_luts;
++                } else {
++                    CellInfo *f2 = lts.cells[(z << 4) | BEL_FF2];
++                    if (f2 != nullptr && lts.cells[(z << 4) | BEL_FF] == nullptr && try_move(f2, BEL_FF))
++                        ++moved_ffs;
++                }
++            }
++        }
++    }
++
++
++    if (split_pairs) {
++        for (size_t ti = 0; ti < tile_status.size(); ti++) {
++            if (!tile_status.at(ti).lts)
++                continue;
++            auto &lts = *tile_status.at(ti).lts;
++            for (int z = 0; z < 8; z++) {
++                CellInfo *l5 = lts.cells[(z << 4) | BEL_5LUT];
++                if (l5 == nullptr || lts.cells[(z << 4) | BEL_6LUT] == nullptr)
++                    continue;
++                for (int z2 = (z / 4) * 4; z2 < (z / 4) * 4 + 4; z2++) {
++                    if (lts.cells[(z2 << 4) | BEL_6LUT] != nullptr || lts.cells[(z2 << 4) | BEL_5LUT] != nullptr)
++                        continue;
++                    if (try_move_to(l5, (z2 << 4) | BEL_6LUT)) {
++                        ++split;
++                        break;
++                    }
++                }
++            }
++        }
++    }
++    log_info("lut6-first: %d LUT pairs split, ", split);
++    log_info("lut6-first: %d LUTs 5LUT -> 6LUT, %d flip-flops x5FF -> xFF, %d moves refused by legality\n", moved_luts,
++             moved_ffs, kept);
++}
++
+ void XilinxImpl::configureRouter2(Router2Cfg &cfg)
+ {
+     // Routing configuration proven on xc7 by nextpnr-xilinx
+@@ -1320,6 +1424,7 @@ void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+ 
+ void XilinxImpl::preRoute()
+ {
++    lut_a6_perm = ctx->args.options.count("lut-a6-perm");
+     if (!cell_tags_set) {
+         // We loaded a pre-placed design. Need to set tags and update bel-cell map
+         assign_cell_tags();
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index cc8c3442..43032fa5 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -174,6 +174,9 @@ struct XilinxImpl : HimbaechelAPI
+     // (RCLK_BEFORE_DIV -> RCLK_OUT -> RCLK2RCLK -> CK_BUFRCLK) runs through a
+     // BUFR, so those wires are a buffer's output rather than general routing.
+     // Cached: is_pip_unavail is on the router's hot path.
++    void lut6_first(bool split_pairs);
++
++    bool lut_a6_perm = false;
+     mutable bool design_has_bufr = false;
+     mutable bool design_has_bufr_valid = false;
+     bool checkPipAvail(PipId pip) const override { return !is_pip_unavail(pip); }

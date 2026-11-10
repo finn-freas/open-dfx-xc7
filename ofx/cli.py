@@ -12,6 +12,7 @@ from . import BOARDS, FLOW, ROOT, VERSION
 from . import project as P
 from . import defaults, reports, runner, templates, timing, vhdl
 from . import cli_ip
+from . import hls as hlsmod
 from . import drc as drcmod
 from . import power as powermod
 from .stage import stage
@@ -187,6 +188,8 @@ def cmd_build(a):
     st = staged(proj, dry)
     out = impl_dir(proj)
     extra = {"part": proj.part, "seed": proj.seed, "freq": proj.freq_mhz(), "top": proj.top}
+    if proj.seeds > 1:
+        extra["seeds"] = f"auto:{proj.seeds}" if proj.seeds_auto else proj.seeds
     if st["inputs"] != st["sources"]:
         extra["vhdl"] = {"std": proj.vhdl_std, "units": proj.vhdl_units}
         if proj.vhdl_generics:
@@ -208,6 +211,8 @@ def cmd_build(a):
     npa, npe = timing_nextpnr_args(proj)
     cmd = [CONFIG["py"], runner.flow("build_openxc7.py"), st["dir"], "--top", proj.top, "--xdc", st["xdc"],
            "--part", proj.part, "--seed", str(proj.seed), "--out", out] + npa
+    if proj.seeds > 1:
+        cmd += ["--seeds", str(proj.seeds)] + (["--seeds-auto"] if proj.seeds_auto else [])
     if proj.device.get("db_extra"):
         cmd += ["--chipdb", proj.device["chipdb"], "--db-root", proj.device["db_root"]]
     cmd += defaults_args(dp)
@@ -236,6 +241,29 @@ def cmd_build(a):
     runner.run(cmd + ([] if ref is not None else rtl), env={**env_for(proj), **npe})
     if not dry:
         reports.print_report([out])
+
+
+def cmd_hls(a):
+    proj = load(a)
+    dry = is_dry(a)
+    out = proj.build / hlsmod.CONFIG["out_dir"]
+    try:
+        if not hlsmod.kernels(proj):
+            sys.exit("ofx hls: the project has no [[hls]] kernel")
+        files, _ = hlsmod.generate(proj, out, dry)
+        res = hlsmod.simulate(proj, out, dry) if a.sim else {}
+    except hlsmod.HlsError as e:
+        sys.exit(f"ofx: {e}")
+    for f in files:
+        print(f"hls rtl: {f}")
+    bad = 0
+    for top, r in res.items():
+        ok = r["rc"] == 0
+        bad += not ok
+        print(f"hls sim {top}: {'PASS' if ok else 'FAIL'}" + (f", {r['cycles']} cycles" if r["cycles"] else "")
+              + f" ({r['log']})")
+    if bad:
+        sys.exit(1)
 
 
 def incremental_ref(proj, ref, dry):
@@ -381,6 +409,10 @@ def design_dict(proj, st):
             sys.exit(f"ofx: HD.PARTPIN constraints in more than one XDC ({ppx}); keep them in one file")
         if ppx:
             d["partpin_xdc"] = ppx[0]
+        if dfx.get("timed"):
+            d.update({"place_union": list(p["default_rms"]), "grey_clock_leaf": True, "fix_endpoints": True,
+                      "pin_module_ends": True, "pin_w_module": 0.5, "pin_exclude_wrap_exits": True,
+                      "static_try_unfixed": True, "module_seeds": 2})
     elif p["shell"]:
         d["rm_shell"] = str(p["shell"])
     else:
@@ -409,6 +441,25 @@ def static_rms(proj, a, dd):
     return [(a.rms or proj.dfx["partitions"][0]["default_rms"])[0]]
 
 
+def multi_outputs(out, rms, cfgs):
+    """Outputs of the multi-partition flow that depend on one of the RMs or configurations: every file or directory
+    under the build (top level, partition dirs, checks, partials, verify) whose name, split at '_' and '.', contains
+    an RM name or a configuration's RM sequence (build_pr_native main_multi and ofx partial names are made of them),
+    and the aggregate pr_check_multi.json."""
+    if not out.exists():
+        return []
+    dirs = [out] + [p for p in out.iterdir() if p.is_dir() and not re.search(r"_[amn]$", p.name)]
+    seqs = [[r] for r in rms] + [c.split("_") for c in cfgs]
+    gone = []
+    for d in dirs:
+        for x in sorted(d.iterdir()):
+            toks = re.split(r"[_.]", x.name)
+            if any(toks[i:i + len(s)] == s for s in seqs for i in range(len(toks) - len(s) + 1)) or \
+                    (seqs and x.name == "pr_check_multi.json"):
+                gone.append(x)
+    return gone
+
+
 def child_runs(proj, st, dd, dkey, key, a, dry):
     """Vivado's child runs: when only RMs were added, removed or changed and the static implementation's inputs are
     the same, keep static (and every unchanged RM build) and remove only the outputs of the changed RMs. Returns True
@@ -416,17 +467,22 @@ def child_runs(proj, st, dd, dkey, key, a, dry):
     the caller's runner.fresh decides, and the stamp gets the per-RM keys."""
     root = dfx_root(proj)
     stamp = root / runner.CONFIG["stamp"]
-    if len(proj.dfx["partitions"]) != 1:
-        return False
-    q = proj.dfx["partitions"][0]
-    rms = st["rms"][q["name"]]
-    srm = static_rms(proj, a, dd)
-    sdd = {k: v for k, v in dd.items() if k not in ("rms", "default_rms")}
+    multi = len(proj.dfx["partitions"]) > 1
+    rms = {r: f for q in proj.dfx["partitions"] for r, f in st["rms"][q["name"]].items()}
+    if multi:
+        srm = [q["rms"][0] for q in dd["partitions"]]
+        sdd = {k: v for k, v in dd.items() if k not in ("rms", "default_rms", "configs", "partitions")}
+        sdd["partitions"] = [dict(q, rms=q["rms"][:1]) for q in dd["partitions"]]
+    else:
+        srm = static_rms(proj, a, dd)
+        sdd = {k: v for k, v in dd.items() if k not in ("rms", "default_rms")}
     sdd["static_rms"] = {r: str(rms[r]) for r in srm if r in rms}
     sfiles = [f for f in dfx_inputs(proj, st) if f not in rms.values()] + [rms[r] for r in srm if r in rms]
     skey = runner.digest(sfiles, dict(dkey, design=sdd))
     rkeys = {r: runner.digest([f], {}) for r, f in rms.items()}
     rec = {"inputs": key, "static": skey, "rms": rkeys}
+    if multi:
+        rec["configs"] = ["_".join(c) for c in dd["configs"]]
     old = json.loads(stamp.read_text()) if stamp.exists() else None
     if old is None or old.get("inputs") == key or old.get("static") != skey:
         if not dry:
@@ -435,7 +491,12 @@ def child_runs(proj, st, dd, dkey, key, a, dry):
         return False
     changed = sorted(r for r in set(old.get("rms", {})) | set(rkeys) if old.get("rms", {}).get(r) != rkeys.get(r))
     out = dfx_out(proj)
-    gone = [x for r in changed for pat in RM_OUTPUTS for x in sorted(out.glob(pat.format(rm=r)))]
+    if multi:
+        gone_cfgs = sorted(set(old.get("configs", [])) - set(rec["configs"]))
+        gone = multi_outputs(out, changed, gone_cfgs)
+        changed += [f"configuration {c}" for c in gone_cfgs]
+    else:
+        gone = [x for r in changed for pat in RM_OUTPUTS for x in sorted(out.glob(pat.format(rm=r)))]
     print(f"[{'dry' if dry else 'run'}] static inputs unchanged: child runs for RM(s) {changed}; keeping static and "
           f"the other RM builds; removing {len(gone)} output(s) of the changed RMs", flush=True)
     if not dry:
@@ -758,6 +819,12 @@ def main(argv=None):
     b.add_argument("--incremental-routes", action="store_true",
                    help="with --incremental, also replay the reference's routes (slice-level reuse)")
     b.set_defaults(fn=cmd_build)
+    hl = sub.add_parser("hls", help="high-level synthesis: C/C++ [[hls]] kernels to Verilog with Bambu (ofx build "
+                                     "runs it too); --sim co-simulates each kernel's C testbench against its RTL "
+                                     "(dry run unless --run)")
+    hl.add_argument("--sim", action="store_true", help="also run the C testbench against the RTL (Verilator)")
+    hl.add_argument("--run", action="store_true")
+    hl.set_defaults(fn=cmd_hls)
     pr = sub.add_parser("program", help="program the board with openFPGALoader (dry run unless --run)")
     pr.add_argument("--flash", action="store_true", help="write the SPI flash instead of SRAM")
     pr.add_argument("--bit")

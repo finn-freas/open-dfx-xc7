@@ -1,0 +1,30 @@
+diff --git a/himbaechel/uarch/xilinx/fasm.cc b/himbaechel/uarch/xilinx/fasm.cc
+index e10b42f1..f8c33ebe 100644
+--- a/himbaechel/uarch/xilinx/fasm.cc
++++ b/himbaechel/uarch/xilinx/fasm.cc
+@@ -3103,6 +3103,12 @@ struct FasmBackend
+         if (use_simd == "FOUR12")
+             write_bit("USE_SIMD_FOUR12");
+ 
++
++
++        if (ctx->args.options.count("dsp-use-mult-none") &&
++            str_or_default(ci->params, ctx->id("USE_MULT"), "MULTIPLY") == "NONE")
++            write_bit("USE_MULT_NONE");
++
+         // PATTERN
+         const size_t pattern_size = 48;
+         std::vector<bool> pattern_vector(pattern_size, false);
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index c9cd40e5..1594e213 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -74,6 +74,8 @@ po::options_description XilinxImpl::getUArchOptions()
+     po::options_description specific("Xilinx specific options");
+     specific.add_options()("fasm", po::value<std::string>(), "fasm bitstream output file");
+     specific.add_options()("xdc", po::value<std::string>(), "name of constraints file");
++    specific.add_options()("dsp-use-mult-none",
++                           "write USE_MULT_NONE for DSP48E1 with USE_MULT=NONE (needs a prjxray-db with that feature)");
+     specific.add_options()("placement", po::value<std::string>(),
+                            "placement dump (JSON: cell -> tile/site/bel/type) for external LVS");
+     specific.add_options()("delay-matrix", po::value<std::string>(),

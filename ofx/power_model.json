@@ -1,0 +1,180 @@
+{
+ "coef": {
+  "Clocks": {
+   "clk_loads": 0.0,
+   "clk_pips": 2.325414997604396e-05,
+   "clk_bufs": 0.006230716803452804
+  },
+  "Slice Logic": {
+   "lut": 6.951735734091484e-05,
+   "ff": 0.0,
+   "carry": 0.0,
+   "mux": 0.0,
+   "lutram": 0.3073282742005818
+  },
+  "Signals": {
+   "sig_pips": 8.37655123929366e-06,
+   "sig_fanout": 0.0
+  },
+  "Block RAM": {
+   "bram": 0.017319957763957835
+  },
+  "DSPs": {
+   "dsp": 0.013437987124450079
+  },
+  "MMCM": {
+   "mmcm_n": 53.34083720921616,
+   "mmcm_vco": 52.684883720973986
+  },
+  "PLL": {
+   "pll_n": 42.703333333907395,
+   "pll_vco": 62.76555555526187
+  },
+  "I/O": {
+   "io_out_cv2": 0.005652235317304388,
+   "io_in": 0.18711779753447233,
+   "io_vref": 0.7780037123489961,
+   "io_diff_out": 0.0
+  }
+ },
+ "static": {
+  "s0": 0.07186360361025636,
+  "s1": 0.0036187018873589066
+ },
+ "rail_share": {
+  "Vccint": {
+   "Clocks": 0.9440862856513103,
+   "Slice Logic": 0.9720888129956908,
+   "Signals": 1.0,
+   "Block RAM": 0.9237885747893415,
+   "DSPs": 0.9846088903667083,
+   "MMCM": 0.005104260207582339,
+   "PLL": 0.12734632915905356,
+   "I/O": 0.0015509938266816314
+  },
+  "Vccaux": {
+   "MMCM": 0.9966313278263841,
+   "PLL": 0.8735700183993123,
+   "I/O": 0.06383022676107594
+  },
+  "Vccbram": {
+   "Signals": 0.0003881080844989733,
+   "Block RAM": 0.07124266906871395
+  },
+  "Vccadc": {},
+  "Vcco": {
+   "PLL": 0.0032817378752810354,
+   "I/O": 0.9290209733392029
+  }
+ },
+ "rail_static": {
+  "Vccint": 0.010022118905272485,
+  "Vccaux": 0.01302875457685423,
+  "Vcco33": 0.0010022118905272485,
+  "Vcco25": 0.0,
+  "Vcco18": 0.0,
+  "Vcco15": 0.0,
+  "Vcco135": 0.0,
+  "Vcco12": 0.0,
+  "Vccaux_io": 0.0,
+  "Vccbram": 0.0,
+  "Vccadc": 0.02004423781054497
+ },
+ "theta_ja": 4.8,
+ "name": "power_model.json",
+ "train": [
+  "blinky_p10",
+  "blinky_p5",
+  "blinky_p7",
+  "bram_p10",
+  "bram_p5",
+  "drc_cfgbvs",
+  "drc_cfgbvs_gnd",
+  "drc_cfgbvs_v18",
+  "drc_dfx_ok",
+  "drc_dsp_nopipe",
+  "drc_ffclk",
+  "drc_gated",
+  "drc_idelay_ref200",
+  "drc_idelay_ref200g",
+  "drc_iobuf_noload",
+  "drc_iostdtype",
+  "drc_mmcm_nofb",
+  "drc_mmcm_vcolow",
+  "drc_ok",
+  "drc_pll_vco",
+  "drc_ramb36_async",
+  "drc_ramb_async",
+  "drc_ramb_width",
+  "drc_unrouted",
+  "drc_vref_int",
+  "lutram_infer",
+  "plle2_adv",
+  "pw_bram16",
+  "pw_bram16_p5",
+  "pw_bram4",
+  "pw_bram40",
+  "pw_dsp32",
+  "pw_dsp32_p5",
+  "pw_dsp64",
+  "pw_dsp8",
+  "pw_io24",
+  "pw_io24_p5",
+  "pw_io8",
+  "pw_xor128",
+  "pw_xor128_p20",
+  "pw_xor32",
+  "pw_xor32_p5",
+  "pw_xor8",
+  "rv_big_p10",
+  "rv_soc_p10"
+ ],
+ "heldout": [
+  "dsp48e1",
+  "dsp_cascade",
+  "fir_p5",
+  "mmcme2_adv",
+  "oserdes_pin",
+  "pw_mmcm32_150",
+  "pw_mmcm32_200",
+  "ramb36e1",
+  "rv_mul_p10",
+  "srl"
+ ],
+ "heldout_error": {
+  "n": 10,
+  "total_mape": 10.034282183750822,
+  "total_max": 30.23434659345058,
+  "dynamic_mape": 70.533043816028,
+  "dynamic_mae_mw": 11.562884801425803,
+  "static_mape": 0.4104261583687821
+ },
+ "train_error": {
+  "n": 45,
+  "total_mape": 5.603476603586625,
+  "total_max": 84.69316367923786,
+  "dynamic_mape": 29.827200357914105,
+  "dynamic_mae_mw": 7.659639242175149,
+  "static_mape": 0.4143587778754773
+ },
+ "lofo_error": {
+  "n": 55,
+  "total_mape": 7.417049223252121,
+  "total_max": 86.11479749780838,
+  "dynamic_mape": 34.247329685243635,
+  "dynamic_mae_mw": 10.931177768051331,
+  "static_mape": 0.4935546738783201
+ },
+ "heldout_families": [
+  "rv_mul",
+  "fir",
+  "arty_eth",
+  "mmcme2",
+  "ramb36",
+  "dsp",
+  "oserdes_pin",
+  "srl",
+  "pw_mmcm"
+ ],
+ "vivado": "Vivado 2025.2 report_power, vectorless defaults, xc7a35tcsg324-1, 25 C ambient"
+}

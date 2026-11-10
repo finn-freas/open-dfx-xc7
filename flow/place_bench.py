@@ -30,6 +30,22 @@ CONFIG = {
         "v7": "build/nextpnr-build/place_v7/nextpnr-himbaechel",
         "v8": "build/nextpnr-build/place_v8/nextpnr-himbaechel",
         "v9": "build/nextpnr-build/place_v9/nextpnr-himbaechel",
+        "v10": "build/nextpnr-build/place_v10/nextpnr-himbaechel",
+        "v11": "build/nextpnr-build/place_v11/nextpnr-himbaechel",
+        "v12": "build/nextpnr-build/place_v12/nextpnr-himbaechel",
+        "v13": "build/nextpnr-build/place_v13/nextpnr-himbaechel",
+        "v14": "build/nextpnr-build/place_v14/nextpnr-himbaechel",
+        "v15": "build/nextpnr-build/place_v15/nextpnr-himbaechel",
+        "v16": "build/nextpnr-build/place_v16/nextpnr-himbaechel",
+        "v17": "build/nextpnr-build/place_v17/nextpnr-himbaechel",
+        "v18": "build/nextpnr-build/place_v18/nextpnr-himbaechel",
+        "combo": "build/nextpnr-build/combo/nextpnr-himbaechel",
+        "dfxfix": "build/nextpnr-build/dfxfix/nextpnr-himbaechel",
+        "ua": "build/nextpnr-build/ua/nextpnr-himbaechel",
+        "legal": "build/nextpnr-build/legal/nextpnr-himbaechel",
+        "repl": "build/nextpnr-build/repl/nextpnr-himbaechel",
+        "afo": "build/nextpnr-build/afo/nextpnr-himbaechel",
+        "rel04": "build/nextpnr-build/rel04/nextpnr-himbaechel",
         "perm": "build/nextpnr-build/qorperm/nextpnr-himbaechel",
     },
     "chipdb": qor_bench.NIGHTLY_CHIPDB,
@@ -107,6 +123,102 @@ CONFIG = {
         "pl9_off_rcal": {"bin": "v9", "args": TMG + [], "cal": True, "rcal": True},
         "pl9_sdwp_rcal": {"bin": "v9", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-weighted-precond"], "cal": True, "rcal": True},
         "pl9_sdwptw15_rcal": {"bin": "v9", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-weighted-precond", "--placer-static-timingweight", "15"], "cal": True, "rcal": True},
+        "pl10_gy05_rcal": {"bin": "v10", "args": TMG + ["-o", "static-grad-y=0.5"], "cal": True, "rcal": True},
+        "cb_all_syn2": {"bin": "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", "netlist": "x1_cal_syn2"},
+        "cb_off_syn2": {"bin": "combo", "args": TMG, "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", "netlist": "x1_cal_syn2"},
+        "rel_off": {"bin": "rel04", "args": TMG, "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin"},
+        "cb_off": {"bin": "combo", "args": TMG, "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin"},
+        "cb_lp": {"bin": "combo", "args": TMG + ["-o", "lut-a6-perm", "-o", "lut6-first"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin"},
+        "cb_all": {"bin": "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin"},
+        "cb_off_dq": {"bin": "combo", "args": TMG, "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", "dspq": True},
+        "cb_lp_dq": {"bin": "combo", "args": TMG + ["-o", "lut-a6-perm", "-o", "lut6-first"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", "dspq": True},
+        **{f"ua_{k}{dq}": {"bin": "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "0.75" if k in ("tu75", "all") else "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first"] + (["-o", "static-group-util=0.75,0.75,0.8,0.8"] if k in ("tu75", "all") else []) + (["-o", "static-delay=816,28,28,28,28"] if k in ("dly", "all") else []), "cal": True, "chipdb": "build/chipdb-rcal-a6/chipdb-xc7a50t.bin" if k in ("pin", "all") else "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for k in ("tu75", "dly", "pin", "all") for dq in ("", "_dq")},
+        **{f"ua_{k}{dq}": {"bin": "ua" if k in ("cw400", "off2") else "combo", "args": TMG + ([] if k == "off2" else ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first"]) + {"cw400": ["--tmg-crit-window", "400"], "dxy": ["-o", "static-delay=816,40,40,18,18"], "y2": ["-o", "static-grad-y=2", "-o", "static-hpwl-x=1", "-o", "static-hpwl-y=2"], "off2": []}[k], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for k in ("cw400", "dxy", "y2", "off2") for dq in ("", "_dq")},
+        **{f"cb_all2{dq}": {"bin": "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for dq in ("", "_dq")},
+        **{f"dfx_all2{dq}": {"bin": "dfxfix", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for dq in ("", "_dq")},
+        **{f"cb2_{k}{dq}": {"bin": "legal" if k == "ring" else "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18"] + (["--placer-static-legal-ring", "8", "--placer-static-legal-ring-clusters"] if k == "ring" else []), "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"netlist": "x1_cal_syn2"} if k == "syn2" else {}), **({"dspq": True} if dq else {})} for k in ("ring", "syn2") for dq in ("", "_dq")},
+        **{f"cb2_{k}{dq}": {"bin": "legal" if k == "ring20" else "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235" + (":lambda=0.25" if k == "lam25" else ""), "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18"] + (["--placer-static-legal-ring", "20", "--placer-static-legal-ring-clusters"] if k == "ring20" else []), "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for k in ("ring20", "lam25") for dq in ("", "_dq")},
+        **{f"cb2_hx25{dq}": {"bin": "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18", "-o", "static-hpwl-x=5", "-o", "static-hpwl-y=2"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for dq in ("", "_dq")},
+        **{f"cb2_repl{dq}": {"bin": "repl", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18", "-o", "replicate"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for dq in ("", "_dq")},
+        **{f"cb2_repl2{dq}": {"bin": "repl", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18", "-o", "replicate=cc=1:fanout=0"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for dq in ("", "_dq")},
+        **{f"cb2_{k}{dq}": {"bin": "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18"] + {"tw10": ["--placer-static-timingweight", "10"], "tw20": ["--placer-static-timingweight", "20"], "ce1": ["--placer-static-critexp", "1"], "tw20ce4": ["--placer-static-timingweight", "20", "--placer-static-critexp", "4"]}[k], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for k in ("tw10", "tw20", "ce1", "tw20ce4") for dq in ("", "_dq")},
+        **{f"cb2_{k}{dq}": {"bin": "repl", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18", "--placer-static-timingweight", "20", "--placer-static-critexp", "4", "-o", "replicate=cc=1:fanout=0"], "cal": True, "chipdb": {"twrepl": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", "twcdirepl": "build/chipdb-rcal-a6pd-cdi/chipdb-xc7a50t.bin"}[k], **({"dspq": True} if dq else {})} for k in ("twrepl", "twcdirepl") for dq in ("", "_dq")},
+        **{f"cb2_afo{k}{dq}": {"bin": "afo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", f"sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235:fo={k}", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18", "-o", f"arc-fanout={k}"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for k in (100, 200) for dq in ("", "_dq")},
+        **{f"cb2_ch{k}{dq}": {"bin": "afo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18"] + {"snap": ["-o", "chain-snap"], "rig1": ["-o", "chain-rigid=1"], "rig05": ["-o", "chain-rigid=0.5"], "cl8": ["-o", "chain-legal=8"], "cnw2": ["-o", "chain-net-w=2"], "snapcl4": ["-o", "chain-snap", "-o", "chain-legal=4"], "rig1cnw2": ["-o", "chain-rigid=1", "-o", "chain-net-w=2"]}[k], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for k in ("snap", "rig1", "rig05", "cl8", "cnw2", "snapcl4", "rig1cnw2") for dq in ("", "_dq")},
+        **{f"cb2_{k}{dq}": {"bin": "repl" if k == "cdirepl" else "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first", "-o", "static-delay=816,40,40,18,18"] + (["-o", "replicate=cc=1:fanout=0"] if k == "cdirepl" else []), "cal": True, "chipdb": "build/chipdb-rcal-a6pd-cdi/chipdb-xc7a50t.bin", **({"dspq": True} if dq else {})} for k in ("cdi", "cdirepl") for dq in ("", "_dq")},
+        "cb_all_dq": {"bin": "combo", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "sa-refine=t0=0.01:quant=0.002:exp=8:rmin=3:pcent=0.6:site=750:tile=850:alpha=313:beta=1.235", "-o", "lut-a6-perm", "-o", "lut6-first"], "cal": True, "chipdb": "build/chipdb-rcal-a6pd/chipdb-xc7a50t.bin", "dspq": True},
+        "pl11_anc20ipw_stub": {"bin": "v11", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5"]},
+        "lg2_tu_stub": {"bin": "legal", "args": TMG + ["--placer-static-target-util", "1.0"]},
+        "lg2_tu_r8c_stub": {"bin": "legal", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-legal-ring", "8", "--placer-static-legal-ring-clusters"]},
+        "lg2_tu_r8cy2_stub": {"bin": "legal", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-legal-ring", "8", "--placer-static-legal-ring-clusters", "--placer-static-legal-wy", "2"]},
+        "lg2_tu10_stub": {"bin": "legal", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0"]},
+        "lg2_tu10_r8c_stub": {"bin": "legal", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-legal-ring", "8", "--placer-static-legal-ring-clusters"]},
+        "lg_off_rcal": {"bin": "legal", "args": TMG, "cal": True, "rcal": True},
+        "lg_tu_stub": {"bin": "legal", "args": TMG + ["--placer-static-target-util", "1.0"]},
+        "lg_tu_r4_stub": {"bin": "legal", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-legal-ring", "4"]},
+        "lg_tu_r8_stub": {"bin": "legal", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-legal-ring", "8"]},
+        "lg_tu_r8y2_stub": {"bin": "legal", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-legal-ring", "8", "--placer-static-legal-wy", "2"]},
+        "lg_tu_r8n0_stub": {"bin": "legal", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-legal-ring", "8", "--placer-static-legal-wn", "0"]},
+        "rel_off_rcal": {"bin": "rel04", "args": TMG, "cal": True, "rcal": True},
+        "cb_off_rcal": {"bin": "combo", "args": TMG, "cal": True, "rcal": True},
+        "pl18_tuonly_rcal": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0"], "cal": True, "rcal": True},
+        "pl18_tu1_mx_rcal": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0", "-o", "static-delay=matrix"], "cal": True, "rcal": True},
+        "pl18_tu1_mx_stub": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0", "-o", "static-delay=matrix"]},
+        "pl18_tuonly_dqrcal": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0"], "cal": True, "rcal": True, "dspq": True},
+        "pl18_tu1_mx_dqrcal": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0", "-o", "static-delay=matrix"], "cal": True, "rcal": True, "dspq": True},
+        "pl18_tuonly_stub": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0"]},
+        "pl18_tu1_cq02_aq5_stub": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-arc-ratio", "0.5", "--placer-static-arc-quad"]},
+        "pl18_tu1_cq02_aq10_stub": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-arc-ratio", "1.0", "--placer-static-arc-quad"]},
+        "pl18_tu1_cq02_aq5_dq": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-arc-ratio", "0.5", "--placer-static-arc-quad"], "dspq": True},
+        "pl18_tu1_cq02_aq10_dq": {"bin": "v18", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-arc-ratio", "1.0", "--placer-static-arc-quad"], "dspq": True},
+        "pl17_tuonly_stub": {"bin": "v17", "args": TMG + ["--placer-static-target-util", "1.0"]},
+        "pl17_tu1_cq02_dcf_stub": {"bin": "v17", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-driver-crit-fanout", "1000"]},
+        "pl17_tu1_cq02_dcf_dq": {"bin": "v17", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-driver-crit-fanout", "1000"], "dspq": True},
+        "pl16_tu1_cq02_arc5_stub": {"bin": "v16", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-arc-ratio", "0.5"]},
+        "pl16_tu1_cq02_arc10_stub": {"bin": "v16", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-arc-ratio", "1.0"]},
+        "pl16_tu1_cq02_arc5_dq": {"bin": "v16", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-arc-ratio", "0.5"], "dspq": True},
+        "pl16_tu1_cq02_arc10_dq": {"bin": "v16", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-arc-ratio", "1.0"], "dspq": True},
+        "pl15_tuonly_stub": {"bin": "v15", "args": TMG + ["--placer-static-target-util", "1.0"]},
+        "pl15_tuonly_cq02_stub": {"bin": "v15", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02"]},
+        "pl15_tuonly_dq": {"bin": "v15", "args": TMG + ["--placer-static-target-util", "1.0"], "dspq": True},
+        "pl15_tuonly_cq02_dq": {"bin": "v15", "args": TMG + ["--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02"], "dspq": True},
+        "pl15_tu10_cq02_tw15_stub": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-timingweight", "15"]},
+        "pl15_tu10_cq02_tw15_cdb_stub": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-timingweight", "15", "-o", "carry-di-bypass"]},
+        "pl15_tu10_cq02_tw15_dq": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "--placer-static-timingweight", "15"], "dspq": True},
+        "pl15_tu10_cq02_cdb_dq": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "-o", "carry-di-bypass"], "dspq": True},
+        "pl15_tu10_dq": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0"], "dspq": True},
+        "pl15_cq02_dq": {"bin": "v15", "args": TMG + ["--placer-static-crit-quantile", "0.02"], "dspq": True},
+        "pl16_tu10_cq02_dplq_dq": {"bin": "v16", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "-o", "dpl=2,3,0.8,4,0,0.02"], "dspq": True},
+        "pl16_tu10_cq02_stub": {"bin": "v16", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02"]},
+        "pl16_tu10_cq02_dplq_stub": {"bin": "v16", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "-o", "dpl=2,3,0.8,4,0,0.02"]},
+        "pl16_tu10_cq02_cdb_dplq_stub": {"bin": "v16", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "-o", "carry-di-bypass", "-o", "dpl=2,3,0.8,4,0,0.02"]},
+        "pl15_tu10_cq02_ra_stub": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "-o", "static-ram-assign"]},
+        "pl15_tu10_cq02_cdb_stub": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02", "-o", "carry-di-bypass"]},
+        "pl15_tu10_cq02_dq": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02"], "dspq": True},
+        "pl15_anc20ipw_stub": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5"]},
+        "pl15_cq02_stub": {"bin": "v15", "args": TMG + ["--placer-static-crit-quantile", "0.02"]},
+        "pl15_tu10_cq02_stub": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02"]},
+        "pl15_tu10_cq05_stub": {"bin": "v15", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.05"]},
+        "pl14_off_stub": {"bin": "v14", "args": TMG},
+        "pl14_anc20ipw_tu10_ra_stub": {"bin": "v14", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "static-ram-assign"]},
+        "pl14_anc20ipw_stub": {"bin": "v14", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5"]},
+        "pl14_anc20ipw_ra_stub": {"bin": "v14", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "-o", "static-ram-assign"]},
+        "pl14_anc20ipw_gur_ra_stub": {"bin": "v14", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "-o", "static-group-util=0.7,0.7,1.0,1.0", "-o", "static-ram-assign"]},
+        "pl13_anc20ipw_stub": {"bin": "v13", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5"]},
+        "pl13_anc20ipw_gur_stub": {"bin": "v13", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "-o", "static-group-util=0.7,0.7,1.0,1.0"]},
+        "pl13_anc20ipw_tu10_cdb_stub": {"bin": "v13", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "carry-di-bypass"]},
+        "pl13_off_dq": {"bin": "v13", "args": TMG, "dspq": True},
+        "pl13_anc20ipw_tu10_cdb_dq": {"bin": "v13", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0", "-o", "carry-di-bypass"], "dspq": True},
+        "pl12_anc20ipw_stub": {"bin": "v12", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5"]},
+        "pl12_anc20ipw_gur_stub": {"bin": "v12", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "-o", "static-group-util=0.7,0.7,1.0,1.0"]},
+        "pl11_anc20ipw_tu9_stub": {"bin": "v11", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "0.9"]},
+        "pl11_anc20ipw_tu10_stub": {"bin": "v11", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5", "--placer-static-target-util", "1.0"]},
+        "pl11_off_rcal": {"bin": "v11", "args": TMG + [], "cal": True, "rcal": True},
+        "pl11_anc20_rcal": {"bin": "v11", "args": TMG + ["--placer-static-anchor-init", "20"], "cal": True, "rcal": True},
+        "pl11_anc20ipw_rcal": {"bin": "v11", "args": TMG + ["--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5"], "cal": True, "rcal": True},
+        "pl10_off_rcal": {"bin": "v10", "args": TMG + [], "cal": True, "rcal": True},
+        "pl10_gy2_rcal": {"bin": "v10", "args": TMG + ["-o", "static-grad-y=2"], "cal": True, "rcal": True},
+        "pl10_gy2h_rcal": {"bin": "v10", "args": TMG + ["-o", "static-grad-y=2", "-o", "static-hpwl-x=1", "-o", "static-hpwl-y=2"], "cal": True, "rcal": True},
         "pl6_te2_rcal": {"bin": "v6", "args": TMG + ["--placer-static-timing-every", "2"], "cal": True, "rcal": True},
         "pl6_sdte2_rcal": {"bin": "v6", "args": TMG + ["-o", "static-delay=786,63,29,37,7"] + ["--placer-static-timing-every", "2"], "cal": True, "rcal": True},
         "pl6_sd_dqrcal": {"bin": "v6", "args": TMG + ["-o", "static-delay=786,63,29,37,7"], "cal": True, "rcal": True, "dspq": True},
@@ -192,8 +304,13 @@ CONFIG = {
         "pl2_ff1_dq": {"bin": "v2", "args": TMG + ["-o", "static-ff-area=1.0"], "dspq": True},
         "pl2_ff1_dqcal": {"bin": "v2", "args": TMG + ["-o", "static-ff-area=1.0"], "dspq": True, "cal": True},
     },
+    "netlists": {"x1_cal_syn2": {
+        "rv_soc": "build/qor/synth/rv_soc/37511eb45ab30e99/qor_rv_soc.json",
+        "rv_big": "build/qor/synth/rv_big/77939744d75e65fd/qor_rv_big.json",
+        "rv_mul": "build/qor/synth/rv_mul/046025d4c58e1d72/qor_rv_mul.json",
+        "bram": "build/qor/synth/bram/b517806bf1405d7b/qor_bram.json"}},
     "vivado_root": Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build"),
-    "vivado_tag": "place_xtime",
+    "vivado_tag": "place_xtime2",
 }
 
 
@@ -220,6 +337,8 @@ def register(name):
 
 
 def chipdb_of(v):
+    if v.get("chipdb"):
+        return ROOT / v["chipdb"]
     if v.get("rcal"):
         return CONFIG["chipdb_rcal"]
     return CONFIG["chipdb_cal"] if v.get("cal") else CONFIG["chipdb"]
@@ -291,7 +410,11 @@ def pnr_one(design, period, vname, seed, dry):
     if design in CONFIG["socs"]:
         return pnr_soc(design, vname, seed, dry)
     register(vname)
-    syn = qor_bench.synth(design, period, vname, dry)
+    nl = CONFIG.get("netlists", {}).get(variant(vname).get("netlist", ""), {}).get(design)
+    if nl:
+        syn = {"ok": True, "json": str(ROOT / nl), "key": sha_file(ROOT / nl)}
+    else:
+        syn = qor_bench.synth(design, period, vname, dry)
     if not dry:
         wait_slot()
     return qor_bench.pnr_one(design, period, vname, seed, syn, dry)
@@ -330,7 +453,9 @@ def xprep(design, period, vname, seed, dry):
     paths = qx.crit_paths(run / "report.json")
     (d / "paths.txt").write_text("".join(f"{qx.tcl_quote(a[0])} {a[1]} {qx.tcl_quote(b[0])} {b[1]} {dly:.3f}\n"
                                          for _, _, a, b, dly in paths))
-    rows, skipped = qx.placement(run / f"{top}_routed.json")
+    sm = json.loads(syn_json.read_text())["modules"]
+    ncells = set(sm[top]["cells"]) if top in sm else set(next(iter(sm.values()))["cells"])
+    rows, skipped = qx.placement(run / f"{top}_routed.json", ncells)
     (d / "place.txt").write_text("".join(f"{qx.tcl_quote(n)} {b}\n" for n, b in rows))
     (d / "place_info.json").write_text(json.dumps({"rows": len(rows), "skipped": skipped,
                                                    "from": str(run.relative_to(ROOT))}) + "\n")

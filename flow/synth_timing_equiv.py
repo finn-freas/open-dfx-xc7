@@ -20,11 +20,12 @@ CONFIG = {
     "timeout_s": 3600,
     "seq": 8,
     "hard": ["RAMB36E1", "RAMB18E1", "RAM32M", "RAM64M", "RAM32X1D", "RAM64X1D", "RAM128X1D", "RAM256X1S", "RAM32X1S",
-             "RAM64X1S", "RAM128X1S", "SRL16E", "SRLC32E", "ICAPE2", "DSP48E1", "IDELAYE2", "ODELAYE2", "ISERDESE2",
-             "OSERDESE2", "IDELAYCTRL", "MMCME2_ADV", "PLLE2_ADV", "BUFGCTRL", "IBUF", "OBUF", "IOBUF", "OBUFT",
+             "RAM64X1S", "RAM128X1S", "ICAPE2", "DSP48E1", "IDELAYE2", "ODELAYE2", "ISERDESE2",
+             "OSERDESE2", "IDELAYCTRL", "MMCME2_ADV", "PLLE2_ADV", "BUFGCTRL", "IOBUF", "OBUFT",
              "IBUFDS", "OBUFDS", "IOBUFDS", "IOBUFDS_INTERMDISABLE", "IOBUF_INTERMDISABLE", "STARTUPE2", "DNA_PORT", "XADC"],
     "hw_init": {"FDRE": "0", "FDCE": "0", "FDSE": "1", "FDPE": "1"},
-    "flat": ["LUT1", "LUT2", "LUT3", "LUT4", "LUT5", "LUT6", "INV", "CARRY4", "MUXF7", "MUXF8", "FDRE", "FDSE", "FDCE", "FDPE", "BUFG"],
+    "flat": ["LUT1", "LUT2", "LUT3", "LUT4", "LUT5", "LUT6", "INV", "CARRY4", "MUXF7", "MUXF8", "FDRE", "FDSE", "FDCE", "FDPE", "BUFG",
+             "SRL16E", "SRLC32E", "IBUF", "OBUF"],
     "sim_script": ROOT / "flow" / "qor_area_sim.sh",
     "sim_designs": ["rv_soc", "rv_mul", "rv_big"],
     "sim_nvec": 11,
@@ -94,7 +95,7 @@ def check_seq(out, gold, gate):
     aig = out / "miter.aig"
     if not aig.exists():
         ys = (f"read_rtlil {gold}; read_rtlil {gate}; async2sync; miter -equiv -flatten -ignore_gold_x gold gate miter; "
-              f"hierarchy -top miter; flatten; opt_clean; dffunmap; simplemap; opt_clean; zinit; aigmap; write_aiger -zinit -map {out / 'miter.map'} {aig}")
+              f"hierarchy -top miter; flatten; opt_clean; dffunmap; simplemap; opt_clean; zinit; setundef -zero; aigmap; write_aiger -zinit -map {out / 'miter.map'} {aig}")
         rc = run([tool("yosys"), "-p", ys], out / "miter.log")
         if rc != 0:
             return {"proven": False, "error": f"miter failed ({out / 'miter.log'})"}

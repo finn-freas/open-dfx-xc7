@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Sun, 8 Nov 2026 08:56:09 -0500
+Subject: [PATCH] xilinx: partition-pin pre-route: FAN and CTRL wires are on
+ the direct approach to a CE or SR pin
+
+A slice CE pin is fed from the interconnect's FAN wires (CLBLM_M_CE <- FAN7 <-
+FAN_ALT7) and SR from the CTRL wires.  Both count as pin-feed wires, but the
+direct approach to a target was only followed through site pins, CLBL, BYP and
+IMUX wires, so a partition net that drives a CE or SR had no route at all
+(dfxpp_a50: 'no route outside the pblocks for ready').  An IMUX or BYP target
+has no FAN or CTRL wire uphill except through a bounce wire, which stays
+excluded, so routes to those targets do not change.
+---
+ himbaechel/uarch/xilinx/xilinx.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 5fcd510e..8472a80f 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -1469,7 +1469,8 @@ bool XilinxImpl::route_outside_pblocks(NetInfo *ni, WireId target, const pool<Lo
+         auto has = [&](const char *s) { return name.find(s) != std::string::npos; };
+         const bool site_pin = has(".") && !has("LUT") && !has("CARRY") && !has("MUX") && !has("XOR");
+         const bool feed = boost::starts_with(name, "CLBL") || boost::starts_with(name, "BYP") ||
+-                          boost::starts_with(name, "IMUX");
++                          boost::starts_with(name, "IMUX") || boost::starts_with(name, "FAN") ||
++                          boost::starts_with(name, "CTRL");
+         return (site_pin || feed) && !has("BOUNCE");
+     };
+     pool<WireId> approach{target};

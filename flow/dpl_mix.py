@@ -12,6 +12,7 @@ their own positions (a check that the legaliser changes nothing when nothing ove
 """
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
@@ -23,7 +24,7 @@ import dpl_metrics
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = {
-    "dump_root": Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build/dpl_xtime"),
+    "dump_root": Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build/" + os.environ.get("DPL_XTIME", "dpl_xtime2")),
     "xsrc": ROOT / "build" / "qor" / "dpl" / "xsrc",
     "slicem_types": re.compile(r"^(RAM|SRL)"),
     "hard_prefix": ("RAMB", "DSP48"),

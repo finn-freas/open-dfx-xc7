@@ -12,7 +12,13 @@ Steps (each is a sub-command; all are dry runs unless --run is given):
            -- one batch session under the machine-wide Vivado lock
   report   docs/qor-scoreboard.md
 
-Quick mode (--quick): the QUICK subset, one seed, one fixed period per design (no sweep), no xtime step.
+Quick mode (--quick): the QUICK subset, one seed, one Vivado run per design at its start period.
+Variant runs (placement/router agents): --variant NAME [--nextpnr BIN] [--np-arg ARG] [--np-opt K=V] [--synth CMDS]
+puts the open-flow results under build/qor_suite/<design>/open/NAME and the report in
+build/qor_suite/scoreboard_NAME.md (with a column against base). Example:
+  qor_suite.py open --quick --variant anc20 --np-arg=--placer-static-anchor-init --np-arg=20 --run
+  qor_suite.py vivado --quick --variant anc20 --modes placed --run    (Vivado timer on the variant's placement)
+  qor_suite.py report --quick --variant anc20 --run
 """
 import argparse
 import collections
@@ -41,13 +47,18 @@ CONFIG = {
     "win_work_ps": r"C:\Users\finnf\open-dfx-xc7-vivado",
     "vivado_tag": "qor_suite",
     "slot_helper": ROOT / "vivado" / "vivado_slot.sh",
+    "slot1_only": True,
+    "yield_queues": [ROOT / "build" / "qor" / "place" / "gp" / "vq" / "names.txt"],
+    "yield_procs": r"place_vqueue.sh worke[r]|dpl_vivad[o].sh|route_xtime.py vivad[o]|run_polit[e]|breadth_queu[e]",
+    "yield_poll_s": 120,
     "vivado_budget_s": 1000000000,
     "vivado_bat": r"C:\AMDDesignTools\2025.2\Vivado\bin\vivado.bat",
     "tcl": ROOT / "vivado" / "qor_suite.tcl",
     "build_openxc7": ROOT / "flow" / "build_openxc7.py",
     "npwait": ROOT / "ofx" / "npwait.sh",
     "nextpnr": ROOT / "toolchain" / "openxc7" / "bin" / "nextpnr-xilinx",
-    "max_nextpnr": "3",
+    "max_nextpnr": os.environ.get("OFX_MAX_NEXTPNR", "2"),
+    "release": None,
     "mem_gb": 4,
     "dry_run": True,
     "sweep_runs": 3,
@@ -59,7 +70,7 @@ CONFIG = {
                  "xc7a100t": {"LUT": 63400, "FF": 126800, "BRAM36": 135, "DSP": 240}},
     "weights": {"fmax": 1, "area": 1, "power": 1, "build_time": 1, "routability": 1},
     "verdict": {"better": 1.05, "par": 0.95},
-    "quick": ["rv_big", "vexriscv", "aes", "sha256", "fir", "bram"],
+    "quick": ["rv_big", "serv", "aes", "sha256", "bram", "axi_xbar"],
     "repos": {
                 "serv": ("https://github.com/olofk/serv", "f200eb2ed7b69ac1c6b8eddd47654522aeee5ce8"),
         "aes": ("https://github.com/secworks/aes", "80dc4718e1dcbbdb4b0dd1bdb393d8f7b98981dc"),
@@ -74,10 +85,7 @@ CONFIG = {
 
 DESIGNS = {
     "vexriscv": {"kind": "cpu", "origin": "pythondata-cpu-vexriscv (litex-hub, 642ecfed)", "files": [VEX / "VexRiscv_Full.v"],
-                 "top": "VexRiscv", "reset": {"reset": 1}, "period": 6.0,
-                 "exclude_reason": "the yosys netlist drives the output pin with x: an undriven VexRiscv output bit "
-                                   "propagates through the wrapper's XOR reduction, so both tools do not build the same "
-                                   "logic; to fix, the wrapper must tie undriven DUT outputs"},
+                 "top": "VexRiscv", "reset": {"reset": 1}, "period": 6.0, "tie_undriven": True},
     "serv": {"kind": "cpu", "origin": "serv", "files": sorted((SRC / "serv/rtl").glob("serv_*.v")), "top": "serv_rf_top",
              "exclude": ["serv_synth_wrapper.v", "serv_debug.v"], "copies": 16, "reset": {"i_rst": 1}, "clock": "clk",
              "period": 5.0},
@@ -271,6 +279,34 @@ def xdc_text(name, period):
             f"set_property -dict {{ PACKAGE_PIN {pins['out']} IOSTANDARD LVCMOS33 }} [get_ports dout]\n")
 
 
+def tie_undriven(name, s):
+    """Undriven internal wires (VexRiscv's generated RTL has 18 bits) are x to yosys and 0 to Vivado (Synth 8-3295
+    ties undriven pins to GND), so the two tools would build different logic. Tie them to 0 in the shared source copy,
+    which is what Vivado does anyway."""
+    d = DESIGNS[name]
+    files = [f for f in (s / "files.txt").read_text().split() if f != "suite_top.v"]
+    r = subprocess.run([yosys_bin(), "-q", "-p", f"read_verilog -sv {' '.join(files)}; hierarchy -top {d['top']}; proc; "
+                        "opt_clean; check"], cwd=s, capture_output=True, text=True)
+    und = collections.defaultdict(list)
+    for mod, wire, bit in re.findall(r"Wire (\w+)\.\\(\S+)(?: \[(\d+)\])? is used but has no driver", r.stdout + r.stderr):
+        und[mod].append((wire, bit))
+    tied = 0
+    for f in files:
+        t = (s / f).read_text()
+        for mod, ws in und.items():
+            m = re.search(rf"^module {re.escape(mod)}\b.*?^endmodule", t, re.S | re.M)
+            if not m:
+                continue
+            body = "".join(f"  assign {w}{'[' + b + ']' if b else ''} = 1'b0;  // tied by qor_suite.py (undriven)\n"
+                           for w, b in ws)
+            end = m.end() - len("endmodule")
+            t = t[:end] + body + t[end:]
+            tied += len(ws)
+        (s / f).write_text(t)
+    print(f"{name}: tied {tied} undriven wire bits to 0")
+    return tied
+
+
 def cmd_wrap(names, dry):
     for name in names:
         d = DESIGNS[name]
@@ -303,6 +339,9 @@ def cmd_wrap(names, dry):
                 continue
             (s / "ports.json").unlink()
             (s / "suite_top.v").write_text(text)
+            (s / "files.txt").write_text("\n".join(sorted(f.name for f in s.glob("*.v"))) + "\n")
+            if d.get("tie_undriven"):
+                winfo["tied_undriven"] = tie_undriven(name, s)
             url, commit = CONFIG["repos"].get(d["origin"], (d["origin"], ""))
             info.update(top="suite_top", files=sorted(f.name for f in s.glob("*.v")), dut=d["top"],
                         params=d.get("params", {}), origin=f"{url} {commit}".strip(), **winfo)
@@ -455,6 +494,22 @@ def open_place_metrics(routed, part):
     return place_metrics(nets_sites, pips, part)
 
 
+def release_args(name, xdc):
+    """build_openxc7 arguments for the release defaults of CONFIG["release"] (an install prefix)."""
+    sys.path.insert(0, str(ROOT))
+    from ofx import defaults
+    pre = Path(CONFIG["release"])
+    opts = dict(defaults.CONFIG["defaults"])
+    synth, _ = defaults.synth_script(opts, xdc, pre / defaults.CONFIG["plugins"])
+    fabric = "xc7a100t" if part_of(name).startswith(("xc7a75t", "xc7a100t")) else "xc7a50t"
+    placer, _ = defaults.placer_args(opts)
+    args = ["--chipdb", str(pre / "share/nextpnr/himbaechel/xilinx" / f"chipdb-{fabric}.bin"),
+            "--db-root", str(pre / "share/nextpnr/external/prjxray-db")]
+    if synth:
+        args += ["--synth", synth]
+    return args + [f"--nextpnr-arg={x}" for x in defaults.nextpnr_args(opts) + (placer or [])]
+
+
 def open_one(name, period, seed, label, extra, dry):
     s = ddir(name) / "src"
     d = run_dir(name, period, seed, label)
@@ -468,26 +523,37 @@ def open_one(name, period, seed, label, extra, dry):
     (d / "constraints.xdc").write_text(xdc_text(name, period))
     files = (s / "files.txt").read_text().split()
     top = (s / "top.txt").read_text().strip()
+    if CONFIG["release"]:
+        extra = release_args(name, d / "constraints.xdc") + extra
     cmd = [sys.executable, str(CONFIG["build_openxc7"]), str(s), "--top", top, "--xdc", str(d / "constraints.xdc"),
            "--part", part_of(name), "--seed", str(seed), "--freq", f"{1000.0 / period:.3f}", "--out", str(d / "impl"),
            "--nextpnr", str(CONFIG["npwait"]), "--nextpnr-arg=--timing-allow-fail", "--run", "--rtl"] + files + extra
-    env = dict(os.environ, OFX_NEXTPNR_BIN=str(CONFIG["nextpnr"]), OFX_MAX_NEXTPNR=CONFIG["max_nextpnr"])
+    wl = d / "npwait.log"
+    if wl.exists():
+        wl.unlink()
+    env = dict(os.environ, OFX_NEXTPNR_BIN=str(CONFIG["nextpnr"]), OFX_MAX_NEXTPNR=CONFIG["max_nextpnr"],
+               OFX_NPWAIT_LOG=str(wl))
     mem_wait()
+    load0 = loadavg()
     t0 = time.time()
     r = subprocess.run(["/usr/bin/time", "-v"] + cmd, cwd=s, env=env, capture_output=True, text=True)
     wall = time.time() - t0
+    load1 = loadavg()
+    waited = sum(float(x) for x in re.findall(r"waited (\d+)", wl.read_text())) if wl.exists() else None
     (d / "build.log").write_text(r.stdout + r.stderr)
     impl = d / "impl"
     st = parse_stage_times(r.stdout)
     npl = (impl / "nextpnr.log").read_text(errors="replace") if (impl / "nextpnr.log").exists() else ""
     nm = nextpnr_metrics(npl)
     rss = re.search(r"Maximum resident set size \(kbytes\): (\d+)", r.stderr)
+    cpu = time_v_cpu(r.stderr)
     res = {"design": name, "period": period, "seed": seed, "label": label, "ok": r.returncode == 0 and (impl / f"{top}.bit").exists(),
            "wall_s": wall, "stage_s": {"synth": st.get("yosys"), "place": (st["nextpnr"] - nm["route_s_log"]) if "nextpnr" in st else None,
                                        "route": nm["route_s_log"] if "nextpnr" in st else None,
                                        "bitstream": (st.get("fasm2frames") or 0) + (st.get("xc7frames2bit") or 0)},
            "peak_rss_gb": int(rss.group(1)) / 1048576 if rss else None, "fmax_nextpnr": nm["fmax_nextpnr"],
-           "util_nextpnr": nm["util_nextpnr"], "extra": extra}
+           "util_nextpnr": nm["util_nextpnr"], "extra": extra, "queue_wait_s": waited, "cpu_s": cpu,
+           "loadavg": [load0, load1], "nextpnr_bin": str(CONFIG["nextpnr"]), "nproc": os.cpu_count()}
     if (impl / f"{top}.json").exists():
         res["cells"] = stat_cells(impl / f"{top}.json")
     if res["ok"]:
@@ -505,25 +571,54 @@ def open_one(name, period, seed, label, extra, dry):
     return res
 
 
+def seeds_of(a):
+    """Open-flow runs per design. nextpnr-xilinx's placer and router use criticality relative to the worst slack, so the
+    target period does not change the result (aes at 6 ns and 11.08 ns: bit-identical FASM, 2026-11-08); a period sweep
+    like Vivado's is therefore flat. The open flow gets the same number of runs as Vivado's sweep, as seeds."""
+    if a.seeds:
+        return a.seeds
+    return [1] if a.quick or a.no_sweep else list(range(1, CONFIG["sweep_runs"] + 1))
+
+
 def sweep_open(name, a, dry, label, extra):
-    """nextpnr-timer sweep: start at the design's period, then the period nextpnr achieved, best of the runs."""
+    """Seed sweep at the design's start period; Fmax = best of the runs."""
     runs = []
     p = a.period or DESIGNS[name]["period"]
-    nrun = 1 if a.quick or a.no_sweep else CONFIG["sweep_runs"]
-    for seed in a.seeds:
-        q = p
-        for i in range(nrun):
-            r = open_one(name, q, seed, label, extra, dry)
-            if r is None:
-                break
-            runs.append(r)
-            if not r["ok"] or not r["fmax_nextpnr"]:
-                break
-            nq = round(1000.0 / r["fmax_nextpnr"], 2)
-            if abs(nq - q) < 0.05:
-                break
-            q = nq
+    for seed in seeds_of(a):
+        r = open_one(name, p, seed, label, extra, dry)
+        if r is None:
+            continue
+        runs.append(r)
+        if not r["ok"]:
+            break
     return runs
+
+
+def loadavg():
+    try:
+        return float(Path("/proc/loadavg").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def time_v_cpu(text):
+    u = re.search(r"User time \(seconds\): ([\d.]+)", text)
+    sy = re.search(r"System time \(seconds\): ([\d.]+)", text)
+    return float(u.group(1)) + float(sy.group(1)) if u and sy else None
+
+
+def open_runs(name, label, period=None):
+    """result.json of the open runs at the start period (older runs at other periods are bit-identical duplicates)."""
+    p0 = period or DESIGNS[name]["period"]
+    out = []
+    for f in sorted((ddir(name) / "open" / label).glob("*/result.json")):
+        r = json.loads(f.read_text())
+        if abs(r["period"] - p0) < 1e-6:
+            r["dir"] = f.parent.name
+            if r.get("cpu_s") is None and (f.parent / "build.log").exists():
+                r["cpu_s"] = time_v_cpu((f.parent / "build.log").read_text(errors="replace"))
+            out.append(r)
+    return out
 
 
 def cmd_open(names, a, dry):
@@ -562,19 +657,74 @@ def vivado_jobs(names, a):
         nrun = 1 if a.quick or a.no_sweep else CONFIG["sweep_runs"]
         if "free" in a.modes:
             lines.append(f"{name} free {p:g} {nrun}")
-        if "placed" in a.modes and not a.quick:
-            runs = [json.loads(f.read_text()) for f in (ddir(name) / "open" / a.label).glob("*/result.json")]
-            ok = [r for r in runs if r["ok"]]
-            if not ok:
-                continue
-            best = max(ok, key=lambda r: r["fmax_nextpnr"] or 0)
-            lines.append(f"{name} placed {best['period']:g} 1 {ptag(best['period'])}_s{best['seed']}")
+        if "placed" in a.modes:
+            for r in open_runs(name, a.label, a.period):
+                if r["ok"] and r["fmax_nextpnr"] and r["seed"] in seeds_of(a):
+                    lines.append(f"{name} placedx {round(1000.0 / r['fmax_nextpnr'], 2):g} 1 {a.label}_{r['dir']}")
     return lines
+
+
+CARRY_SPLIT = re.compile(r"\$split\$muxcy\d+\$PACKED_CARRY4\$$")
+
+
+def exact_export(name, rd, top, pd):
+    """Exact import of an open run for Vivado (flow/xroute.py export, the method of flow/exact_src.py): the netlist
+    is nextpnr's physical netlist (its feed-through LUT1s and split CARRY4s are cells), LUTRAM macros are placed sub-cell
+    by sub-cell, LUT pins are locked as nextpnr used them. Vivado then only routes (and places what place_cell refuses,
+    counted as missed). The older 'placed' mode (placement_rows) imposed only cells of the yosys netlist and let Vivado
+    choose LUT pins and LUTRAM sites: 7-21 % optimistic on rv_soc against this import (packing agent, 2026-11-08)."""
+    import device
+    import xroute
+    tmp = CONFIG["out"] / "exact" / pd.name
+    (tmp / "run").mkdir(parents=True, exist_ok=True)
+    (tmp / "run" / "status.json").write_text(json.dumps({"cmd": ["--json", str(rd / "impl" / f"{top}.json")]}))
+    npr = tmp / "npr"
+    npr.mkdir(exist_ok=True)
+    if not (npr / "routed.json").exists():
+        (npr / "routed.json").symlink_to(rd / "impl" / f"{top}_routed.json")
+    r = device.resolve(part_of(name))
+    xroute.CONFIG["tilegrid"] = Path(r["db_root"]) / r["family"] / r["fabric"] / "tilegrid.json"
+    xroute.CONFIG["out"] = tmp / "x"
+    xroute.name_of = lambda d, c="cal": pd.name
+    xroute.src_run = lambda d: tmp / "run"
+    xroute.dinfo = lambda d: {"top": top, "xdc": str(rd / "constraints.xdc")}
+    d = xroute.export(name, npr, False, "cal")
+    for f in ("netlist.edf", "place.txt", "macros.txt", "lockpins.txt", "export.json"):
+        shutil.copy(d / f, pd / f)
+    ex = json.loads((d / "export.json").read_text())
+    return {k: ex[k] for k in ("stats", "place", "macros", "lockpins")}
+
+
+def placement_rows(routed, netlist_cells):
+    """nextpnr placement as (cell, BEL) rows for Vivado's place_cell, named as in the synthesized netlist. CARRY4s
+    carry nextpnr's packing suffix ($split$muxcy<N>$PACKED_CARRY4$, any N). Cells absent from the synthesized netlist
+    are nextpnr-only physical cells (carry DI route-through LUTs `$LUT$`, constant feeds `$feed$`, duplicates `_DUP`);
+    they are not placed (Vivado makes its own) and counted in place_info.json."""
+    j = json.loads(Path(routed).read_text())
+    m = j["modules"][next(iter(j["modules"]))]
+    rows, info, seen = [], collections.Counter(), {}
+    for name, c in m["cells"].items():
+        bel = c["attributes"].get("NEXTPNR_BEL")
+        if not bel or c["type"] in {"PAD", "PSEUDO_GND", "PSEUDO_VCC", "BUFGCTRL", "ICAP_ICAP"} or c["type"].startswith("IOB33"):
+            info["skipped_io_global"] += 1
+            continue
+        n = CARRY_SPLIT.sub("", name) if c["type"] == "CARRY4" else name
+        if n not in netlist_cells:
+            info["physical_only"] += 1
+            continue
+        if n in seen:
+            info["carry_split"] += 1
+            if "$muxcy0$" in name:
+                rows[seen[n]] = (n, bel)
+            continue
+        seen[n] = len(rows)
+        rows.append((n, bel))
+    info["rows"] = len(rows)
+    return rows, dict(info)
 
 
 def stage_vivado(names, a, dry):
     """Copy sources and our placements to the Windows work tree; returns the job file path."""
-    import qor_xtime
     w = CONFIG["win_work"] / "designs" / CONFIG["vivado_tag"]
     jobs = vivado_jobs(names, a)
     for line in jobs:
@@ -590,20 +740,18 @@ def stage_vivado(names, a, dry):
                 shutil.copy(x, dst / x.name)
         (dst / "constraints.xdc.tpl").write_text(re.sub(r"(create_clock[^\n]*-period\s+)[\d.]+", r"\1@PERIOD@",
                                                         xdc_text(name, 10.0)))
-        if mode == "placed":
-            rd = ddir(name) / "open" / a.label / f[4]
+        if mode == "placedx":
+            rd = ddir(name) / "open" / a.label / f[4][len(a.label) + 1:]
             top = (ddir(name) / "src" / "top.txt").read_text().strip()
-            pd = w / f"{name}__placed_{f[4]}"
+            pd = w / f"{name}__placedx_{f[4]}"
             pd.mkdir(parents=True, exist_ok=True)
-            subprocess.run([yosys_bin(), "-q", "-p", f"read_json {rd / 'impl' / (top + '.json')}; delete t:$scopeinfo; "
-                            f"write_edif -pvector bra {pd / 'netlist.edf'}"], check=True)
-            rows, skipped = qor_xtime.placement(rd / "impl" / f"{top}_routed.json")
-            (pd / "place.txt").write_text("".join(f"{{{n}}} {b}\n" for n, b in rows))
-            (pd / "place_info.json").write_text(json.dumps({"rows": len(rows), "skipped": skipped}) + "\n")
+            info = exact_export(name, rd, top, pd)
+            info.update(source=str(rd), nextpnr_bin=json.loads((rd / "result.json").read_text()).get("nextpnr_bin"))
+            (pd / "place_info.json").write_text(json.dumps(info) + "\n")
             shutil.copy(dst / "constraints.xdc.tpl", pd / "constraints.xdc.tpl")
             (pd / "top.txt").write_text(top + "\n")
             (pd / "part.txt").write_text(part_of(name) + "\n")
-    jf = CONFIG["win_work"] / "build" / CONFIG["vivado_tag"] / f"jobs_{a.label}.txt"
+    jf = CONFIG["win_work"] / "build" / CONFIG["vivado_tag"] / f"jobs_{a.label}_{os.getpid()}.txt"
     if not dry:
         jf.parent.mkdir(parents=True, exist_ok=True)
         jf.write_text("\n".join(jobs) + "\n")
@@ -617,6 +765,29 @@ def stage_vivado(names, a, dry):
 def vivado_running():
     r = subprocess.run(["tasklist.exe"], capture_output=True, text=True)
     return "vivado.exe" in r.stdout.lower()
+
+
+def others_waiting():
+    for q in CONFIG["yield_queues"]:
+        if q.exists() and q.read_text().strip():
+            return f"queue {q}"
+    r = subprocess.run(["pgrep", "-af", CONFIG["yield_procs"]], capture_output=True, text=True)
+    lines = [l for l in r.stdout.splitlines() if "qor_suite" not in l]
+    return f"process {lines[0][:80]}" if lines else None
+
+
+def yield_to_others():
+    t0, last = time.time(), None
+    while True:
+        w = others_waiting()
+        if not w:
+            if last:
+                print(f"  yielded {time.time() - t0:.0f} s", flush=True)
+            return
+        if w != last:
+            print(f"  yielding to {w}", flush=True)
+            last = w
+        time.sleep(CONFIG["yield_poll_s"])
 
 
 def cmd_vivado(names, a, dry):
@@ -645,11 +816,10 @@ def cmd_vivado(names, a, dry):
             continue
         one.write_text(job + chr(10))
         while True:
-            sh = (f"source {CONFIG['slot_helper']}; trap 'exit 143' TERM HUP INT; "
-                  "while true; do a=$(win_avail_mb); if [ -n \"$a\" ] && [ \"$a\" -ge 3500 ] && _viv_mkdir vivado.lock2; "
-                  "then VIV_HELD=vivado.lock2; break; fi; if _viv_mkdir vivado.lock; then VIV_HELD=vivado.lock; break; fi; "
-                  "sleep 30; done; trap '_viv_rmdir \"$VIV_HELD\"' EXIT; "
-                  f"echo \"slot $VIV_HELD\"; t0=$(date +%s); " + " ".join(f"'{x}'" for x in args)
+            yield_to_others()
+            sh = (f"{'export VIV_SLOT1_ONLY=1; ' if CONFIG['slot1_only'] else ''}"
+                  f"source {CONFIG['slot_helper']}; trap 'exit 143' TERM HUP INT; vivado_acquire; "
+                  f"echo \"slot $VIV_HELD $(date '+%F %T')\"; t0=$(date +%s); " + " ".join(f"'{x}'" for x in args)
                   + "; rc=$?; echo \"vivado rc=$rc $(( $(date +%s) - t0 )) s\"; vivado_release; exit $rc")
             subprocess.run(["bash", "-c", sh], cwd="/mnt/c/Users/finnf")
             print(f"  {job.split()[0]}: log {log}", flush=True)
@@ -660,9 +830,11 @@ def cmd_vivado(names, a, dry):
 
 
 def vivado_results(name, mode="free"):
+    """mode: free, or placed_<label> (Vivado timer on that label's placements)."""
     d = CONFIG["win_work"] / "build" / CONFIG["vivado_tag"]
     out = []
-    for f in sorted(d.glob(f"{name}__{mode}*/run*/result.txt")):
+    pat = f"{name}__free/run*/result.txt" if mode == "free" else f"{name}__{mode}_*/run*/result.txt"
+    for f in sorted(d.glob(pat)):
         r = {}
         for line in f.read_text().splitlines():
             k, _, v = line.partition(" ")
@@ -698,31 +870,61 @@ def gmean(xs):
     return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else None
 
 
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def placed_info(dirname):
+    f = CONFIG["win_work"] / "designs" / CONFIG["vivado_tag"] / dirname / "place_info.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
 def summarize(name, label):
-    runs = [json.loads(f.read_text()) for f in (ddir(name) / "open" / label).glob("*/result.json")]
+    runs = open_runs(name, label)
     ok = [r for r in runs if r["ok"]]
-    s = {"design": name, "kind": DESIGNS[name]["kind"], "part": part_of(name), "open_runs": len(runs), "open_ok": len(ok)}
-    p0 = DESIGNS[name]["period"]
-    first = next((r for r in ok if abs(r["period"] - p0) < 1e-6), ok[0] if ok else None)
+    s = {"design": name, "kind": DESIGNS[name]["kind"], "part": part_of(name), "open_runs": len(runs), "open_ok": len(ok),
+         "open_seeds": sorted(r["seed"] for r in runs)}
     if ok:
         best = max(ok, key=lambda r: r["fmax_nextpnr"] or 0)
-        s["open"] = {"fmax_nextpnr": best["fmax_nextpnr"], "best_period": best["period"], "cells": first.get("cells"),
-                     "stage_s": first["stage_s"], "wall_s": first["wall_s"], "power_w": first.get("power_w"),
-                     "place": first.get("place_metrics"), "period": first["period"]}
+        first = min(ok, key=lambda r: r["seed"])
+        known = [r for r in ok if r.get("queue_wait_s") is not None]
+        tw = [r["wall_s"] - r["queue_wait_s"] for r in known] if known else [r["wall_s"] for r in ok]
+        s["open"] = {"fmax_nextpnr": best["fmax_nextpnr"], "best_seed": best["seed"], "cells": first.get("cells"),
+                     "stage_s": first["stage_s"], "wall_s": median(tw), "wall_raw_s": median([r["wall_s"] for r in ok]),
+                     "queue_s": median([r.get("queue_wait_s") for r in known]) if known else None,
+                     "queue_known": len(known), "cpu_s": median([r.get("cpu_s") for r in ok]),
+                     "loadavg": median([x for r in known for x in (r.get("loadavg") or []) if x is not None]),
+                     "power_w": first.get("power_w"), "place": first.get("place_metrics"), "period": first["period"],
+                     "fmax_seeds": {r["seed"]: r["fmax_nextpnr"] for r in ok}}
     vr = vivado_results(name, "free")
     vok = [r for r in vr if r.get("rc") == "0"]
+    p0 = DESIGNS[name]["period"]
     if vok:
         fm = [1000.0 / (num(r["period"]) - num(r["wns"])) for r in vok if num(r.get("wns")) is not None]
         v0 = next((r for r in vok if abs(num(r["period"]) - p0) < 1e-6), vok[0])
         s["vivado"] = {"fmax": max(fm) if fm else None, "util": {k: num(v0.get(k)) for k in ("LUT", "FF", "BRAM36", "DSP", "LUTRAM")},
                        "stage_s": {k: num(v0.get(f"t_{k}")) for k in ("synth", "place", "route", "bitstream")},
-                       "wall_s": num(v0.get("t_total")), "power_w": num(v0.get("power_total")),
+                       "wall_s": num(v0.get("t_total")), "cpu_s": num(v0.get("cpu_total")),
+                       "cpu_s_runs": [num(r.get("cpu_total")) for r in vok if r.get("cpu_total")],
+                       "wall_s_runs": [num(r.get("t_total")) for r in vok],
+                       "power_w": num(v0.get("power_total")),
                        "power_dynamic_w": num(v0.get("power_dynamic")), "threads": v0.get("threads"),
-                       "place": viv_place_metrics(v0["dir"], part_of(name)), "period": num(v0["period"])}
+                       "place": viv_place_metrics(v0["dir"], part_of(name)), "period": num(v0["period"]), "runs": len(vok)}
     s["vivado_runs"], s["vivado_ok"] = len(vr), len(vok)
-    xr = [r for r in vivado_results(name, "placed") if r.get("rc") == "0" and num(r.get("wns")) is not None]
+    xr = [r for r in vivado_results(name, f"placedx_{label}") if r.get("rc") == "0" and num(r.get("wns")) is not None]
     if xr:
-        s["open_vivado_timer_fmax"] = max(1000.0 / (num(r["period"]) - num(r["wns"])) for r in xr)
+        fx = {r["dir"].parent.name: 1000.0 / (num(r["period"]) - num(r["wns"])) for r in xr}
+        bt = max(fx, key=fx.get)
+        rb = next(r for r in xr if r["dir"].parent.name == bt)
+        pi = placed_info(bt)
+        s["open_vivado_timer_fmax"] = fx[bt]
+        s["placed"] = {"runs": len(xr), "fmax_runs": sorted(round(v, 1) for v in fx.values()),
+                       "placed": num(rb.get("placed")), "missed": num(rb.get("missed")), "rows": pi.get("rows"),
+                       "lutram_macros": pi.get("macros"), "lockpins": num(rb.get("lockpins"))}
     return s
 
 
@@ -732,6 +934,7 @@ def goodness(s):
     if not o or not v:
         return g
     fo = s.get("open_vivado_timer_fmax") or o["fmax_nextpnr"]
+    s["fmax_timer"] = "Vivado" if s.get("open_vivado_timer_fmax") else "nextpnr"
     g["fmax"] = fo / v["fmax"] if fo and v["fmax"] else None
     ar = []
     c = o.get("cells") or {}
@@ -815,19 +1018,33 @@ def cmd_report(names, a, dry):
     L.append("## Method\n")
     L.append(f"- Machine: {mc['cpu']}, {mc['threads_wsl']} hardware threads; the open flow runs in WSL2 with "
              f"{mc['mem_gb_wsl']} GB, Vivado 2025.2 on Windows on the same CPU. Vivado runs with its default thread count "
-             f"(`general.maxThreads` = {', '.join(threads) or '?'}); yosys and nextpnr run single-threaded. Other jobs shared "
-             "the machine, so wall-clock times are noisy.")
+             f"(`general.maxThreads` = {', '.join(threads) or '?'}, confirmed per run in result.txt and by place_design's "
+             "\"maximum of 2 CPUs\"); yosys and nextpnr run single-threaded. Other agents' jobs shared the machine. Build "
+             "time is therefore given three ways: wall clock (Vivado: the start-period run; open flow: median over the seeds "
+             "of wall clock minus the time queued for a nextpnr slot in ofx/npwait.sh, which is not tool time), CPU seconds "
+             "(Vivado: the process's TotalProcessorTime from Windows; open flow: user + system of the whole build from "
+             "`/usr/bin/time`), and the WSL 1-minute load average during the open runs. CPU seconds are not inflated by "
+             "waiting for a core, so they are the load-robust check; g build time uses the wall clock.")
     L.append("- Every design builds from the same RTL in both tools. A wrapped design is the upstream core inside `suite_top`: "
              "its inputs come from a 32-bit LFSR shift chain, its outputs are registered and XOR-reduced to one pin, so nothing "
              "is optimised away and the I/O count fits any package. Native designs (fir, bram, rv_big) use their own top.")
     L.append("- Vivado alone: `synth_design`, `opt_design`, `place_design`, `route_design`, `write_bitstream`, default "
              "strategies. Fmax sweep: run at the design's start period, then at the achieved period (period - WNS), up to "
              f"{CONFIG['sweep_runs']} runs; Fmax = max over runs of 1000 / (period - WNS), Vivado's timer.")
+    L.append(f"- Open flow runs: {CONFIG['sweep_runs']} seeds at the design's start period (the same number of runs as "
+             "Vivado's sweep). A period sweep does not work for nextpnr-xilinx: its placer and router weight paths by "
+             "criticality relative to the worst slack, so the target period does not change the result (aes at 6 ns and "
+             "at 11.08 ns gave bit-identical FASM, 2026-11-08); seeds are the only knob that changes the result.")
     L.append("- Open flow: `flow/build_openxc7.py` (the plain `ofx build` flow: yosys `synth_xilinx -flatten -abc9`, "
-             "nextpnr-xilinx, fasm2frames, xc7frames2bit). Sweep driven by nextpnr's reported Fmax the same way. "
-             "\"Fmax (Vivado timer)\" is Vivado's timer on the open flow's netlist with every cell at nextpnr's BEL "
-             "(`place_cell`, then Vivado routes: our placement, Vivado's routing). Where that step is missing the "
-             "nextpnr timer is used and the cell says so.")
+             "nextpnr-xilinx, fasm2frames, xc7frames2bit). "
+             "\"ours, Vivado timer\" (placed mode, exact import) is Vivado's timer on the open flow's implementation: "
+             "nextpnr's physical netlist (its feed-through LUT1s and split CARRY4s included) exported by flow/xroute.py, "
+             "every cell fixed at nextpnr's BEL, LUTRAM macros placed sub-cell by sub-cell, LUT pins locked as nextpnr "
+             "used them; Vivado then only routes (`route_design`) and times. One Vivado run per seed at the period "
+             "nextpnr reported for that seed, best over the seeds. Cells place_cell refuses are left to Vivado and "
+             "counted. This is the like-for-like Fmax; where it is missing g Fmax falls back to the nextpnr timer and the "
+             "table says so. An earlier import (yosys-netlist cells only, Vivado's LUT pins and LUTRAM sites) read 7-21 % "
+             "optimistic on rv_soc and is not used.")
     L.append("- Area: LUT (logic LUTs), FF, BRAM (36 Kb equivalents), DSP after implementation (Vivado: report_utilization; "
              "open: cell counts of the yosys netlist). Power: Vivado `report_power` (vectorless defaults) and `ofx power` "
              "(the open estimate); `-` where the open power model is not installed.")
@@ -854,23 +1071,28 @@ def cmd_report(names, a, dry):
              + " | ".join(fmt(gm[k]) for k in W) + " |\n")
     L.append(f"Open-flow build failures: {nfail} of {len(rows)} designs (scored 0, not in the geometric mean).\n")
     L.append("## Fmax and area\n")
-    L.append("| design | Vivado Fmax | ours, Vivado timer | ours, nextpnr timer | LUT V / ours | FF V / ours | BRAM V / ours | DSP V / ours | power V / ours (W) |")
-    L.append("|---|---|---|---|---|---|---|---|---|")
+    L.append("| design | Vivado Fmax | ours, Vivado timer | ours, nextpnr timer | g Fmax timer | our cells at nextpnr BEL | LUT V / ours | FF V / ours | BRAM V / ours | DSP V / ours | power V / ours (W) |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
         o, v = r.get("open") or {}, r.get("vivado") or {}
         c, u = o.get("cells") or {}, v.get("util") or {}
+        pl = r.get("placed") or {}
+        cov = (f"{int(pl['placed'])} / {int(pl['placed'] + pl['missed'])}"
+               if pl.get("placed") is not None and pl.get("missed") is not None else "-")
         L.append(f"| {r['design']} | {fmt(v.get('fmax'), 1)} | {fmt(r.get('open_vivado_timer_fmax'), 1)} | {fmt(o.get('fmax_nextpnr'), 1)} | "
+                 f"{r.get('fmax_timer', '-') if r['g'].get('fmax') else '-'} | {cov} | "
                  + " | ".join(f"{fmt(u.get(k), 0) if u.get(k) is not None else '-'} / {c.get(k, '-')}" for k in ("LUT", "FF", "BRAM36", "DSP"))
                  + f" | {fmt(v.get('power_w'), 3)} / {fmt(o.get('power_w'), 3)} |")
     L.append("\n## Build time by stage (seconds, start period)\n")
-    L.append("| design | Vivado synth | place | route | bitstream | total | ours synth | place | route | bitstream | total |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("| design | Vivado synth | place | route | bitstream | total | ours synth | place | route | bitstream | total (queue removed) | ours queued | CPU s V / ours | load avg (open runs) |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
         o, v = r.get("open") or {}, r.get("vivado") or {}
         vs, os_ = v.get("stage_s") or {}, o.get("stage_s") or {}
         L.append(f"| {r['design']} | " + " | ".join(fmt(vs.get(k), 1) for k in ("synth", "place", "route", "bitstream"))
                  + f" | {fmt(v.get('wall_s'), 1)} | " + " | ".join(fmt(os_.get(k), 1) for k in ("synth", "place", "route", "bitstream"))
-                 + f" | {fmt(o.get('wall_s'), 1)} |")
+                 + f" | {fmt(o.get('wall_s'), 1)} | {fmt(o.get('queue_s'), 0) if o.get('queue_known') else 'not logged'} | "
+                 f"{fmt(v.get('cpu_s'), 0)} / {fmt(o.get('cpu_s'), 0)} | {fmt(o.get('loadavg'), 1)} |")
     L.append("\n## Placement quality (start period)\n")
     L.append("| design | HPWL V / ours | routed INT pips V / ours | peak pips per INT tile V / ours | p99 V / ours | place time V / ours (s) | builds ok V / ours |")
     L.append("|---|---|---|---|---|---|---|")
@@ -881,15 +1103,48 @@ def cmd_report(names, a, dry):
                  f"{pv.get('int_pips_peak', '-')} / {po.get('int_pips_peak', '-')} | {pv.get('int_pips_p99', '-')} / {po.get('int_pips_p99', '-')} | "
                  f"{fmt((v.get('stage_s') or {}).get('place'), 1)} / {fmt((o.get('stage_s') or {}).get('place'), 1)} | "
                  f"{r['vivado_ok']}/{r['vivado_runs']} / {r['open_ok']}/{r['open_runs']} |")
+    L.append("\n## Running it, and quick runs of a variant\n")
+    L.append("- Full scoreboard: `python3 flow/qor_suite.py open --run` (3 seeds per design), `vivado --modes free --run` "
+             "(Vivado alone), `vivado --modes placed --run` (Vivado timer on every open run), `report --run`. Finished runs "
+             "are cached and skipped. nextpnr runs only through ofx/npwait.sh with OFX_MAX_NEXTPNR=2; every Vivado "
+             "invocation (one per design) takes a slot with vivado/vivado_slot.sh `vivado_acquire` and releases it after.")
+    L.append(f"- Quick mode (`--quick`): designs {', '.join(CONFIG['quick'])}, seed 1, start period, one Vivado run. "
+             "Variant runs keep their results apart from base under a name (`--variant NAME`, same as `--label`):")
+    L.append("")
+    L.append("```")
+    L.append("python3 flow/qor_suite.py open   --quick --variant NAME [--nextpnr /path/to/nextpnr-xilinx] \\")
+    L.append("        [--np-arg=--placer-static-anchor-init --np-arg=20] [--np-opt key=value] [--synth 'yosys cmds'] --run")
+    L.append("python3 flow/qor_suite.py vivado --quick --variant NAME --modes placed --run   # Vivado timer on NAME's placements")
+    L.append("python3 flow/qor_suite.py report --quick --variant NAME --run                 # build/qor_suite/scoreboard_NAME.md")
+    L.append("```")
+    L.append("")
+    L.append("- The variant report has the same tables plus \"Variant NAME against base\" (Fmax by both timers for the "
+             "same seeds). The Vivado-alone reference (`--modes free`) does not depend on the variant and is shared; run it "
+             "once for designs that lack it. `--nextpnr` needs `--variant` (base is the reference flow). Add `--seeds 1 2 3` "
+             "for a seed sweep instead of seed 1. Without `--run` every step is a dry run that prints what it would do.")
+    if a.label != "base":
+        L.append(f"\n## Variant `{a.label}` against base\n")
+        L.append("Best over the variant's seeds, base restricted to the same seeds. Vivado Fmax is the Vivado-alone reference.\n")
+        L.append("| design | Vivado Fmax | ours, Vivado timer: base / variant | ours, nextpnr timer: base / variant | seeds |")
+        L.append("|---|---|---|---|---|")
+        for r in rows:
+            seeds = sorted(set(r["open_seeds"]))
+            ob = {x["seed"]: x["fmax_nextpnr"] for x in open_runs(r["design"], "base") if x["ok"] and x["seed"] in seeds}
+            xb = [1000.0 / (num(x["period"]) - num(x["wns"])) for x in vivado_results(r["design"], "placedx_base")
+                  if x.get("rc") == "0" and num(x.get("wns")) is not None
+                  and any(x["dir"].parent.name.endswith(f"_s{sd}") for sd in seeds)]
+            L.append(f"| {r['design']} | {fmt((r.get('vivado') or {}).get('fmax'), 1)} | {fmt(max(xb) if xb else None, 1)} / "
+                     f"{fmt(r.get('open_vivado_timer_fmax'), 1)} | {fmt(max(ob.values()) if ob else None, 1)} / "
+                     f"{fmt((r.get('open') or {}).get('fmax_nextpnr'), 1)} | {','.join(map(str, seeds)) or '-'} |")
     text = "\n".join(L) + "\n"
     if dry:
         print(text)
         return
-    if a.label == "base":
+    if a.label == "base" and not a.quick and not a.designs:
         CONFIG["doc"].write_text(text)
         print(f"wrote {CONFIG['doc']}")
     else:
-        p = CONFIG["out"] / f"scoreboard_{a.label}.md"
+        p = CONFIG["out"] / f"scoreboard_{a.label}{'_quick' if a.quick else ''}.md"
         p.write_text(text)
         print(f"wrote {p}")
 
@@ -901,15 +1156,30 @@ def main():
     ap.add_argument("--quick", action="store_true", help="QUICK subset, one seed, fixed period, no sweep, no xtime")
     ap.add_argument("--no-sweep", action="store_true")
     ap.add_argument("--period", type=float, help="fixed period in ns for every design (default: per design)")
-    ap.add_argument("--seeds", type=int, nargs="+", default=CONFIG["seeds"])
+    ap.add_argument("--seeds", type=int, nargs="+", help="open-flow seeds (default 1..3, quick: 1)")
     ap.add_argument("--label", default="base", help="result label for a variant of the open flow (default base)")
+    ap.add_argument("--variant", help="same as --label: name of a variant of the open flow")
+    ap.add_argument("--nextpnr", help="nextpnr-xilinx binary for the open runs (default toolchain/openxc7/bin)")
     ap.add_argument("--np-opt", action="append", default=[], help="extra nextpnr -o option (variant runs)")
     ap.add_argument("--np-arg", action="append", default=[], help="extra nextpnr argument (variant runs)")
     ap.add_argument("--synth", help="yosys synthesis commands instead of the default ({top} is replaced)")
+    ap.add_argument("--release", help="install prefix: open runs with its nextpnr, chipdb, plugins and the ofx build "
+                                      "defaults (needs --variant)")
     ap.add_argument("--modes", nargs="+", default=["free", "placed"], help="vivado step: free and/or placed")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
     dry = CONFIG["dry_run"] and not a.run
+    if a.variant:
+        a.label = a.variant
+    if a.release:
+        if a.label == "base":
+            sys.exit("--release needs --variant NAME (base results are the reference flow)")
+        CONFIG["release"] = Path(a.release).expanduser().resolve()
+        CONFIG["nextpnr"] = CONFIG["release"] / "bin" / "nextpnr-himbaechel"
+    if a.nextpnr:
+        if a.label == "base":
+            sys.exit("--nextpnr needs --variant NAME (base results are the reference flow)")
+        CONFIG["nextpnr"] = Path(a.nextpnr).resolve()
     names = a.designs or (CONFIG["quick"] if a.quick else list(DESIGNS))
     unknown = [n for n in names if n not in DESIGNS]
     if unknown:

@@ -96,7 +96,7 @@ JSON encoding. `OFX_GT_DEFAULTS=0` turns it off. So a GT or PCIe instance no lon
 - A netlist without these cells is not rewritten (blinky_b3 JSON md5 unchanged), so other designs cannot change.
 
 This is a flow-side fix. The fix that belongs upstream is in nextpnr-xilinx's `fasm.cc` (UNISIM defaults in
-`write_gtp_channel`, `write_gtp_pll`, `write_pcie_2_1`, plus the SPARE_* attributes). It is not drafted here.
+`write_gtp_channel`, `write_gtp_pll`, `write_pcie_2_1`, plus the SPARE_* attributes). It is drafted as the opt-in `-o gt-unisim-defaults` (docs/drafts/nextpnr-gt-unisim-defaults.md): with an unfilled netlist it gives the same `.frames` as this workaround on pcie_bare and gtp_lbm (`flow/gt_unisim_check.sh`).
 
 ## 5. GTP against Vivado, and the PCIe endpoint (stretch)
 

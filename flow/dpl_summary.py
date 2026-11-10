@@ -5,6 +5,7 @@ packing metrics of flow/dpl_metrics.py.
 """
 import fnmatch
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -13,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dpl_metrics
 
 ROOT = Path(__file__).resolve().parent.parent
-DUMP = Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build/dpl_xtime")
+DUMP = Path("/mnt/c/Users/finnf/open-dfx-xc7-vivado/build/" + os.environ.get("DPL_XTIME", "dpl_xtime2"))
 XSRC = ROOT / "build" / "qor" / "dpl" / "xsrc"
 CACHE = ROOT / "build" / "qor" / "dpl" / "metrics"
 

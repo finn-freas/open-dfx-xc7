@@ -1,0 +1,50 @@
+--- a/himbaechel/uarch/xilinx/gen/xilinx_gen.py	2026-11-06 04:50:34.541825903 -0500
++++ b/himbaechel/uarch/xilinx/gen/xilinx_gen.py	2026-11-08 17:12:09.066204214 -0500
+@@ -1,3 +1,4 @@
++import os
+ from os import path
+ import sys
+ import argparse
+@@ -306,8 +307,8 @@
+                 if len(swn) == 2 and swn[0] in "ABCDEFGH" and swn[1] in "123456":
+                     i = int(swn[1])
+                     for j in range(1, 7):
+-                        if (i == 6) != (j == 6):
+-                            continue # don't allow permutation of input 6
++                        if (i == 6) != (j == 6) and not (LUT_A6_PERM and j == 6):
++                            continue
+                         pip_config = ("ABCDEFGH".index(swn[0]) << 8) | ((j - 1) << 4) | (i - 1)
+                         if s.rel_xy()[0] == 1:
+                             pip_config |= (4 << 8)
+@@ -315,7 +316,7 @@
+                             pip_class=PipClass.LUT_PERMUTATION,
+                             pip_config=pip_config,
+                             site_key=(s.index << 8),
+-                            timing="SITE_NULL"
++                            timing=(f"LUT_PIN_A{j}" if LUT_PIN_DELAY else "SITE_NULL")
+                         )
+                     # Add LUT route-through pseudo-pip
+                     rt_config = ("ABCDEFGH".index(swn[0]) << 8)
+@@ -569,6 +570,12 @@
+                 if entry.to_pin == "DOBDOU": import_bus_clkq(bram36, "DOBDO", 32, "CLKARDCLK" if rsdp else "CLKBWRCLK", entry)
+                 if entry.to_pin == "DOPBDOPU": import_bus_clkq(bram36, "DOPBDOP", 4, "CLKARDCLK" if rsdp else "CLKBWRCLK", entry)
+ 
++LUT_A6_PERM = os.environ.get("OFX_LUT_A6_PERM") == "1"
++
++
++LUT_PIN_DELAY = [int(x) for x in os.environ["OFX_LUT_PIN_DELAY"].split(",")] if os.environ.get("OFX_LUT_PIN_DELAY") else None
++
++
+ def main():
+     xlbase = path.join(path.dirname(path.realpath(__file__)), "..")
+ 
+@@ -677,6 +684,9 @@
+                 seen_nodes.add(uid)
+     # Stub timing class
+     ch.timing.set_pip_class("DEFAULT", "SITE_NULL", delay=TimingValue(20))
++    if LUT_PIN_DELAY:
++        for j in range(1, 7):
++            ch.timing.set_pip_class("DEFAULT", f"LUT_PIN_A{j}", delay=TimingValue(20 + LUT_PIN_DELAY[j - 1]))
+     for k, v in sorted(CELL_CAL.get("site_pips", {}).items()):
+         ch.timing.set_pip_class("DEFAULT", k, delay=TimingValue(*v))
+     # Stub bel timings. On virtex7 the LUT comb delay and the FF D/CK->Q

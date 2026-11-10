@@ -74,6 +74,8 @@ SCRIPTS = {
     "synch2": "+&scorr; &sweep; &synch2; &if {W} {D} {R} -v; &mfs",
     "satlut": "+&scorr; &sweep; &dc2; &dch -f -r; &ps; &if {W} {D} {R} -v; &mfs; &satlut -d",
     "noarea": "+&scorr; &sweep; &dc2; &dch -f -r; &ps; &if {W} {D} {R} -v",
+    "nofa": "+&scorr; &sweep; &dc2; &dch -f -r; &ps; &if {W} {D} {R} -F 0 -A 0 -v",
+    "nofa_mfs": "+&scorr; &sweep; &dc2; &dch -f -r; &ps; &if {W} {D} {R} -F 0 -A 0 -v; &mfs",
 }
 
 VARIANTS = {
@@ -123,6 +125,15 @@ VARIANTS = {
     "m_keepmem_dspq": {"yosys": YOSYS_SYNX, "scratch": "opt_dff.keep_memrd_regs 1", "dspq": True},
     "x1": {"scratch": "abc9.xaiger 1"},
     "k_mul": {"prep": "keepmul"},
+    "x1_cal_nofa": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "abc9_script": "nofa"},
+    "x1_cal_nofa_mfs": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "abc9_script": "nofa_mfs"},
+    "x1_nofa": {"scratch": "abc9.xaiger 1", "abc9_script": "nofa"},
+    "x1_cal_dch2": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "abc9_script": "dch2"},
+    "x1_cal_syn2": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "abc9_script": "syn2"},
+    "dx1_cal_syn2": {"scratch": "abc9.xaiger 1", "dspq": True, "lutlib": "flat200", "W": 450, "abc9_script": "syn2"},
+    "x1_cal_synch2": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "abc9_script": "synch2"},
+    "x1_cal_dff": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "dff": True},
+    "x1_cal_wm5": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "flags": "-widemux 5"},
     "k_mul_dspq": {"prep": "keepmul", "dspq": True},
     "x1_cal": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450},
     "x1_cal_dff": {"scratch": "abc9.xaiger 1", "lutlib": "flat200", "W": 450, "dff": True},

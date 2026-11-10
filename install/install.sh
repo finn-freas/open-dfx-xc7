@@ -470,13 +470,32 @@ build_yosys_plugins() {
     done
     sed -e 's/XilinxDspPass() : Pass("xilinx_dsp"/XilinxDspPass() : Pass("xilinx_dsp_qor"/' \
         -e 's/XilinxDspPass/XilinxDspQorPass/g' "$src/techlibs/xilinx/xilinx_dsp.cc" > "$gen/xilinx_dsp_qor.cc"
+    git -C "$src" show HEAD:passes/techmap/clkbufmap.cc | grep -n 'NEW_ID' | cut -d: -f1 > "$gen/clkbufmap_stock_lines"
     sed -e 's/Pass("clkbufmap",/Pass("clkbufmap_gapfix",/' -e 's/ClkbufmapPass/ClkbufmapGapfixPass/g' \
-        "$src/passes/techmap/clkbufmap.cc" > "$gen/clkbufmap_gapfix.cc"
+        "$src/passes/techmap/clkbufmap.cc" | awk 'NR == FNR { l[++n] = $1; next }
+        /NEW_ID/ { k++; print "#line " l[k] " \"clkbufmap.cc\""; print; print "#line " FNR + 1 " \"clkbufmap_gapfix.cc\""; next }
+        { print } END { if (k != n) exit 1 }' "$gen/clkbufmap_stock_lines" - > "$gen/clkbufmap_gapfix.cc"
     cp "$src/techlibs/xilinx/xilinx_asyncreg.cc" "$gen/xilinx_asyncreg.cc"
+    rm -rf "$gen/dspinit"; mkdir -p "$gen/dspinit/techlibs/xilinx" "$gen/dspinit/pm/techlibs/xilinx"
+    for f in xilinx_dsp.cc xilinx_dsp.pmg xilinx_dsp48a.pmg xilinx_dsp_CREG.pmg xilinx_dsp_cascade.pmg; do
+        git -C "$src" show "HEAD:techlibs/xilinx/$f" > "$gen/dspinit/techlibs/xilinx/$f"
+    done
+    for p in "$PATCHES_DSPINIT"/[0-9]*.patch; do
+        patch -s -d "$gen/dspinit" -p1 < "$p"
+    done
+    for p in xilinx_dsp xilinx_dsp48a xilinx_dsp_CREG xilinx_dsp_cascade; do
+        "$ENV/bin/python3" -I "$src/passes/pmgen/pmgen.py" -o "$gen/dspinit/pm/techlibs/xilinx/${p}_pm.h" \
+            "$gen/dspinit/techlibs/xilinx/$p.pmg"
+    done
+    { echo '#line 1 "xilinx_dsp.cc"'
+      sed -e 's/XilinxDspPass() : Pass("xilinx_dsp"/XilinxDspPass() : Pass("xilinx_dsp_init"/' \
+          -e 's/XilinxDspPass/XilinxDspInitPass/g' "$gen/dspinit/techlibs/xilinx/xilinx_dsp.cc"; } > "$gen/xilinx_dsp_init.cc"
+    plugin_cxx "$PLUGINS/xilinx_dsp_init.so" -I"$gen/dspinit/pm" "$gen/xilinx_dsp_init.cc"
     plugin_cxx "$PLUGINS/xilinx_dsp_qor.so" -I"$gen" "$gen/xilinx_dsp_qor.cc"
     plugin_cxx "$PLUGINS/xilinx_asyncreg.so" "$gen/xilinx_asyncreg.cc"
     plugin_cxx "$PLUGINS/clkbufmap_gapfix.so" "$gen/clkbufmap_gapfix.cc"
-    for p in xilinx_dsp_qor xilinx_asyncreg clkbufmap_gapfix; do
+    echo "clkbufmap_gapfix.so names its cells as the stock clkbufmap pass" > "$PLUGINS/clkbufmap_gapfix.stock-names"
+    for p in xilinx_dsp_qor xilinx_asyncreg clkbufmap_gapfix xilinx_dsp_init; do
         "$PREFIX/opt/oss-cad-suite/bin/yosys" -m "$PLUGINS/$p.so" -q -p "help $p" > /dev/null
         echo "plugin $p: $(sha256sum "$PLUGINS/$p.so" | cut -d' ' -f1)"
     done
@@ -486,12 +505,12 @@ yosys_plugins() {
     say "yosys plugins: $(ls "$PATCHES"/yosys/[0-9]*.patch | wc -l) patches on yosys $(toml yosys rev | cut -c1-9), built against the oss-cad-suite headers"
     local src="$CACHE/work/yosys-$VARIANT" key
     patched_tree yosys "$PATCHES/yosys" "$src"
-    key="$(toml oss-cad-suite sha256) $(toml yosys rev) $(cat "$PATCHES"/yosys/[0-9]*.patch | sha256sum | cut -d' ' -f1)"
-    if stamp_ok yosys-plugins "$key" && [ -f "$PLUGINS/xilinx_dsp_qor.so" ]; then
+    key="$(toml oss-cad-suite sha256) $(toml yosys rev) $(cat "$PATCHES"/yosys/[0-9]*.patch | sha256sum | cut -d' ' -f1) stock-names $(cat "$PATCHES"/yosys-dsp-init/[0-9]*.patch | sha256sum | cut -d' ' -f1)"
+    if stamp_ok yosys-plugins "$key" && [ -f "$PLUGINS/xilinx_dsp_qor.so" ] && [ -f "$PLUGINS/xilinx_dsp_init.so" ]; then
         echo "[cached] $PLUGINS"
         return
     fi
-    logged yosys-plugins env -u LDFLAGS ENV="$ENV" PREFIX="$PREFIX" PLUGINS="$PLUGINS" bash -c \
+    logged yosys-plugins env -u LDFLAGS ENV="$ENV" PREFIX="$PREFIX" PLUGINS="$PLUGINS" PATCHES_DSPINIT="$PATCHES/yosys-dsp-init" bash -c \
         "$(declare -f plugin_cxx build_yosys_plugins); set -e; build_yosys_plugins '$src' '$CACHE/build/yosys-plugins'"
     stamp_set yosys-plugins "$key"
 }
@@ -552,6 +571,13 @@ step_chipdb() {
         if gen_chipdb "$dev" "$bin" "chipdb-$dev-cal" "$meta" --cell-timing "$cal"; then
             check_chipdb "$bin" chipdb-sha256-cal "$dev" "the reference calibrated chipdb"
         fi
+        local rt="$PATCHES/chipdb/route-timing-$dev.json" pd="$PATCHES/chipdb/lut-pin-delay-$dev.txt"
+        [ -f "$rt" ] && [ -f "$pd" ] || continue
+        bin="$CHIPDB_DIR/tuned/chipdb-$dev.bin"
+        if gen_chipdb "$dev" "$bin" "chipdb-$dev-tuned" "$meta" --cell-timing "$cal" --route-timing "$rt" \
+            --lut-a6-perm --lut-pin-delay "$(tr -d ' \n' < "$pd")"; then
+            check_chipdb "$bin" chipdb-sha256-tuned "$dev" "the reference tuned chipdb"
+        fi
     done
 }
 
@@ -585,6 +611,7 @@ EOF
   "chipdbs": "$(cd "$CHIPDB_DIR" 2>/dev/null && ls chipdb-*.bin 2>/dev/null | tr '\n' ' ' | sed 's/ $//')",
   "chipdbs-ofx": "$(cd "$CHIPDB_DIR/ofx" 2>/dev/null && ls chipdb-*.bin 2>/dev/null | tr '\n' ' ' | sed 's/ $//')",
   "chipdbs-cal": "$(cd "$CHIPDB_DIR/cal" 2>/dev/null && ls chipdb-*.bin 2>/dev/null | tr '\n' ' ' | sed 's/ $//')",
+  "chipdbs-tuned": "$(cd "$CHIPDB_DIR/tuned" 2>/dev/null && ls chipdb-*.bin 2>/dev/null | tr '\n' ' ' | sed 's/ $//')",
   "ofx-release": "$RELEASE"
 }
 EOF

@@ -1,0 +1,1202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Finn Freas <finn.freas@gmail.com>
+Date: Sun, 8 Nov 2026 19:38:52 -0500
+Subject: [PATCH] xilinx: -o sa-refine, timing-driven annealing after
+ legalisation
+
+A VPR-style simulated-annealing refinement (sa_refine.cc), called from
+postPlace after replace_around_brams and before fixup_placement; skipped
+under -o preplaced/prerouted.
+
+- Moves: single LUT/FF move or swap, small LUT/FF cluster, whole-slice
+  swap/shift (not LUT-RAM/SRL slices), carry-chain block shift, block RAM
+  and DSP to another site of their type or a swap.
+- Cost: (1 - lambda) dWL/WL + lambda dT/T, T = sum crit^exp * delay(arc),
+  with an arc delay model fitted against Vivado (site, siteother, tile,
+  alpha + beta * delay matrix) and criticality against the slack at a
+  quantile of the port slacks.
+- -o sa-refine[=key=value:...]; keys lambda, exp, t0, rlim, rmin, inner,
+  quant, alpha, beta, site, siteother, tile, pcrit, pcent, pslice, pchain,
+  phard, hardwin, temps, time, critmin, greedy, kinds, slicemask, dump.
+
+Off unless given; without the option the .frames are unchanged.
+---
+ himbaechel/uarch/xilinx/CMakeLists.txt |    1 +
+ himbaechel/uarch/xilinx/sa_refine.cc   | 1119 ++++++++++++++++++++++++
+ himbaechel/uarch/xilinx/xilinx.cc      |    5 +
+ himbaechel/uarch/xilinx/xilinx.h       |    1 +
+ 4 files changed, 1126 insertions(+)
+ create mode 100755 himbaechel/uarch/xilinx/sa_refine.cc
+
+diff --git a/himbaechel/uarch/xilinx/CMakeLists.txt b/himbaechel/uarch/xilinx/CMakeLists.txt
+index a10d35db..7d7352c0 100644
+--- a/himbaechel/uarch/xilinx/CMakeLists.txt
++++ b/himbaechel/uarch/xilinx/CMakeLists.txt
+@@ -4,6 +4,7 @@ set(SOURCES
+     clock_tree.cc
+     constids.inc
+     delay_matrix.cc
++    sa_refine.cc
+     extra_data.h
+     fasm.cc
+     hardblock_timing.cc
+diff --git a/himbaechel/uarch/xilinx/sa_refine.cc b/himbaechel/uarch/xilinx/sa_refine.cc
+new file mode 100755
+index 00000000..0601770d
+--- /dev/null
++++ b/himbaechel/uarch/xilinx/sa_refine.cc
+@@ -0,0 +1,1119 @@
++/*
++ *  nextpnr -- Next Generation Place and Route
++ *
++ *  Permission to use, copy, modify, and/or distribute this software for any
++ *  purpose with or without fee is hereby granted, provided that the above
++ *  copyright notice and this permission notice appear in all copies.
++ *
++ *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <fstream>
++#include <tuple>
++#include "log.h"
++#include "nextpnr.h"
++#include "timing.h"
++#include "util.h"
++#include "xilinx.h"
++
++#define HIMBAECHEL_CONSTIDS "uarch/xilinx/constids.inc"
++#include "himbaechel_constids.h"
++
++NEXTPNR_NAMESPACE_BEGIN
++
++namespace {
++struct SARefine
++{
++    Context *ctx;
++    XilinxImpl *impl;
++    TimingAnalyser tmg;
++
++    double lambda = 0.7;
++    float crit_exp = 4.0f;
++    double t0 = 0.05;
++    int rlim0 = 8;
++    int rmin = 1;
++    double inner = 4.0;
++    float quant = 0.02f;
++    int alpha_ps = 489;
++    double beta = 1.391;
++    int site_lut_ps = 665, site_other_ps = 866, tile_ps = 682;
++    int wl_fanout = 256;
++    double p_crit = 0.3, p_cent = 0.3, p_slice = 0.3;
++    int max_temps = 300;
++    double time_limit = 900;
++    float crit_min = 0.5f;
++    int greedy_end = 2;
++    int kinds = 31;
++    std::string dump_file;
++    double p_chain = 0.5;
++    double p_hard = 0.05;
++    int hard_win = 12;
++    int slicemask = 3;
++
++    std::vector<NetInfo *> nets;
++    std::vector<int> saved_net_udata;
++    std::vector<CellInfo *> cells;
++    std::vector<int> saved_cell_udata;
++    std::vector<char> net_wl, net_tm;
++    std::vector<int> net_bb;
++    std::vector<std::vector<delay_t>> arc_d;
++    std::vector<std::vector<float>> arc_w;
++    std::vector<int> net_stamp, cell_stamp;
++    int stamp = 0;
++
++    double wl_total = 0, t_total = 0;
++
++    std::vector<CellInfo *> movable_cells, crit_cells;
++    int max_x = 0, max_y = 0;
++    std::vector<std::vector<std::vector<BelId>>> tile_luts, tile_ffs;
++    std::vector<std::vector<std::array<bool, 2>>> tile_slice;
++
++    long n_move = 0, n_accept = 0, n_illegal = 0;
++    long kind_try[5] = {0, 0, 0, 0, 0}, kind_acc[5] = {0, 0, 0, 0, 0};
++    std::vector<CellInfo *> hard_cells;
++    dict<IdString, std::vector<BelId>> hard_bels;
++
++    static bool hard_type(const CellInfo *ci)
++    {
++        return ci->type.in(id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1, id_DSP48E1_DSP48E1);
++    }
++
++
++    SARefine(Context *ctx, XilinxImpl *impl) : ctx(ctx), impl(impl), tmg(ctx) {}
++
++    double rnd() { return ctx->rngf(1.0f); }
++
++    static bool slice_type(IdString t) { return t.in(id_SLICE_LUTX, id_SLICE_FFX, id_CARRY4, id_SELMUX2_1); }
++
++    bool fixed(const CellInfo *ci) const
++    {
++        return ci->belStrength > STRENGTH_STRONG || ci->region != nullptr || ci->isPseudo();
++    }
++
++    bool single_movable(const CellInfo *ci) const
++    {
++        if (ci == nullptr || ci->bel == BelId() || fixed(ci))
++            return false;
++        if (!ci->type.in(id_SLICE_LUTX, id_SLICE_FFX) || ci->cluster != ClusterId())
++            return false;
++        if (ci->attrs.count(id_X_LUT_AS_DRAM) || ci->attrs.count(id_X_LUT_AS_SRL))
++            return false;
++        return true;
++    }
++
++    bool cluster_movable(const CellInfo *root) const
++    {
++        if (root == nullptr || root->bel == BelId() || root->cluster != root->name || root->constr_children.empty())
++            return false;
++        if (root->constr_children.size() > 3 || fixed(root))
++            return false;
++        if (root->type != id_SLICE_LUTX || root->attrs.count(id_X_LUT_AS_DRAM) || root->attrs.count(id_X_LUT_AS_SRL))
++            return false;
++        for (auto *ch : root->constr_children)
++            if (!ch->type.in(id_SLICE_LUTX, id_SLICE_FFX) || ch->bel == BelId() || fixed(ch) ||
++                !ch->constr_children.empty())
++                return false;
++        return true;
++    }
++
++
++    delay_t arc_delay(BelId sb, IdString sp, BelId db, IdString dp) const
++    {
++        if (sb == BelId() || db == BelId())
++            return 0;
++        if (dp == id_CIN && sp == id_CO3)
++            return 0;
++        if (sb.tile == db.tile) {
++            Loc sl = ctx->getBelLocation(sb), dl = ctx->getBelLocation(db);
++            const bool same_slice = (sl.z >> 6) == (dl.z >> 6);
++            if (!same_slice)
++                return tile_ps;
++            const int st = sl.z & 0xF;
++            const bool ff_src = st == BEL_FF || st == BEL_FF2;
++            const bool lut_in = dp.in(id_A1, id_A2, id_A3, id_A4, id_A5, id_A6);
++            if (lut_in)
++                return site_lut_ps;
++            if (!ff_src && (dp == id_D || dp.in(id_S0, id_S1, id_S2, id_S3, id_DI0, id_DI1, id_DI2, id_DI3) ||
++                            dp.in(id_I0, id_I1)))
++                return 0;
++            return site_other_ps;
++        }
++        Loc sl = ctx->getBelLocation(sb), dl = ctx->getBelLocation(db);
++        delay_t m = impl->delay_matrix_lookup(dl.x - sl.x, dl.y - sl.y);
++        if (m < 0) {
++            int ax = std::abs(dl.x - sl.x), ay = std::abs(dl.y - sl.y);
++            m = (3 * (30 * std::min(ax, 18) + 10 * std::max(ax - 18, 0) + 60 * std::min(ay, 6) +
++                      20 * std::max(ay - 6, 0) + 300)) /
++                2;
++        }
++        return alpha_ps + delay_t(beta * m);
++    }
++
++    delay_t arc_delay(const NetInfo *ni, const PortRef &usr) const
++    {
++        return arc_delay(ni->driver.cell->bel, ni->driver.port, usr.cell->bel, usr.port);
++    }
++
++    int bbox(const NetInfo *ni) const
++    {
++        Loc d = ctx->getBelLocation(ni->driver.cell->bel);
++        int x0 = d.x, x1 = d.x, y0 = d.y, y1 = d.y;
++        for (auto &usr : ni->users) {
++            if (usr.cell == nullptr || usr.cell->bel == BelId())
++                continue;
++            Loc l = ctx->getBelLocation(usr.cell->bel);
++            x0 = std::min(x0, l.x);
++            x1 = std::max(x1, l.x);
++            y0 = std::min(y0, l.y);
++            y1 = std::max(y1, l.y);
++        }
++        return (x1 - x0) + (y1 - y0);
++    }
++
++    float weight(float crit) const { return std::pow(std::max(0.0f, crit), crit_exp); }
++
++
++    void init()
++    {
++        for (auto &n : ctx->nets) {
++            NetInfo *ni = n.second.get();
++            saved_net_udata.push_back(ni->udata);
++            ni->udata = int(nets.size());
++            nets.push_back(ni);
++        }
++        for (auto &c : ctx->cells) {
++            CellInfo *ci = c.second.get();
++            saved_cell_udata.push_back(ci->udata);
++            ci->udata = int(cells.size());
++            cells.push_back(ci);
++        }
++        int nn = int(nets.size());
++        net_wl.assign(nn, 0);
++        net_tm.assign(nn, 0);
++        net_bb.assign(nn, 0);
++        arc_d.resize(nn);
++        arc_w.resize(nn);
++        net_stamp.assign(nn, 0);
++        cell_stamp.assign(cells.size(), 0);
++        for (auto *ni : nets) {
++            if (ni->driver.cell == nullptr || ni->driver.cell->bel == BelId())
++                continue;
++            if (ni->driver.cell->type.in(id_BUFGCTRL, id_BUFHCE) || ni->driver.cell->isPseudo())
++                continue;
++            bool clk = false;
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true) {
++                int cnt = 0;
++                if (usr.cell && ctx->getPortTimingClass(usr.cell, usr.port, cnt) == TMG_CLOCK_INPUT)
++                    clk = true;
++            }
++            if (clk)
++                continue;
++            net_tm[ni->udata] = 1;
++            net_wl[ni->udata] = int(ni->users.entries()) <= wl_fanout;
++            arc_d[ni->udata].assign(ni->users.capacity(), 0);
++            arc_w[ni->udata].assign(ni->users.capacity(), 0);
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true)
++                if (usr.cell && usr.cell->bel != BelId())
++                    arc_d[ni->udata][ue.index.idx()] = arc_delay(ni, usr);
++            if (net_wl[ni->udata])
++                net_bb[ni->udata] = bbox(ni);
++        }
++        for (auto bel : ctx->getBels()) {
++            Loc l = ctx->getBelLocation(bel);
++            max_x = std::max(max_x, l.x);
++            max_y = std::max(max_y, l.y);
++        }
++        tile_luts.assign(max_x + 1, std::vector<std::vector<BelId>>(max_y + 1));
++        tile_ffs.assign(max_x + 1, std::vector<std::vector<BelId>>(max_y + 1));
++        tile_slice.assign(max_x + 1, std::vector<std::array<bool, 2>>(max_y + 1, {false, false}));
++        for (auto bel : ctx->getBels()) {
++            Loc l = ctx->getBelLocation(bel);
++            if (ctx->isValidBelForCellType(id_SLICE_LUTX, bel)) {
++                tile_luts[l.x][l.y].push_back(bel);
++                if ((l.z & 0xF) == BEL_6LUT && ((l.z >> 4) & 3) == 0)
++                    tile_slice[l.x][l.y][(l.z >> 6) & 1] = true;
++            } else if (ctx->isValidBelForCellType(id_SLICE_FFX, bel)) {
++                tile_ffs[l.x][l.y].push_back(bel);
++            }
++        }
++        for (auto *ci : cells)
++            if (ci->bel != BelId() && !fixed(ci) && slice_type(ci->type) && tile_slice_of(ci->bel))
++                movable_cells.push_back(ci);
++        for (auto *ci : cells)
++            if (ci->bel != BelId() && !fixed(ci) && hard_type(ci) && ci->cluster == ClusterId()) {
++                hard_cells.push_back(ci);
++                if (!hard_bels.count(ci->type)) {
++                    auto &v = hard_bels[ci->type];
++                    for (auto bel : ctx->getBels())
++                        if (ctx->isValidBelForCellType(ci->type, bel))
++                            v.push_back(bel);
++                }
++            }
++    }
++
++    bool tile_slice_of(BelId b) const
++    {
++        Loc l = ctx->getBelLocation(b);
++        return l.x <= max_x && l.y <= max_y && tile_slice[l.x][l.y][(l.z >> 6) & 1];
++    }
++
++    void restore()
++    {
++        for (size_t i = 0; i < nets.size(); i++)
++            nets[i]->udata = saved_net_udata[i];
++        for (size_t i = 0; i < cells.size(); i++)
++            cells[i]->udata = saved_cell_udata[i];
++    }
++
++    void totals()
++    {
++        wl_total = 0;
++        t_total = 0;
++        for (auto *ni : nets) {
++            int n = ni->udata;
++            if (!net_tm[n])
++                continue;
++            if (net_wl[n]) {
++                net_bb[n] = bbox(ni);
++                wl_total += net_bb[n];
++            }
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true)
++                if (usr.cell && usr.cell->bel != BelId()) {
++                    arc_d[n][ue.index.idx()] = arc_delay(ni, usr);
++                    t_total += double(arc_w[n][ue.index.idx()]) * arc_d[n][ue.index.idx()];
++                }
++        }
++    }
++
++    delay_t worst_slack = 0;
++    std::vector<delay_t> slacks;
++    double slack_q(double q)
++    {
++        if (slacks.empty())
++            return 0;
++        size_t k = std::min(slacks.size() - 1, size_t(q * slacks.size()));
++        std::nth_element(slacks.begin(), slacks.begin() + k, slacks.end());
++        return ctx->getDelayNS(slacks[k]);
++    }
++
++    void analyse()
++    {
++        for (auto *ni : nets) {
++            int n = ni->udata;
++            if (!net_tm[n])
++                continue;
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true)
++                if (usr.cell && usr.cell->bel != BelId())
++                    tmg.set_route_delay(CellPortKey(usr), DelayPair(arc_delay(ni, usr)));
++        }
++        tmg.run(false);
++        worst_slack = std::numeric_limits<delay_t>::max();
++        slacks.clear();
++        crit_cells.clear();
++        std::vector<char> seen(cells.size(), 0);
++        for (auto *ni : nets) {
++            int n = ni->udata;
++            if (!net_tm[n])
++                continue;
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true) {
++                if (!usr.cell || usr.cell->bel == BelId())
++                    continue;
++                CellPortKey k(usr);
++                float cr = tmg.get_criticality(k);
++                arc_w[n][ue.index.idx()] = weight(cr);
++                delay_t sl = tmg.get_setup_slack(k);
++                if (sl > -1000000000 && sl < 1000000000)
++                {
++                    worst_slack = std::min<delay_t>(worst_slack, sl);
++                    slacks.push_back(sl);
++                }
++                if (cr >= crit_min) {
++                    for (CellInfo *c : {usr.cell, ni->driver.cell})
++                        if (!seen[c->udata] && !fixed(c) && slice_type(c->type) && c->bel != BelId()) {
++                            seen[c->udata] = 1;
++                            crit_cells.push_back(c);
++                        }
++                }
++            }
++        }
++        totals();
++    }
++
++
++    std::vector<std::pair<CellInfo *, BelId>> mv_old;
++    std::vector<int> touched_nets;
++    struct ArcChange
++    {
++        int net, idx;
++        delay_t d;
++    };
++    std::vector<ArcChange> arc_changes;
++    std::vector<std::pair<int, int>> bb_changes;
++
++    bool rebind(const std::vector<std::pair<CellInfo *, BelId>> &target)
++    {
++        mv_old.clear();
++        for (auto &t : target)
++            mv_old.emplace_back(t.first, t.first->bel);
++        for (auto &o : mv_old)
++            ctx->unbindBel(o.second);
++        bool ok = true;
++        for (auto &t : target) {
++            if (t.second == BelId() || !ctx->checkBelAvail(t.second) ||
++                !ctx->isValidBelForCellType(t.first->type, t.second)) {
++                ok = false;
++                break;
++            }
++
++
++            if (t.first->attrs.count(id_X_LUT_AS_DRAM) || t.first->attrs.count(id_X_LUT_AS_SRL)) {
++                IdString tt = impl->bel_tile_type(t.second);
++                if (!tt.in(id_CLBLM_L, id_CLBLM_R) || (ctx->getBelLocation(t.second).z >> 6) != 0) {
++                    ok = false;
++                    break;
++                }
++            }
++            ctx->bindBel(t.second, t.first, STRENGTH_WEAK);
++        }
++        if (ok) {
++            for (auto &t : target)
++                if (!ctx->isBelLocationValid(t.second)) {
++                    ok = false;
++                    break;
++                }
++            if (ok)
++                for (auto &o : mv_old)
++                    if (!ctx->isBelLocationValid(o.second)) {
++                        ok = false;
++                        break;
++                    }
++        }
++        if (!ok)
++            undo();
++        return ok;
++    }
++
++    void undo()
++    {
++        for (auto &o : mv_old)
++            if (o.first->bel != BelId())
++                ctx->unbindBel(o.first->bel);
++        for (auto &o : mv_old)
++            ctx->bindBel(o.second, o.first, STRENGTH_WEAK);
++    }
++
++
++    void delta(double &dwl, double &dt)
++    {
++        ++stamp;
++        dwl = 0;
++        dt = 0;
++        arc_changes.clear();
++        bb_changes.clear();
++        touched_nets.clear();
++        for (auto &o : mv_old)
++            cell_stamp[o.first->udata] = stamp;
++        for (auto &o : mv_old)
++            for (auto &port : o.first->ports) {
++                NetInfo *ni = port.second.net;
++                if (ni == nullptr || !net_tm[ni->udata] || net_stamp[ni->udata] == stamp)
++                    continue;
++                net_stamp[ni->udata] = stamp;
++                touched_nets.push_back(ni->udata);
++            }
++        for (int n : touched_nets) {
++            NetInfo *ni = nets[n];
++            if (net_wl[n]) {
++                int b = bbox(ni);
++                dwl += b - net_bb[n];
++                bb_changes.emplace_back(n, b);
++            }
++            const bool drv_moved = cell_stamp[ni->driver.cell->udata] == stamp;
++            for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true) {
++                if (!usr.cell || usr.cell->bel == BelId())
++                    continue;
++                if (!drv_moved && cell_stamp[usr.cell->udata] != stamp)
++                    continue;
++                int i = ue.index.idx();
++                delay_t d = arc_delay(ni, usr);
++                if (d != arc_d[n][i]) {
++                    dt += double(arc_w[n][i]) * (d - arc_d[n][i]);
++                    arc_changes.push_back({n, i, d});
++                }
++            }
++        }
++    }
++
++    void commit()
++    {
++        for (auto &b : bb_changes) {
++            wl_total += b.second - net_bb[b.first];
++            net_bb[b.first] = b.second;
++        }
++        for (auto &a : arc_changes) {
++            t_total += double(arc_w[a.net][a.idx]) * (a.d - arc_d[a.net][a.idx]);
++            arc_d[a.net][a.idx] = a.d;
++        }
++    }
++
++    double temp = 0, wl_norm = 1, t_norm = 1;
++    int rlim = 8;
++    bool probing = false;
++    std::vector<double> probe_up;
++
++
++    bool decide(int kind)
++    {
++        double dwl, dt;
++        delta(dwl, dt);
++        double c = (1.0 - lambda) * dwl / wl_norm + lambda * dt / t_norm;
++        n_move++;
++        kind_try[kind]++;
++        if (probing) {
++            if (c > 0)
++                probe_up.push_back(c);
++            undo();
++            return false;
++        }
++        if (c <= 0 || (temp > 0 && rnd() < std::exp(-c / temp))) {
++            commit();
++            n_accept++;
++            kind_acc[kind]++;
++            return true;
++        }
++        undo();
++        return false;
++    }
++
++    bool centroid(const std::vector<CellInfo *> &mem, int &cx, int &cy)
++    {
++        double sx = 0, sy = 0, sw = 0;
++        ++stamp;
++        for (auto *c : mem)
++            cell_stamp[c->udata] = stamp;
++        for (auto *c : mem)
++            for (auto &port : c->ports) {
++                NetInfo *ni = port.second.net;
++                if (ni == nullptr || !net_tm[ni->udata] || int(ni->users.entries()) > 64)
++                    continue;
++                auto add = [&](CellInfo *o, float w) {
++                    if (o == nullptr || o->bel == BelId() || cell_stamp[o->udata] == stamp)
++                        return;
++                    Loc l = ctx->getBelLocation(o->bel);
++                    sx += w * l.x;
++                    sy += w * l.y;
++                    sw += w;
++                };
++                if (port.second.type == PORT_IN)
++                    add(ni->driver.cell, 0.05f + arc_w[ni->udata][port.second.user_idx.idx()]);
++                else if (port.second.type == PORT_OUT)
++                    for (auto ue : ni->users.enumerate()) if (const PortRef &usr = ue.value; true)
++                        add(usr.cell, 0.05f + arc_w[ni->udata][ue.index.idx()]);
++            }
++        if (sw <= 0)
++            return false;
++        cx = int(std::lround(sx / sw));
++        cy = int(std::lround(sy / sw));
++        return true;
++    }
++
++    bool pick_tile(const std::vector<CellInfo *> &mem, int &tx, int &ty)
++    {
++        Loc cur = ctx->getBelLocation(mem.front()->bel);
++        int cx = cur.x, cy = cur.y;
++        if (rnd() < p_cent) {
++            int x, y;
++            if (centroid(mem, x, y)) {
++                cx = x;
++                cy = y;
++            }
++        }
++        for (int tries = 0; tries < 8; tries++) {
++            int x = cx + ctx->rng(2 * rlim + 1) - rlim;
++            int y = cy + ctx->rng(2 * rlim + 1) - rlim;
++            if (x < 0 || y < 0 || x > max_x || y > max_y)
++                continue;
++            if (!tile_slice[x][y][0] && !tile_slice[x][y][1])
++                continue;
++            tx = x;
++            ty = y;
++            return true;
++        }
++        return false;
++    }
++
++    void move_single(CellInfo *ci)
++    {
++        if (!(kinds & 1))
++            return;
++        int tx, ty;
++        if (!pick_tile({ci}, tx, ty))
++            return;
++        auto &cand = ci->type == id_SLICE_LUTX ? tile_luts[tx][ty] : tile_ffs[tx][ty];
++        if (cand.empty())
++            return;
++        BelId nb = cand[ctx->rng(int(cand.size()))];
++        if (nb == ci->bel)
++            return;
++        CellInfo *other = ctx->getBoundBelCell(nb);
++        std::vector<std::pair<CellInfo *, BelId>> target{{ci, nb}};
++        if (other != nullptr) {
++            if (!single_movable(other) || other->type != ci->type)
++                return;
++            target.emplace_back(other, ci->bel);
++        }
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(0);
++    }
++
++    void move_cluster(CellInfo *root)
++    {
++        if (!(kinds & 2))
++            return;
++        std::vector<CellInfo *> mem{root};
++        for (auto *ch : root->constr_children)
++            mem.push_back(ch);
++        int tx, ty;
++        if (!pick_tile(mem, tx, ty))
++            return;
++        auto &cand = tile_luts[tx][ty];
++        if (cand.empty())
++            return;
++        BelId nb = cand[ctx->rng(int(cand.size()))];
++        if (nb == root->bel)
++            return;
++        std::vector<std::pair<CellInfo *, BelId>> target;
++
++
++        if (!ctx->getClusterPlacement(root->cluster, nb, target) || target.size() != mem.size())
++            return;
++        for (auto &t : target) {
++            if (t.second == BelId())
++                return;
++            CellInfo *o = ctx->getBoundBelCell(t.second);
++            if (o != nullptr && std::find(mem.begin(), mem.end(), o) == mem.end())
++                return;
++        }
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(1);
++    }
++
++
++    struct SK
++    {
++        int x, y, s;
++        bool operator==(const SK &o) const { return x == o.x && y == o.y && s == o.s; }
++    };
++
++    int slice_index(const std::vector<SK> &g, BelId b) const
++    {
++        if (b == BelId())
++            return -1;
++        Loc l = ctx->getBelLocation(b);
++        for (int i = 0; i < int(g.size()); i++)
++            if (g[i].x == l.x && g[i].y == l.y && g[i].s == (l.z >> 6))
++                return i;
++        return -1;
++    }
++
++
++
++    bool group_cells(const std::vector<SK> &g, std::vector<std::tuple<CellInfo *, int, int>> &out)
++    {
++        out.clear();
++        for (int i = 0; i < int(g.size()); i++)
++            for (BelId b : ctx->getBelsByTile(g[i].x, g[i].y)) {
++                Loc l = ctx->getBelLocation(b);
++                if ((l.z >> 6) != g[i].s)
++                    continue;
++                CellInfo *c = ctx->getBoundBelCell(b);
++                if (c == nullptr)
++                    continue;
++                const int f = l.z & 0xF;
++                if (fixed(c) || !slice_type(c->type) ||
++                    !(f == BEL_6LUT || f == BEL_5LUT || f == BEL_FF || f == BEL_FF2 || f == BEL_F7MUX ||
++                      f == BEL_F8MUX || f == BEL_CARRY4))
++                    return false;
++                if ((c->type == id_CARRY4 && !(slicemask & 1)) || (c->type == id_SELMUX2_1 && !(slicemask & 2)) ||
++                    ((c->attrs.count(id_X_LUT_AS_DRAM) || c->attrs.count(id_X_LUT_AS_SRL)) && !(slicemask & 4)))
++                    return false;
++                out.emplace_back(c, i, l.z & 0x3F);
++            }
++        for (auto &e : out) {
++            CellInfo *c = std::get<0>(e);
++            if (c->cluster == ClusterId())
++                continue;
++            CellInfo *root = ctx->getClusterRootCell(c->cluster);
++            if (slice_index(g, root->bel) < 0)
++                return false;
++            for (auto *ch : root->constr_children) {
++                if (slice_index(g, ch->bel) < 0)
++                    return false;
++                for (auto *gch : ch->constr_children)
++                    if (slice_index(g, gch->bel) < 0)
++                        return false;
++            }
++        }
++        return true;
++    }
++
++    std::vector<std::tuple<CellInfo *, int, int>> ga_cells, gb_cells;
++
++
++    bool slice_cells(int x, int y, int s, std::vector<std::pair<CellInfo *, int>> &out)
++    {
++        out.clear();
++        if (!group_cells({SK{x, y, s}}, ga_cells))
++            return false;
++        for (auto &e : ga_cells)
++            out.emplace_back(std::get<0>(e), std::get<2>(e));
++        return true;
++    }
++
++
++
++
++    void collect(CellInfo *c, std::vector<CellInfo *> &m)
++    {
++        m.push_back(c);
++        for (auto *ch : c->constr_children)
++            collect(ch, m);
++    }
++
++    void move_chain(CellInfo *root)
++    {
++        if (!(kinds & 8))
++            return;
++        std::vector<CellInfo *> mem;
++        collect(root, mem);
++        std::vector<SK> src;
++        for (auto *c : mem) {
++            if (c->bel == BelId() || fixed(c))
++                return;
++            Loc l = ctx->getBelLocation(c->bel);
++            SK k{l.x, l.y, l.z >> 6};
++            if (std::find(src.begin(), src.end(), k) == src.end())
++                src.push_back(k);
++        }
++        if (!group_cells(src, ga_cells))
++            return;
++        std::vector<CellInfo *> all{root};
++        for (auto &e : ga_cells)
++            if (std::get<0>(e) != root)
++                all.push_back(std::get<0>(e));
++        int tx, ty;
++        if (!pick_tile(all, tx, ty))
++            return;
++        Loc rl = ctx->getBelLocation(root->bel);
++        int dx = tx - rl.x, dy = ty - rl.y, ds = ctx->rng(2) - (rl.z >> 6);
++        if (dx == 0 && dy == 0 && ds == 0)
++            return;
++        std::vector<SK> dst;
++        for (auto &k : src) {
++            SK t{k.x + dx, k.y + dy, k.s + ds};
++            if (t.x < 0 || t.y < 0 || t.x > max_x || t.y > max_y || t.s < 0 || t.s > 1 || !tile_slice[t.x][t.y][t.s])
++                return;
++            if (std::find(src.begin(), src.end(), t) != src.end())
++                return;
++            dst.push_back(t);
++        }
++        auto shifted = [&](BelId b) {
++            Loc l = ctx->getBelLocation(b);
++            int i = slice_index(src, b);
++            if (i < 0)
++                return BelId();
++            return ctx->getBelByLocation(Loc(dst[i].x, dst[i].y, (dst[i].s << 6) | (l.z & 0x3F)));
++        };
++        BelId nb = shifted(root->bel);
++        std::vector<std::pair<CellInfo *, BelId>> plc;
++        if (nb == BelId() || !ctx->getClusterPlacement(root->cluster, nb, plc))
++            return;
++        for (auto &p : plc)
++            if (p.first->bel == BelId() || p.second != shifted(p.first->bel))
++                return;
++        if (!group_cells(dst, gb_cells))
++            return;
++        std::vector<std::pair<CellInfo *, BelId>> target;
++        for (auto &e : ga_cells) {
++            const SK &t = dst[std::get<1>(e)];
++            target.emplace_back(std::get<0>(e), ctx->getBelByLocation(Loc(t.x, t.y, (t.s << 6) | std::get<2>(e))));
++        }
++        for (auto &e : gb_cells) {
++            const SK &t = src[std::get<1>(e)];
++            target.emplace_back(std::get<0>(e), ctx->getBelByLocation(Loc(t.x, t.y, (t.s << 6) | std::get<2>(e))));
++        }
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(3);
++    }
++
++    std::vector<std::pair<CellInfo *, int>> sa_cells, sb_cells;
++
++    void move_slice(CellInfo *ci)
++    {
++        if (!(kinds & 4))
++            return;
++        Loc cur = ctx->getBelLocation(ci->bel);
++        int s0 = (cur.z >> 6) & 1;
++        if (!slice_cells(cur.x, cur.y, s0, sa_cells) || sa_cells.empty())
++            return;
++        std::vector<CellInfo *> mem;
++        for (auto &e : sa_cells)
++            mem.push_back(e.first);
++        int tx, ty;
++        if (!pick_tile(mem, tx, ty))
++            return;
++        int s1 = ctx->rng(2);
++        if (!tile_slice[tx][ty][s1])
++            s1 ^= 1;
++        if (!tile_slice[tx][ty][s1] || (tx == cur.x && ty == cur.y && s1 == s0))
++            return;
++        if (!slice_cells(tx, ty, s1, sb_cells))
++            return;
++        std::vector<std::pair<CellInfo *, BelId>> target;
++        for (auto &e : sa_cells)
++            target.emplace_back(e.first, ctx->getBelByLocation(Loc(tx, ty, (s1 << 6) | e.second)));
++        for (auto &e : sb_cells)
++            target.emplace_back(e.first, ctx->getBelByLocation(Loc(cur.x, cur.y, (s0 << 6) | e.second)));
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(2);
++    }
++
++
++
++    void move_hard(CellInfo *ci)
++    {
++        if (!(kinds & 16))
++            return;
++        Loc cur = ctx->getBelLocation(ci->bel);
++        int cx = cur.x, cy = cur.y;
++        if (rnd() < p_cent) {
++            int x, y;
++            if (centroid({ci}, x, y)) {
++                cx = x;
++                cy = y;
++            }
++        }
++        auto &all = hard_bels[ci->type];
++        std::vector<BelId> cand;
++        for (BelId b : all) {
++            Loc l = ctx->getBelLocation(b);
++            if (std::abs(l.x - cx) <= hard_win && std::abs(l.y - cy) <= hard_win && b != ci->bel)
++                cand.push_back(b);
++        }
++        if (cand.empty())
++            return;
++        BelId nb = cand[ctx->rng(int(cand.size()))];
++        CellInfo *other = ctx->getBoundBelCell(nb);
++        std::vector<std::pair<CellInfo *, BelId>> target{{ci, nb}};
++        if (other != nullptr) {
++            if (other->type != ci->type || fixed(other) || other->cluster != ClusterId())
++                return;
++            target.emplace_back(other, ci->bel);
++        }
++        if (!rebind(target)) {
++            n_illegal++;
++            return;
++        }
++        decide(4);
++    }
++
++    void one_move()
++    {
++        CellInfo *ci;
++        if (!hard_cells.empty() && rnd() < p_hard) {
++            move_hard(hard_cells[ctx->rng(int(hard_cells.size()))]);
++            return;
++        }
++        if (!crit_cells.empty() && rnd() < p_crit)
++            ci = crit_cells[ctx->rng(int(crit_cells.size()))];
++        else
++            ci = movable_cells[ctx->rng(int(movable_cells.size()))];
++        if (ci->bel == BelId())
++            return;
++        if (rnd() < p_slice) {
++            move_slice(ci);
++            return;
++        }
++        if (single_movable(ci)) {
++            move_single(ci);
++            return;
++        }
++        if (ci->cluster != ClusterId()) {
++            CellInfo *root = ctx->getClusterRootCell(ci->cluster);
++            if (cluster_movable(root)) {
++                move_cluster(root);
++                return;
++            }
++            if (root->type == id_CARRY4 && rnd() < p_chain) {
++                move_chain(root);
++                return;
++            }
++        }
++        move_slice(ci);
++    }
++
++    double total_hpwl()
++    {
++        double h = 0;
++        for (auto *ni : nets)
++            if (net_wl[ni->udata])
++                h += bbox(ni);
++        return h;
++    }
++
++    void parse(const std::string &v)
++    {
++        size_t p = 0;
++        while (p < v.size()) {
++            size_t e = v.find(':', p);
++            std::string kv = v.substr(p, e == std::string::npos ? std::string::npos : e - p);
++            p = e == std::string::npos ? v.size() : e + 1;
++            auto eq = kv.find('=');
++            if (eq == std::string::npos)
++                log_error("-o sa-refine: expected key=value, got '%s'\n", kv.c_str());
++            std::string k = kv.substr(0, eq);
++            if (kv.substr(0, eq) == "dump") {
++                dump_file = kv.substr(eq + 1);
++                continue;
++            }
++            double x = std::stod(kv.substr(eq + 1));
++            if (k == "lambda")
++                lambda = x;
++            else if (k == "exp")
++                crit_exp = float(x);
++            else if (k == "t0")
++                t0 = x;
++            else if (k == "rlim")
++                rlim0 = std::max(1, int(x));
++            else if (k == "inner")
++                inner = x;
++            else if (k == "quant")
++                quant = float(x);
++            else if (k == "alpha")
++                alpha_ps = int(x);
++            else if (k == "site")
++                site_lut_ps = int(x);
++            else if (k == "siteother")
++                site_other_ps = int(x);
++            else if (k == "tile")
++                tile_ps = int(x);
++            else if (k == "beta")
++                beta = x;
++            else if (k == "pcrit")
++                p_crit = x;
++            else if (k == "pcent")
++                p_cent = x;
++            else if (k == "pslice")
++                p_slice = x;
++            else if (k == "temps")
++                max_temps = int(x);
++            else if (k == "time")
++                time_limit = x;
++            else if (k == "critmin")
++                crit_min = float(x);
++            else if (k == "slicemask")
++                slicemask = int(x);
++            else if (k == "phard")
++                p_hard = x;
++            else if (k == "hardwin")
++                hard_win = int(x);
++            else if (k == "pchain")
++                p_chain = x;
++            else if (k == "rmin")
++                rmin = std::max(1, int(x));
++            else if (k == "kinds")
++                kinds = int(x);
++            else if (k == "greedy")
++                greedy_end = int(x);
++            else
++                log_error("-o sa-refine: unknown key '%s'\n", k.c_str());
++        }
++    }
++
++    void run(const std::string &opts)
++    {
++        parse(opts);
++        auto t_start = std::chrono::steady_clock::now();
++        log_info("SA refinement: lambda %.2f, crit exponent %.1f, t0 %.3f, window %d, inner %.1f, criticality "
++                 "quantile %.3f, arc model %d + %.3f * matrix (site %d/%d, tile %d ps)\n",
++                 lambda, crit_exp, t0, rlim0, inner, quant, alpha_ps, beta, site_lut_ps, site_other_ps, tile_ps);
++        init();
++        tmg.setup_only = true;
++        tmg.crit_quantile = quant;
++        tmg.setup();
++        analyse();
++        double hpwl0 = total_hpwl();
++        delay_t ws0 = worst_slack;
++        double q0 = slack_q(0.005);
++        int n_single = 0, n_clu = 0;
++        for (auto *c : movable_cells) {
++            n_single += single_movable(c);
++            n_clu += cluster_movable(c);
++        }
++        log_info("SA refinement: %d slice cells (%d single LUT/FF, %d small clusters), %d critical; model worst slack "
++                 "%.3f ns, HPWL %.0f, timing cost %.0f\n",
++                 int(movable_cells.size()), n_single, n_clu, int(crit_cells.size()), ctx->getDelayNS(ws0), hpwl0,
++                 t_total);
++        if (movable_cells.empty()) {
++            restore();
++            return;
++        }
++        long moves_per_temp = long(inner * movable_cells.size());
++        rlim = rlim0;
++        wl_norm = std::max(1.0, wl_total);
++        t_norm = std::max(1.0, t_total);
++        probing = true;
++        for (int i = 0; i < std::min<long>(4000, 2 * movable_cells.size()); i++)
++            one_move();
++        probing = false;
++        auto acc_at = [&](double T) {
++            double a = 0;
++            for (double c : probe_up)
++                a += std::exp(-c / T);
++            return probe_up.empty() ? 0.0 : a / probe_up.size();
++        };
++        double lo = 1e-12, hi = 1.0;
++        for (int i = 0; i < 100; i++) {
++            double mid = std::sqrt(lo * hi);
++            (acc_at(mid) < t0 ? lo : hi) = mid;
++        }
++        temp = probe_up.empty() ? 0.0 : hi;
++        double temp0 = temp;
++        log_info("SA refinement: %d uphill moves in the sample, start temperature %.3g (uphill acceptance %.3f)\n",
++                 int(probe_up.size()), temp, acc_at(std::max(temp, 1e-30)));
++        n_move = n_accept = 0;
++        int greedy_left = greedy_end;
++        int quiet = 0;
++        for (int it = 1; it <= max_temps; it++) {
++            n_move = n_accept = 0;
++            wl_norm = std::max(1.0, wl_total);
++            t_norm = std::max(1.0, t_total);
++            double c_before = (1.0 - lambda) + lambda;
++            double wl_b = wl_total, t_b = t_total;
++            for (long m = 0; m < moves_per_temp; m++)
++                one_move();
++            double ra = n_move ? double(n_accept) / n_move : 0;
++            double c_after = (1.0 - lambda) * wl_total / wl_b + lambda * t_total / std::max(1.0, t_b);
++            double wl_inc = wl_total, t_inc = t_total;
++            totals();
++            double drift_wl = wl_total - wl_inc, drift_t = t_total - t_inc;
++            analyse();
++            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
++            if (it == 1 || it % 5 == 0 || temp == 0)
++                log_info("  SA temp #%d: T %.3g, window %d, accepted %.1f %%, cost x%.4f, HPWL %.0f, timing cost "
++                         "%.0f, model slack worst/0.5%%/2%% %.3f/%.3f/%.3f ns, %.1f s (drift %.0f / %.0f)\n",
++                         it, temp, rlim, 100 * ra, c_after / c_before, total_hpwl(), t_total,
++                         ctx->getDelayNS(worst_slack), slack_q(0.005), slack_q(0.02), secs, drift_wl, drift_t);
++            if (temp == 0) {
++                if (--greedy_left <= 0)
++                    break;
++                continue;
++            }
++            rlim = std::max(rmin, std::min(rlim0, int(rlim * (1.0 - 0.44 + ra) + 0.5)));
++            if (ra > 0.96)
++                temp *= 0.5;
++            else if (ra > 0.8)
++                temp *= 0.9;
++            else if (ra > 0.15 && rlim > 1)
++                temp *= 0.95;
++            else
++                temp *= 0.8;
++            quiet = (c_after > 0.999) ? quiet + 1 : 0;
++            if (temp < temp0 * 1e-3 || quiet >= 5 || secs > time_limit)
++                temp = 0;
++        }
++        double hpwl1 = total_hpwl();
++        if (!dump_file.empty()) {
++
++            std::ofstream df(dump_file);
++            for (auto *ci : cells) {
++                if (ci->bel == BelId() || !ci->type.in(id_SLICE_FFX, id_RAMB36E1_RAMB36E1, id_RAMB18E1_RAMB18E1,
++                                                        id_DSP48E1_DSP48E1))
++                    continue;
++                for (auto &port : ci->ports) {
++                    if (port.second.type != PORT_IN || port.second.net == nullptr ||
++                        !net_tm[port.second.net->udata])
++                        continue;
++                    delay_t sl = tmg.get_setup_slack(CellPortKey(ci->name, port.first));
++                    if (sl > -1000000000 && sl < 1000000000)
++                        df << ci->name.str(ctx) << "\t" << port.first.str(ctx) << "\t" << sl << "\n";
++                }
++            }
++        }
++        int bad = 0;
++        for (auto *c : cells)
++            if (c->bel != BelId() && !ctx->isBelLocationValid(c->bel))
++                bad++;
++        if (bad)
++            log_error("SA refinement left %d cells on invalid bels\n", bad);
++        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
++        log_info("SA refinement done: model slack worst %.3f -> %.3f ns, 0.5%% %.3f -> %.3f ns, HPWL %.0f -> %.0f, moves "
++                 "kept: %ld/%ld single, %ld/%ld cluster, %ld/%ld slice, %ld/%ld chain, %ld/%ld RAM/DSP; %.2f s\n",
++                 ctx->getDelayNS(ws0), ctx->getDelayNS(worst_slack), q0, slack_q(0.005), hpwl0, hpwl1, kind_acc[0],
++                 kind_try[0],
++                 kind_acc[1], kind_try[1], kind_acc[2], kind_try[2], kind_acc[3], kind_try[3], kind_acc[4], kind_try[4], secs);
++        restore();
++    }
++};
++}
++
++void XilinxImpl::sa_refine()
++{
++    const bool asked = ctx->args.options.count("sa-refine");
++    const bool replay = ctx->args.options.count("preplaced") || ctx->args.options.count("prerouted");
++    if (!asked || replay)
++        return;
++    SARefine(ctx, this).run(ctx->args.options.at("sa-refine").as<std::string>());
++}
++
++NEXTPNR_NAMESPACE_END
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index b18649ff..3c845d7f 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -89,6 +89,10 @@ po::options_description XilinxImpl::getUArchOptions()
+     specific.add_options()("carry-di-bypass", po::value<std::string>()->implicit_value(""),
+                            "feed a carry DI that no LUT of its own position drives through the slice X pin "
+                            "(AX..DX), as Vivado does, instead of a feed-through LUT; the S LUT may then be a LUT6");
++    specific.add_options()("sa-refine", po::value<std::string>()->implicit_value(""),
++                           "timing-driven simulated-annealing refinement after legalisation (VPR style), "
++                           "key=value:... (lambda, exp, t0, rlim, inner, quant, alpha, beta, pcrit, pcent, pslice, "
++                           "temps, time, critmin, greedy)");
+     specific.add_options()("preplaced", po::value<std::string>(),
+                            "before placing, pin the cells named in this file to the bels they had in a reference "
+                            "build (scripts/routing_dump.py from that build's --write JSON), packer-made cells included");
+@@ -1206,6 +1210,7 @@ void XilinxImpl::postPlace()
+     // 30), with the measured delay matrix giving its estimates.  Off unless asked for, until it is measured on xc7
+     // (docs/physopt-pass-proposal.md in the tools repository).
+     replace_around_brams();
++    sa_refine();
+     const bool timing_opt_asked = ctx->args.options.count("timing-opt");
+     if (timing_opt_asked) {
+         std::string v = ctx->args.options.at("timing-opt").as<std::string>();
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 0e2d3141..347989d6 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -396,6 +396,7 @@ struct XilinxImpl : HimbaechelAPI
+     bool is_movable_bram(const CellInfo *ci) const;
+     bool place_brams_by_group();
+     void replace_around_brams();
++    void sa_refine();
+ 
+     delay_t predictDelay(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const override;
+     delay_t estimateDelay(WireId src, WireId dst) const override;

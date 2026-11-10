@@ -1,12 +1,14 @@
 --- a/common/kernel/command.cc
 +++ b/common/kernel/command.cc
-@@ -397,6 +397,15 @@
+@@ -397,6 +397,17 @@
      general.add_options()("placer-static-overlap-stop", po::value<float>(),
                            "placer static: stop spreading and legalise the logic once its overlap is below this "
                            "fraction (float, default: 0.1)");
 +    general.add_options()("placer-static-arc-ratio", po::value<float>(),
 +                          "placer static: driver->sink timing-arc term for critical arcs, scaled to this fraction of "
 +                          "the wirelength gradient (float, default: off)");
++    general.add_options()("placer-static-anchor-init", po::value<int>(),
++                          "placer static: star-model relaxation iterations toward fixed cells before spreading (default: off)");
 +    general.add_options()("placer-static-weighted-precond",
 +                          "placer static: precondition by the summed timing net weights instead of the pin count");
 +    general.add_options()("placer-static-arc-exp", po::value<float>(),
@@ -16,12 +18,14 @@
      general.add_options()("placer1-critexp", po::value<float>(),
                            "placer1 and placement refinement: criticality exponent of the timing cost (float, default: 8)");
      general.add_options()("placer1-timing-tradeoff", po::value<float>(),
-@@ -635,6 +644,14 @@
+@@ -635,6 +646,16 @@
          ctx->settings[ctx->id("placerStatic/ipLegaliseLogicOverlap")] = std::to_string(vm["placer-static-ip-wait"].as<float>());
      if (vm.count("placer-static-overlap-stop"))
          ctx->settings[ctx->id("placerStatic/logicOverlapStop")] = std::to_string(vm["placer-static-overlap-stop"].as<float>());
 +    if (vm.count("placer-static-arc-ratio"))
 +        ctx->settings[ctx->id("placerStatic/arcRatio")] = std::to_string(vm["placer-static-arc-ratio"].as<float>());
++    if (vm.count("placer-static-anchor-init"))
++        ctx->settings[ctx->id("placerStatic/anchorInit")] = std::to_string(vm["placer-static-anchor-init"].as<int>());
 +    if (vm.count("placer-static-weighted-precond"))
 +        ctx->settings[ctx->id("placerStatic/weightedPrecond")] = true;
 +    if (vm.count("placer-static-arc-exp"))
@@ -42,7 +46,7 @@
      {
          float gradient = 0;
          if (cell->udata == -1)
-@@ -969,6 +969,8 @@
+@@ -969,13 +969,16 @@
              }
              float weight = 1.0 + double(cfg.timing_weight) * std::pow(double(crit), double(cfg.crit_exp));
              gradient += weight * (d_min - d_max);
@@ -51,7 +55,8 @@
          }
  
          NPNR_ASSERT(std::isfinite(gradient));
-@@ -976,6 +978,7 @@
+-        return gradient;
++        return axis == Axis::Y ? gradient * cfg.grad_scale_y : gradient;
      }
  
      std::vector<float> dens_penalty;
@@ -133,7 +138,54 @@
              if (ref) {
                  cell.ref_total_grad =
                          ((cell.ref_wl_grad * -1) - cell.ref_dens_grad * dens_penalty[cell.group]) / precond;
-@@ -1278,10 +1325,19 @@
+@@ -1156,6 +1203,46 @@
+         }
+     }
+ 
++
++
++
++    void anchor_initial(int iters)
++    {
++        for (int it = 0; it < iters; it++) {
++            std::vector<RealPair> np(ccells.size());
++            for (int i = 0; i < int(ccells.size()); i++) {
++                auto &mc = mcells.at(i);
++                np.at(i) = mc.pos;
++                if (mc.is_fixed)
++                    continue;
++                CellInfo *ci = ccells.at(i).base_cell;
++                RealPair sum(0, 0);
++                int n = 0;
++                for (auto &port : ci->ports) {
++                    NetInfo *ni = port.second.net;
++                    if (!ni || ni->driver.cell == nullptr || ni->users.entries() > 16)
++                        continue;
++                    auto add = [&](CellInfo *o) {
++                        if (o == ci || (o->udata == -1 && o->bel == BelId()))
++                            return;
++                        sum += cell_loc(o, false);
++                        n++;
++                    };
++                    add(ni->driver.cell);
++                    for (auto &usr : ni->users)
++                        add(usr.cell);
++                }
++                if (n > 0)
++                    np.at(i) = clamp_loc(RealPair(0.5f * mc.pos.x + 0.5f * sum.x / n, 0.5f * mc.pos.y + 0.5f * sum.y / n));
++            }
++            for (int i = 0; i < int(ccells.size()); i++) {
++                mcells.at(i).pos = np.at(i);
++                mcells.at(i).ref_pos = np.at(i);
++            }
++        }
++        log_info("Anchored initial placement: %d relaxation iterations.\n", iters);
++    }
++
+     void initialise()
+     {
+         float initial_steplength = 0.01f;
+@@ -1278,10 +1365,19 @@
          }
          log_info("   system potential: %f hpwl: %f\n", system_potential(), system_hpwl());
          compute_overlap();
@@ -154,7 +206,7 @@
      void update_timing()
      {
          if (!cfg.timing_driven)
-@@ -1299,6 +1355,31 @@
+@@ -1299,6 +1395,31 @@
              }
          }
          tmg.run(false);
@@ -186,13 +238,23 @@
      }
  
      void legalise_step(bool dsp_bram)
-@@ -1725,6 +1806,12 @@
+@@ -1649,6 +1770,8 @@
+         prepare_cells();
+         init_cells();
+         init_nets();
++        if (cfg.anchor_init > 0)
++            anchor_initial(cfg.anchor_init);
+         insert_dark();
+         insert_spacer();
+ 
+@@ -1725,6 +1848,13 @@
      target_util = ctx->setting_or<double>("placerStatic/targetUtil", 0.7);
      ip_legalise_logic_overlap = ctx->setting_or<float>("placerStatic/ipLegaliseLogicOverlap", 2.0f);
      logic_overlap_stop = ctx->setting_or<float>("placerStatic/logicOverlapStop", 0.1f);
 +    timing_every = ctx->setting_or<int>("placerStatic/timingEvery", 10);
 +    arc_ratio = ctx->setting_or<float>("placerStatic/arcRatio", 0.0f);
 +    weighted_precond = ctx->setting_or<bool>("placerStatic/weightedPrecond", false);
++    anchor_init = ctx->setting_or<int>("placerStatic/anchorInit", 0);
 +    arc_exp = ctx->setting_or<float>("placerStatic/arcExp", 8.0f);
 +    arc_min_crit = ctx->setting_or<float>("placerStatic/arcMinCrit", 0.5f);
 +    arc_start_overlap = ctx->setting_or<float>("placerStatic/arcStartOverlap", 0.3f);
@@ -201,11 +263,16 @@
      hpwl_scale_y = 1;
 --- a/common/place/placer_static.h
 +++ b/common/place/placer_static.h
-@@ -68,6 +68,12 @@
+@@ -68,6 +68,17 @@
      double target_util = 0.7;
      float ip_legalise_logic_overlap = 2.0f;
      float logic_overlap_stop = 0.1f;
 +    int timing_every = 10;
++
++
++    float grad_scale_y = 1.0f;
++
++    int anchor_init = 0;
 +
 +
 +
@@ -216,7 +283,17 @@
      std::vector<StaticCellGroupCfg> cell_groups;
 --- a/himbaechel/uarch/xilinx/xilinx.cc
 +++ b/himbaechel/uarch/xilinx/xilinx.cc
-@@ -118,6 +118,13 @@
+@@ -112,12 +112,23 @@
+     specific.add_options()("static-hpwl-x", po::value<int>(),
+                            "static placer: wirelength weight of a horizontal tile step against a vertical one "
+                            "(default 2)");
++    specific.add_options()("static-grad-y", po::value<float>(),
++                           "static placer: weight of the vertical wirelength gradient (default 1); >1 flattens the placement");
++    specific.add_options()("static-hpwl-y", po::value<int>(),
++                           "static placer: wirelength weight of a vertical tile step (default 1)");
+     specific.add_options()("static-ff-area", po::value<float>(),
+                            "static placer: area of a flipflop in slice-bel units of 1/16 (default 1.4: control-set "
+                            "and input-pin limits keep a slice from filling up)");
      specific.add_options()("hardblock-timing", po::value<std::string>()->implicit_value(""),
                             "time the DSP48E1 and ICAPE2 pins with the prjxray-db SDF arcs (off by default: they are "
                             "untimed); see hardblock_timing.cc");
@@ -230,7 +307,7 @@
      specific.add_options()("hold-detour-max", po::value<double>(),
                             "hold deficit (ns) up to which a routing detour is used instead of a feedthrough LUT "
                             "(default 0.5)");
-@@ -940,6 +947,21 @@
+@@ -940,6 +951,21 @@
      // on a given device it leaves dm_valid false and the formula stands, so an
      // untested device degrades rather than breaks.
      const ArchArgs &dm_args = ctx->args;
@@ -252,7 +329,22 @@
      std::string dm = dm_args.options.count("delay-matrix") ? dm_args.options["delay-matrix"].as<std::string>() : "build";
      if (dm != "off") {
          if (dm != "build")
-@@ -1047,6 +1069,44 @@
+@@ -1036,7 +1062,13 @@
+     cfg.hpwl_scale_x = ctx->args.options.count("static-hpwl-x")
+                                ? std::max(1, ctx->args.options.at("static-hpwl-x").as<int>())
+                                : 2;
+-    cfg.hpwl_scale_y = 1;
++
++
++    cfg.hpwl_scale_y = ctx->args.options.count("static-hpwl-y")
++                               ? std::max(1, ctx->args.options.at("static-hpwl-y").as<int>())
++                               : 1;
++    if (ctx->args.options.count("static-grad-y"))
++        cfg.grad_scale_y = ctx->args.options.at("static-grad-y").as<float>();
+ 
+     cfg.glbBufTypes.insert(id_PSEUDO_GND);
+     cfg.glbBufTypes.insert(id_PSEUDO_VCC);
+@@ -1047,6 +1079,44 @@
      cfg.timing_mx = 25;
      cfg.timing_my = 50;
  
@@ -297,7 +389,7 @@
      cfg.predict_delay = [](Context *ctx, const PlacerStaticCfg &cfg, Loc src_loc, IdString src_pin, Loc dst_loc,
                             IdString dst_pin) -> delay_t {
          if (dst_pin == id_CIN && src_pin == id_CO3)
-@@ -2092,17 +2152,18 @@
+@@ -2092,17 +2162,18 @@
          Loc dl = ctx->getBelLocation(src_bel), sl = ctx->getBelLocation(dst_bel);
          bool same_slice = (dl.z >> 4) == (sl.z >> 4);
          bool source_is_ff2 = (dl.z & 0xF) == BEL_FF2;

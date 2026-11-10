@@ -12,10 +12,10 @@ index a10d35db..fa71310d 100644
      hardblock_timing.cc
 diff --git a/himbaechel/uarch/xilinx/detail_place.cc b/himbaechel/uarch/xilinx/detail_place.cc
 new file mode 100644
-index 00000000..d0e42b15
+index 00000000..0fe401fc
 --- /dev/null
 +++ b/himbaechel/uarch/xilinx/detail_place.cc
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,394 @@
 +/*
 + *  nextpnr -- Next Generation Place and Route
 + *
@@ -246,12 +246,118 @@ index 00000000..d0e42b15
 +        return moved;
 +    }
 +
++
++
++
++    bool cluster_movable(const CellInfo *ci) const
++    {
++        if (ci == nullptr || ci->bel == BelId() || ci->cluster != ci->name || ci->constr_children.empty())
++            return false;
++        if (ci->constr_children.size() > 3 || ci->belStrength > STRENGTH_STRONG || ci->region != nullptr)
++            return false;
++        if (ci->type != id_SLICE_LUTX || ci->attrs.count(id_X_LUT_AS_DRAM) || ci->attrs.count(id_X_LUT_AS_SRL))
++            return false;
++        for (auto *ch : ci->constr_children)
++            if (!ch->type.in(id_SLICE_LUTX, id_SLICE_FFX) || ch->bel == BelId() || ch->belStrength > STRENGTH_STRONG)
++                return false;
++        return true;
++    }
++
++    std::vector<CellInfo *> members(CellInfo *root) const
++    {
++        std::vector<CellInfo *> m{root};
++        for (auto *ch : root->constr_children)
++            m.push_back(ch);
++        return m;
++    }
++
++    bool try_cluster(CellInfo *root, BelId nb)
++    {
++        if (nb == root->bel || !ctx->isValidBelForCellType(root->type, nb))
++            return false;
++        std::vector<std::pair<CellInfo *, BelId>> target;
++        if (!ctx->getClusterPlacement(root->cluster, nb, target))
++            return false;
++        auto mem = members(root);
++        if (target.size() != mem.size())
++            return false;
++        for (auto &t : target)
++            if (t.second == BelId() || !ctx->checkBelAvail(t.second))
++                return false;
++        double before = 0;
++        for (auto *c : mem)
++            before += cost(c);
++        std::vector<std::pair<CellInfo *, BelId>> old;
++        for (auto *c : mem) {
++            old.emplace_back(c, c->bel);
++            ctx->unbindBel(c->bel);
++        }
++        for (auto &t : target)
++            ctx->bindBel(t.second, t.first, STRENGTH_WEAK);
++        bool ok = true;
++        for (auto &t : target)
++            ok = ok && ctx->isBelLocationValid(t.second);
++        for (auto &o : old)
++            ok = ok && ctx->isBelLocationValid(o.second);
++        double after = 0;
++        if (ok)
++            for (auto *c : mem)
++                after += cost(c);
++        if (ok && after < before - 1.0)
++            return true;
++        for (auto &t : target)
++            ctx->unbindBel(t.second);
++        for (auto &o : old)
++            ctx->bindBel(o.second, o.first, STRENGTH_WEAK);
++        return false;
++    }
++
++    int improve_cluster(CellInfo *root)
++    {
++        int cx, cy;
++        double sx = 0, sy = 0;
++        int n = 0;
++        for (auto *c : members(root)) {
++            int x, y;
++            if (centre(c, x, y)) {
++                sx += x;
++                sy += y;
++                n++;
++            }
++        }
++        if (n == 0)
++            return 0;
++        cx = int(std::lround(sx / n));
++        cy = int(std::lround(sy / n));
++        std::vector<std::pair<int, BelId>> targets;
++        for (int dy = -radius; dy <= radius; dy++)
++            for (int dx = -radius; dx <= radius; dx++) {
++                int x = cx + dx, y = cy + dy;
++                if (x < 0 || y < 0 || x >= ctx->getGridDimX() || y >= ctx->getGridDimY())
++                    continue;
++                for (BelId b : ctx->getBelsByTile(x, y))
++                    if (ctx->isValidBelForCellType(root->type, b) && ctx->checkBelAvail(b))
++                        targets.emplace_back(std::abs(dx) + std::abs(dy), b);
++            }
++        std::stable_sort(targets.begin(), targets.end(),
++                         [](const std::pair<int, BelId> &a, const std::pair<int, BelId> &b) { return a.first < b.first; });
++        int moved = 0;
++        for (auto &t : targets)
++            if (try_cluster(root, t.second))
++                moved++;
++        return moved;
++    }
++
++    int move_clusters = 0;
++
 +    void run()
 +    {
 +        const std::string v = ctx->args.options.at("dpl").as<std::string>();
 +        if (!v.empty()) {
-+            float r = radius, p = passes, c = crit_min, e = crit_exp;
-+            int n = sscanf(v.c_str(), "%f,%f,%f,%f", &r, &p, &c, &e);
++            float r = radius, p = passes, c = crit_min, e = crit_exp, k = 0;
++            int n = sscanf(v.c_str(), "%f,%f,%f,%f,%f", &r, &p, &c, &e, &k);
++            if (n >= 5)
++                move_clusters = int(k);
 +            if (n >= 1)
 +                radius = std::max(1, int(r));
 +            if (n >= 2)
@@ -261,17 +367,21 @@ index 00000000..d0e42b15
 +            if (n >= 4)
 +                crit_exp = e;
 +        }
-+        log_info("Detailed placement (dpl): radius %d, %d passes, criticality >= %.2f, exponent %.1f\n", radius,
-+                 passes, crit_min, crit_exp);
++        log_info("Detailed placement (dpl): radius %d, %d passes, criticality >= %.2f, exponent %.1f, clusters %d\n", radius,
++                 passes, crit_min, crit_exp, move_clusters);
 +        tmg.setup();
 +        for (int pass = 0; pass < passes; pass++) {
 +            tmg.run();
 +            std::vector<std::pair<float, CellInfo *>> cand;
 +            for (auto &cell : ctx->cells) {
 +                CellInfo *ci = cell.second.get();
-+                if (!movable(ci))
++                const bool as_cluster = move_clusters && cluster_movable(ci);
++                if (!movable(ci) && !as_cluster)
 +                    continue;
 +                float cr = cell_crit(ci);
++                if (as_cluster)
++                    for (auto *ch : ci->constr_children)
++                        cr = std::max(cr, cell_crit(ch));
 +                if (cr >= crit_min)
 +                    cand.emplace_back(cr, ci);
 +            }
@@ -281,7 +391,7 @@ index 00000000..d0e42b15
 +                             });
 +            int moved = 0;
 +            for (auto &c : cand)
-+                moved += improve(c.second);
++                moved += (move_clusters && cluster_movable(c.second)) ? improve_cluster(c.second) : improve(c.second);
 +            log_info("    pass %d: %d candidate cells, %d moves/swaps kept\n", pass + 1, int(cand.size()), moved);
 +            if (moved == 0)
 +                break;

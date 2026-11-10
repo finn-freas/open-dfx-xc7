@@ -690,12 +690,16 @@ Placement quality besides Fmax, seed means (`place_bench.py --metrics`, build/qo
 | pl6_sdpc_rcal: static-delay + predict-cal | 119.18 (2 seeds) | 152.65 | 96.56 |
 | pl7_mxpc_rcal: delay matrix + predict-cal for the global placer | 116.66 | 153.95 | 96.73 |
 | pl6_sdce4_rcal: static-delay, critexp 4 | 112.80 | 153.02 | 96.94 |
+| pl8_sdarc2_rcal: static-delay + timing-arc term, ratio 0.2 (DREAMPlaceFPGA-TD idea) | 109.11 | 154.20 | 94.95 |
+| pl9_sdwp_rcal: static-delay + weighted preconditioner (Mai et al. idea) | 116.83 | 146.80 | 90.57 |
 
 - The cell-calibrated chipdb makes the placements worse in Vivado's eyes: bram -5.5 %, rv_big -12 % against the stub chipdb.
 - Feeding calibrated delays to the global placer wins back part of that loss: bram 147-149 -> 150-154, rv_big 92-95 -> 97-99.
 - No variant beats the stub chipdb's placement, and rv_soc stays within its seed spread (107-126).
 - The gap to Vivado placing the same netlist is unchanged: rv_soc 157.63, bram 170.88 MHz (Finding 11).
-- Two Vivado runs were not finished when this was written: the timing-arc term (pl8) and the weighted preconditioner (pl9).
+- The timing-arc term (pl8) costs rv_soc 6 % and rv_big 4.5 % against static-delay alone; bram is +2.5 %. It is not a win.
+- The weighted preconditioner (pl9) cuts rv_big's HPWL after legalisation by 13 % (25539 -> 22198 against the stub baseline; routed wires -2 %). Its Vivado-timed Fmax is no better: rv_soc equal to the baseline, bram -5.8 %, rv_big -13.7 %. Shorter total wirelength did not mean shorter critical paths, so it is not a win.
+- Conclusion of round 2: none of the five global-placement changes (delay calibration of the global placer, predict-cal, timing-arc term, weighted preconditioner, critexp) beats the stub-chipdb placement under Vivado's timer on more than one design. Finding 15's mixes show global placement still loses about 10 MHz on rv_soc, so the cause lies in how the global placer spreads and orders cells, not in the delay values it uses.
 
 Other results:
 - eth SoC, 3 seeds: plp_rcal 68.95, pl5_pc_rcal 70.08, pl_base 68.64 MHz.
@@ -1012,6 +1016,43 @@ The fixes under Vivado's timer, seeds 1-3 (Fmax per seed; mean; slices, HPWL and
 - The rv_soc seed-1 worst path (FF -> LUT2 -> 4 CARRY4 -> 2 LUT4 -> FDSE S) has the same cells in dp0 and dp1; in dp1 they are spread over SLICE_X30-45 / Y42-68 instead of X34-45 / Y69-82: a different global placement of the same path, not a slower carry.
 - In the imposed placement an S LUT that nextpnr duplicated (`$S_DUP`, 9-11 per design in dp0 and dp1) is not in the yosys netlist, so Vivado drives that S input from the original LUT through a route-through; this penalises both variants alike.
 
+### Round 2 (2026-11-07 morning): cluster moves that follow the global placement (`-o dpl=...,1`)
+Change (docs/drafts/nextpnr-packing-dpl.patch, detail_place.cc): a 5th `dpl` field makes the detailed pass also move small LUT/FF clusters (a LUT and up to three flip-flops the packer tied to it) as one piece, to a free position near the criticality-weighted centre of the cluster's connections where `getClusterPlacement` is legal and both tiles stay valid; kept when the weighted predicted delay drops. With criticality floor 0 every unclustered cell and every such cluster is a candidate, so the slices are rebuilt around the global placement after legalisation. Without the 5th field the pass is unchanged; with no `dpl` at all the FASM is identical to the base (rebuilt dpl2, rv_soc and bram s1). Variant dp4 = carry-di-bypass + `dpl=2,2,0,1,1`. rv_soc s1: 1090 candidates, 725 + 356 moves; rv_soc dp4 s1 bitstream decodes and passes the firmware bench 11/11.
+
+Vivado's timer, seeds 1-3 (means; Fmax per seed in brackets):
+
+| design | variant | Fmax MHz | slices | HPWL | PIPs | Vivado route s | nextpnr s |
+|---|---|---|---|---|---|---|---|
+| rv_soc | dp1 | 112.35 | 462 | 19548 | 42900 | 24.2 | 63 |
+| rv_soc | dp4 | 106.47 (106.37 / 106.37 / 106.66) | 440 | 19963 | 42402 | 22.8 | 31 |
+| bram | dp1 | 152.44 | 287 | 21909 | 22041 | 39.4 | 25 |
+| bram | dp4 | 146.26 (141.98 / 148.50 / 148.30) | 281 | 23852 | 22170 | 43.2 | 19 |
+| rv_mul | dp1 | 97.06 | 661 | 21419 | 50368 | 23.6 | 67 |
+| rv_mul | dp4 | 100.06 (106.86 / 93.74 / 99.58) | 609 | 21582 | 50168 | 25.0 | 33 |
+
+- Area goes down again (slices -2 to -8 % against dp1; rv_mul 609 against Vivado's 551, rv_soc 440 against 398, bram 281 against 290), routed PIPs are equal or lower, but Fmax is not better: -5 % rv_soc, -4 % bram, +3 % rv_mul, all inside the seed spread except that rv_soc dp4 is consistently near 106.4 on all three seeds.
+- So rebuilding the slices around the global placement with the current arc model does not move Vivado-timed Fmax. The model (the predict-cal fit) is what the moves optimise; with the global placement itself fixed, the critical paths keep their hop count (rv_soc worst-200 mean net delay 4.30 ns dp4 vs 4.17 dp1). This points the remaining gap back at global placement and at the delay model, not at slice composition.
+
+### Round 3 (2026-11-08): re-timed with the fixed placement export, and carry-di-bypass as a default
+The "placed" sources above came from qor_xtime.placement(), which stripped only the muxcy0 carry suffix, so part of every placement (rv_soc and rv_mul about 8-10 % of the cells, bram 1 %) was left to Vivado's placer. Fixed in efcb64f; all dp0/dp1 sources were re-prepared and re-timed into C:\Users\finnf\open-dfx-xc7-vivado\build\dpl_xtime2\ (flow/dpl_vivado.sh, flow/dpl_summary.py default to it). The earlier tables in this Finding (rounds 1-2, mixes, dp2dp, dp4) are from the old export and carry that bias.
+
+Vivado's timer, same nextpnr run per seed (Fmax per seed; slices = Vivado's count of the imposed placement):
+
+| design | dp0 (base) Fmax s1 / s2 / s3, mean | dp1 (carry-di-bypass) s1 / s2 / s3, mean | paired | slices dp0 -> dp1 (Vivado's own) |
+|---|---|---|---|---|
+| rv_soc (incl. ICAP) | 116.40 / 109.59 / 114.80, 113.60 | 120.39 / 113.66 / 115.01, 116.35 | +2.4 % | 499 -> 462 (398) |
+| bram | 150.13 / 147.28 / 150.63, 149.35 | 157.18 / 154.44 / 145.71, 152.44 | +2.1 % | 341 -> 287 (290) |
+| rv_mul | 98.53 / 102.00 / 99.56, 100.03 | 101.94 / 95.08 / 96.25, 97.76 | -2.2 % | 688 -> 646 (551) |
+| rv_big | 100.55 / 98.88 / 93.10, 97.51 | 106.16 / 99.91 / 99.89, 101.99 | +4.6 % | 752 -> 687 (-) |
+| eth (LiteX, 100 MHz) | 66.66 / 70.02 / 70.28, 68.99 | 67.02 / 74.43 / 65.46, 68.97 | 0.0 % | 3026 -> 2956 (-) |
+
+- Mean over the four qor designs +1.7 % Fmax, eth 0.0 % (3 of 5 positive; rv_mul -2.2 % with single seeds from -6.8 to +3.5 %, inside its spread), slices -6 to -16 % (bram at Vivado's level, the CPUs still 12-17 % above it), Vivado routed PIPs equal or lower, Vivado route time equal.
+- Safety checks for a default: (1) no-op on a design without carries: fir (no CARRY4 instance), dpl1 binary, `-o dsp-cascade-place`, seed 1: FASM identical with and without the option (build/qor/dpl/noop_fir); (2) off = base: dpl1/dpl2 without the option give FASM identical to dpl0 (rv_soc, bram); (3) rv_soc dp1 seeds 1, 2 and 3: bitstream decoded back to a netlist (fasm2bels) passes the firmware bench 11/11 each; all 15 dp1 FASMs assemble. rv_mul/rv_big cannot be decoded (no DSP_L in fasm2bels).
+- **Superseded (2026-11-08 evening): the proposal is withdrawn.** The "placed" mode used above imposes only cells of the yosys netlist: it drops nextpnr's own cells (rv_soc dp0: 519 feed-through LUT1s, 100 split CARRY4s), leaves the LUTRAM register file (126 cells), 6 re-chunked CARRY4s and 32 refused cells to Vivado's placer, and lets Vivado re-assign LUT pins. flow/exact_src.py imports nextpnr's placement exactly (xroute netlist, LUTRAM macros, LUT pin locks; rv_soc dp0 s1: 2615 placed, 2 refused), and Vivado's timer then gives (Fmax excl. ICAP, dp0 -> dp1): rv_soc 103.48 -> 99.72 / 98.87 -> 97.22 / 100.45 -> 94.97 (-3.6 %, 3 of 3 seeds worse), bram 140.21 -> 142.01 / 137.14 -> 144.86 / 140.00 -> 135.65 (+1.3 %), rv_mul 87.05 -> 93.76 / 90.20 -> 85.86 / 90.28 -> 86.76 (-0.3 %), rv_big 92.61 -> 92.03 / 87.26 -> 88.17 / 88.98 -> 85.06 (-1.3 %); mean -1.0 %. Placed mode is optimistic by 7-21 % on seed 1 (rv_soc dp0 116.40 vs exact 103.48, dp1 120.39 vs 99.72, bram dp0 150.13 vs 140.21). carry-di-bypass stays opt-in (release patch 0031; ofx `carry_di_bypass = false`).
+- **Proposal: make `-o carry-di-bypass` the default** (keep an `-o no-carry-di-bypass` escape): it is an area gain everywhere, Fmax-neutral to slightly positive under Vivado's timer on 12 paired runs, a no-op without carries, and functionally verified on rv_soc. eth (LiteX) is re-timed too: Fmax-neutral (0.0 %, slices -2 %). Still missing: a gate-level simulation of one DSP design (fasm2bels has no DSP_L).
+- dp2dp (carry-di-bypass + dpl) re-timed the same way, seeds 1-3: rv_soc 117.73 / 118.19 / 111.00 (mean 115.64; dp1 116.35), bram 155.35 / 153.99 / 150.22 (153.19; dp1 152.44), rv_mul 100.25 / 95.08 / 96.34 (97.22; dp1 97.76). The detailed placer adds nothing measurable on top of carry-di-bypass.
+- Side finding: fir with the static placer and without `-o dsp-cascade-place` spins in "Strict legalising 19 cells" (stopped after 17 min, dpl0 binary); pre-existing, unrelated to the option.
+
 ### What is open
 - Vivado-timed dp2dp seeds 2-3, rv_big and eth, and the bram/rv_mul mix controls (queue order in build/qor/dpl/queue/names.txt; restart with `NAMES_FILE=... flow/dpl_queue.sh 1`).
 - The QoR suite (flow/qor_suite.py quick mode) was not run on these variants.
@@ -1065,20 +1106,66 @@ Each variant is compared seed by seed with the same seed's base run (same placem
 
 On Vivado's placement (seed 1, rcal timer): `critSeedDelay=1` + `critRipupIters=3` 110.94 / 103.16 / 107.98 / 135.35 against 103.92 / 102.16 / 104.13 / 131.87 (+6.8 / +1.0 / +3.7 / +2.6 %).
 
-- What the two options fix: (1) router2 seeds an arc's forward search with every wire of the net's existing tree near the sink at cost 0, so a critical arc branches off whatever tree is there, whatever that tree's delay from the source; `critSeedDelay` charges a seed its routed delay from the source times the arc's criticality. (2) router2 stops as soon as routing is legal, with criticalities from the pre-route estimate; `critRipupIters` re-routes the critical nets with the routed criticalities and keeps the best legal routing. Neither costs router time on these designs (router2 seconds equal or lower; the machine was shared, so only large changes would show).
+- What the two options fix: (1) router2 seeds an arc's forward search with every wire of the net's existing tree near the sink at cost 0, so a critical arc branches off whatever tree is there, whatever that tree's delay from the source; `critSeedDelay` charges a seed its routed delay from the source times the arc's criticality. (2) router2 stops as soon as routing is legal, with criticalities from the pre-route estimate; `critRipupIters` re-routes the critical nets with the routed criticalities and keeps the best legal routing. Neither costs router time on these designs (router2 seconds equal or lower; the machine was shared, so only large changes would show). Vivado's timer does not confirm the gain (next section).
 - Rip-up of only the critical arcs of a net (instead of the whole net) tripped router2's tree reconstruction (`cursor_bwd == src_wire_idx`, router2.cc) on rv_big and bram; the draft rips the whole net, as `--tmg-ripup` does.
 - Not worth keeping: a steeper criticality curve (`critExp=8`), a lower A* weight for critical arcs (`critEstWeight=1`): within seed noise or worse.
 - The calibrated routing delays in the router (`rcal` chipdb) are the larger lever by the global-placement agent's measurement (same nextpnr placement, 3 seeds, Vivado routes vs nextpnr routes, Finding 15 work): nextpnr's routes are 15-20 % slower than Vivado's (rv_soc 99.1 vs 117.2 MHz, bram 125.4 vs 149.4, eth 57.1 vs 69.0). The same comparison in this harness (`<d>_own_cal_s1` and `_vr`, and the rcal runs with `--no-vr`) is exported and queued, not run.
+
+### Vivado's timer on the router options (same placement per seed; 2026-11-07)
+`critSeedDelay=1` + `critRipupIters=3` against the base router, rcal chipdb, own placement: per seed the two runs share the placement (the options act after placement), and each implementation is imposed on Vivado pip for pip (`<d>_own_rcal_s<n>`, `<d>_own_sd1crk3_rcal_s<n>`, C:\Users\finnf\open-dfx-xc7-vivado\build\rte\). Vivado timer, Fmax excluding ICAPE2; nextpnr's own claim (rcal timer) in brackets. 85-234 nets per run could not take their ROUTE property whole and were completed by `route_design -preserve` (route_log.txt "partial"); the counts are within a few nets of each other in each pair.
+
+| design | per seed: base -> options (Vivado timer) | mean base | mean options | paired mean |
+|---|---|---|---|---|
+| rv_soc | s1: 101.40 -> 96.57 (-4.8 %; nextpnr 103.48 -> 106.92)<br>s2: 92.83 -> 98.83 (+6.5 %; nextpnr 99.99 -> 101.57)<br>s3: 97.85 -> 96.08 (-1.8 %; nextpnr 93.93 -> 100.47) | 97.36 | 97.16 | -0.0 % (n=3) |
+| rv_mul | s1: 94.61 -> 97.25 (+2.8 %; nextpnr 86.63 -> 90.16)<br>s2: 94.70 -> 95.29 (+0.6 %; nextpnr 90.40 -> 94.71)<br>s3: 85.09 -> 92.38 (+8.6 %; nextpnr 84.42 -> 91.29) | 91.47 | 94.97 | +4.0 % (n=3) |
+| rv_big | s1: 83.29 -> 76.69 (-7.9 %; nextpnr 87.80 -> 91.37)<br>s2: 91.18 -> 93.08 (+2.1 %; nextpnr 93.25 -> 95.41)<br>s3: 90.98 -> 97.65 (+7.3 %; nextpnr 90.16 -> 90.04) | 88.49 | 89.14 | +0.5 % (n=3) |
+| bram | s1: 135.45 -> 135.45 (+0.0 %; nextpnr 128.53 -> 131.96)<br>s2: 132.54 -> 136.00 (+2.6 %; nextpnr 125.16 -> 131.16)<br>s3: 127.02 -> 135.67 (+6.8 %; nextpnr 122.52 -> 129.03) | 131.67 | 135.70 | +3.1 % (n=3) |
+
+- **Under Vivado's timer the gain is smaller and not consistent.** nextpnr's rcal timer predicted +2 to +6 % for these options; Vivado measures rv_soc -0.0 % (n=3), rv_mul +4.0 % (n=3), rv_big +0.5 % (n=3), bram +3.1 % (n=3). The per-seed changes go both ways (rv_soc -4.8 / +6.5 / -1.8 %, rv_big -7.9 / +2.1 / +7.3 %) and are smaller than the seed-to-seed spread of the base itself (rv_soc 92.8-101.4, rv_big 83.3-91.2 MHz). rv_mul (+2.8 / +0.6 / +8.6 %) and bram (+0.0 / +2.6 / +6.8 %) are not worse on any seed, so the options may help the DSP and BRAM designs; three seeds are not enough to tell that from noise. Mean over the four designs +1.9 %.
+- Why: the router options trade routes by nextpnr's delay model, and the rcal model is right on average (base runs: nextpnr claim vs Vivado within -8.4 to +7.7 %, e.g. rv_soc 103.48 / 101.40, rv_mul 86.63 / 94.61, bram 128.53 / 135.45) but not per route; a 4 % change predicted by that model is inside its error. One worst path checked net by net (rv_soc s1, flow/route_cmp.py-style per-pin delays): the same 9-level path, two of its nets 120 and 334 ps slower in Vivado's timing after the options moved them.
+- The base runs reproduce earlier Vivado numbers exactly where the implementation is the same (rv_mul s1 94.61 and rv_big s1 83.29 MHz, as Finding 13's rcal runs), so the harness is consistent.
+- Conclusion: keep the options opt-in and off for now; they cost no router time, and Vivado shows no loss on average (+1.9 %) but no clear gain either (rv_soc -0.0 %, rv_big +0.5 %). A router change has to be judged by Vivado's timer (or a model that is right per route), not by nextpnr's.
+
+### Router share on the identical placement, and where nextpnr's routes lose (2026-11-08)
+**Correction (2026-11-08 evening): the `_vr` runs below keep nextpnr's LUT input pins locked (lockpins.txt), so the "router share" in this section excludes pin assignment.** With the same placement and Vivado free to re-assign LUT pins (place_design "Re-assign LUT pins", source `rv_soc_p5_dp0_s1_exact_nolock`, flow/exact_src.py with an empty lockpins.txt), rv_soc s1 reaches 119.6 MHz (WNS -3.359) against 103.48 with our pins and 101.40 with our pins and routes: **routing plus pin choice is worth +17-18 % on rv_soc s1**, back in the 15-20 % range. Per-LUT-arc dumps (vivado/build_rte.tcl RTE_LUT_ARCS=1, both runs): Vivado's intrinsic LUT delay (0.124 vs ~0.355 ns) is the same arc by arc in both runs, i.e. not pin-dependent; the gain is net delay. Vivado puts 170 LUTs with 5 or fewer inputs on A6 (nextpnr's chipdb only permutes A1-A5; A6 is reserved for a sixth input), and those 263 arcs get 442 ps shorter on average; on the 200 worst paths 18 arcs moved to A6 save 7.3 ns and 113 arcs moved among A1-A5 save 226 ps each, unchanged pins 0. Worst-100 paths: net 5.54 -> 4.82 ns, logic 2.49 -> 2.08 ns (a different path set). Follow-up: A6 permutation and criticality-aware pin choice in router2 (docs/wip/router.md).
+
+Method: the `<d>_own_rcal_s<n>` exports (nextpnr placement imposed exactly by flow/xroute.py; this harness does not use qor_xtime.placement, so the 2026-11-08 cell-miss bug of the place_xtime runs does not apply) are timed twice by Vivado: with nextpnr's pips imposed and with Vivado routing the same placement (`_vr`). vivado/build_rte.tcl with RTE_ROUTE_DUMP=1 (flow/rte_dump_vivado.sh, C:\Users\finnf\open-dfx-xc7-vivado\build\rte_arcs\) also dumps every routed net as node pairs, and flow/route_arcs.py compares the two routings arc by arc (Vivado slow-max arc delays).
+
+| design (seed 1) | nextpnr's routes (Vivado timer) | Vivado's routes, same placement (Vivado timer) | router share |
+|---|---|---|---|
+| rv_soc | 101.40 MHz (WNS_noicap -4.862) | 103.48 (-4.664) | +2.0 % |
+| rv_mul | 94.61 (-5.570) | 100.22 (-4.978) | +5.9 % |
+| rv_big | 83.29 (-7.006) | 93.04 (-5.748) | +11.7 % |
+| bram | 135.45 (-2.383) | 140.21 (-2.132) | +3.5 % |
+
+- Seeds 2-3 (same method, Vivado timer, nextpnr's routes -> Vivado's routes on the same placement): rv_soc 92.83 -> 98.87 (+6.5 %), 97.85 -> 100.45 (+2.7 %); rv_mul 94.70 -> 96.29 (+1.7 %), 85.09 -> 92.48 (+8.7 %); rv_big 91.18 -> 92.34 (+1.3 %), 90.98 -> 91.94 (+1.0 %); bram 132.54 -> 137.14 (+3.5 %), 127.02 -> 140.00 (+10.2 %). Mean over 3 seeds: rv_soc +3.7 %, rv_mul +5.4 %, rv_big +4.7 %, bram +5.7 %; **all 12 runs +4.9 %**.
+- On the exact placement the router costs 2-12 % (seed 1 mean +5.8 %, 3-seed mean +4.9 %), not the 15-20 % estimated earlier from place_xtime imports (those left part of the cells to Vivado's placer, see the qor_xtime fix efcb64f).
+- Where the delay goes (arcs on the 200 worst paths of either routing, Vivado timer): arcs of the same shape cost the same (rv_soc -13 ps, bram +4, rv_big -18, rv_mul -9 ps per arc). The losses are in arcs that pass **through an unused LUT** (IMUX -> LUT input -> LUT -> LOGIC_OUTS): rv_soc 45 such arcs carry 41.8 of the 55.6 ns total excess, rv_mul 29 arcs 13.5 ns (more than its 11.3 ns total excess); rv_big 1 arc (on its worst path, +643 ps), bram none. Vivado's own routing uses no LUT route-through on any of the four. The chipdb times these pseudo-pips as SITE_NULL (free; the rcal class adds -56 ps), so the router sees a shortcut where Vivado's timer charges a LUT delay and a new exit (a class fit over 50277 Vivado-timed arcs gives about +2.1 ns per route-through arc, rms 354 ps; indicative only).
+- Second, smaller pattern: long lines (LV18/LH12) and hexes for short hops on rv_big and bram (rv_big worst path +629 ps on one such arc; bram's worst arc +413 ps over LV18/LH12/LV18/LH12). Load: per-branch cost in the fit is about 6 ps, fanout about 1 ps per load, so a load-aware router cost has little to gain under Vivado's timer.
+- Draft change: `-o no-lut-routethru` (docs/drafts/nextpnr-router-timing.patch, binary build/nextpnr-build/rte-nrt): LUT_ROUTETHRU pips unavailable to the router; read in preRoute, so the placement per seed is unchanged and runs pair with the base. Off: FASM identical to the base on rv_soc, rv_mul, rv_big, bram (s1).
+
+Vivado's timer on `-o no-lut-routethru` (rcal chipdb, own placement, same placement per seed as the base, nextpnr's pips imposed; Fmax excl. ICAPE2; TNS_noicap in ns; router2 seconds from nextpnr's log on a shared machine):
+
+| design | per seed: base -> no-lut-routethru (Vivado timer) | mean base -> option | paired mean |
+|---|---|---|---|
+| rv_soc | s1 101.40 -> 98.85 (-2.5 %), s2 92.83 -> 95.83 (+3.2 %), s3 97.85 -> 102.97 (+5.2 %) | 97.36 -> 99.22 | +2.0 % |
+| rv_mul | s1 94.61 -> 92.59 (-2.1 %), s2 94.70 -> 97.48 (+2.9 %), s3 85.09 -> 88.89 (+4.5 %) | 91.47 -> 92.99 | +1.8 % |
+| rv_big | s1 83.29 -> 88.59 (+6.4 %), s2 91.18 -> 90.11 (-1.2 %), s3 90.98 -> 92.90 (+2.1 %) | 88.49 -> 90.53 | +2.4 % |
+| bram | s1 135.45 -> 133.62 (-1.3 %), s2 132.54 -> 136.97 (+3.3 %), s3 127.02 -> 120.53 (-5.1 %) | 131.67 -> 130.37 | -1.0 % |
+
+- The three CPUs (which use route-throughs on their critical arcs) gain +1.8 to +2.4 % (n=3 each, 2 of 3 seeds positive on each); bram (no route-through among its critical arcs) moves -1.0 %, i.e. noise. Mean over the four designs +1.3 %, about the same as `critSeedDelay=1` + `critRipupIters=3` (+1.9 %) and, like it, inside the seed spread of single runs. TNS_noicap moves both ways (rv_soc s1 -1546 -> -1402, rv_mul s2 -2612 -> -2334, rv_big s3 -2536 -> -2578). router2 time is lower on 9 of 12 runs (e.g. rv_soc 25.1 -> 13.9 s, rv_mul 19.2 -> 12.1 s): the route-throughs were negotiated detours.
+- Why the gain is smaller than the 75 % share of the excess suggests: the route-through arcs sit mostly on high-fanout control nets (FF R/CE pins) of the 200 worst paths, not on the single worst path; once they are gone, the worst path is decided by the remaining per-arc routing noise (the same 9-level path moves by +-250 ps per arc between runs). The remaining router share (2-12 % on seed 1) is spread over many arcs by a few hundred ps each.
+- Decision: keep it opt-in (no-op off, verified); a candidate default for the CPU designs once a few more seeds and the LiteX designs confirm it. It costs no runtime.
 
 ### No-op and cost
 - Without the options the draft binary gives FASM identical (sorted, comments dropped) to the release binary on rv_soc, rv_mul, rv_big and bram (build/rte/noop/).
 - Runtime: see the router2 column; the Vivado reference spends 31-44 s routing these designs, nextpnr's router2 8-33 s.
 
 ### Open
-- Vivado's timer on every number in the two router tables (queued: flow/route_xtime.py `vivado` stage; the export directories exist). Until then the router options are measured with nextpnr's rcal timer only.
+- The identical-placement router-share runs (`<d>_vimp_cal_s1` and `_vr`, `<d>_own_cal_s1` and `_vr`) are exported but not run; the Vivado time went to the option check above.
 - Import fidelity: carry chains nextpnr cuts differently and its duplicated S LUTs keep 9-85 chains per design off Vivado's sites; a packer mode that keeps yosys' CARRY4 boundaries would make the import exact.
 - High-fanout and load-dependent delays (Vivado's RC model) are not in nextpnr's router cost; Finding 13 left 0.6-0.7 ns of per-path optimism on the CPUs unexplained, which a load-aware cost for critical arcs might address.
-- Defaults: the options stay opt-in until Vivado's timer confirms them over seeds.
+- Defaults: the options stay opt-in and off (no Vivado-confirmed gain, previous section).
 
 ## nextpnr builds (build/nextpnr-build/, all ce3f7c18 + drafts, cmake flags of docs/buildenv.md, -j4)
 - `qor`: + nextpnr-hardblock-timing.patch (worktree build/src/nextpnr-qor). Log build/nextpnr-build/qor.build.log.
@@ -1260,6 +1347,169 @@ On Vivado's placement (seed 1, rcal timer): `critSeedDelay=1` + `critRipupIters=
 | openXC7 fix_static | 150.99 (nextpnr) | - | 854 / 1370 | 494 | 98 | 24.00 | 0 | 27.20 |
 | openXC7 fix_static_auto (best of 8, seed 8; median 150.76, worst 135.06) | 155.45 (nextpnr) | - | 854 / 1370 | 494 | 98 | 24.00 | 0 | 181.30 |
 <!-- qor_bench:main:end -->
+
+## Finding 17 (2026-11-08): global placement -- target density, criticality against a slack quantile, re-timed baselines (nextpnr draft `nextpnr-placer-density`)
+Method:
+- nextpnr: worktree build/src/nextpnr-place, builds place_v12-v16 (docs/drafts/nextpnr-placer-density.{patch,md}; every
+  option off by default, `.frames` identical to place_v11 / the `ref` binary with them off). Stub chipdb, `--placer static
+  -o hardblock-timing`, 5 ns, seeds 1-3. rv_mul uses the `-pipeline` (dspq) netlist as in Finding 16.
+- Vivado's timer: our placement imposed (vivado/build_xtime.tcl, "placed" mode), Vivado places what it cannot take and routes.
+  flow/place_vivado.sh + flow/place_vqueue.sh; output C:\Users\finnf\open-dfx-xc7-vivado\build\place_xtime2. Each run
+  also dumps cells and the 1000 worst paths; "hops" = mean Manhattan grid hops along the 100 worst Vivado paths in that
+  placement (flow/place_diag.py metric). Table: flow/place_summary.py.
+- **Corrected extraction.** Until 2026-11-08 `qor_xtime.placement()` imposed only the `muxcy0` part of nextpnr's
+  CARRY4 names, so the other carry chunks were left to Vivado, and nextpnr-only cells (carry DI feed-through LUTs) were
+  sent to place_cell. It now uses flow/qor_suite.py's rule (efcb64f). Every earlier Vivado-timed "our placement" number
+  of Findings 13/15/16 and docs/wip/placement-global.md that went through it is biased. Corrected stub baseline:
+  rv_soc 112.56 (was 116.81), bram 155.87 (unchanged: bram's carries were never split, identical placement and
+  result), rv_big 102.32 (was 104.95). With the fix about 60 of 1966 rv_soc rows still fail in place_cell (FFs on a bel
+  next to an imposed carry: COUTMUX contention or bel occupied), against 582 of 2503 refused before.
+
+Changes measured:
+- `tu10`: anchored start (`--placer-static-anchor-init 20 --placer-static-ip-wait 0.5`, Finding 13 round 3) plus target
+  utilisation 1.0 (`--placer-static-target-util 1.0`): spacers fill the device, so the cells sit at full density
+  (elfPlace's target density) instead of 70 %.
+- `cq02`: `--placer-static-crit-quantile 0.02` (new). nextpnr's criticality is 1 - (slack - worst) / -worst; on rv_soc and
+  rv_mul the worst path is the ICAPE2 path (5.2 ns clock-to-out under hardblock-timing), so every logic path gets a low
+  criticality and the global placer's net weight 1 + 5 crit^2 stays near 1 on the paths Vivado finds critical. With the
+  option the static placer's analyser measures against the slack at the 2 % quantile of the port slacks.
+- `cdb`: `-o carry-di-bypass` (Finding 15).
+
+Vivado timer, Fmax per seed and mean, MHz; HPWL after legalisation and slices from nextpnr; hops on Vivado's 100 worst
+paths; nextpnr seconds (shared machine):
+
+| design | variant | Vivado Fmax per seed | mean | vs base | HPWL | slices | sd_x / sd_y | worst-100 hops | nextpnr s |
+|---|---|---|---|---|---|---|---|---|---|
+| rv_soc | base (stub, corrected) | 115.34 / 112.56 / 109.77 | 112.56 | | 17363 | 492 | 9.2 / 13.2 | 49.5 | 42 |
+| rv_soc | tu10 + cq02 | 115.79 / 107.50 / 104.72 | 109.34 | -2.9 % | 16932 | 438 | 10.1 / 7.9 | 42.3 | 32 |
+| rv_soc | tu10 + cq02 + cdb | 126.94 / 116.66 / 117.74 | **120.45** | **+7.0 %** | 17349 | 388 (Vivado 398) | 10.2 / 6.7 | 37.5 | 34 |
+| bram | base | 155.09 / 155.40 / 157.13 | 155.87 | | 22485 | 323 | 16.4 / 18.2 | 19.1 | 27 |
+| bram | tu10 + cq02 | 154.30 / 158.98 / 153.14 | 155.47 | -0.3 % | 20953 | 321 | 23.9 / 15.2 | 21.5 | 25 |
+| bram | tu10 + cq02 + cdb | 144.26 / 148.63 / 151.86 | 148.25 | -4.9 % | 20080 | 287 (Vivado 290) | 7.1 / 14.4 | 23.0 | 25 |
+| rv_big | base | 106.02 / 92.17 / 108.78 | 102.32 | | 25539 | 748 | 14.6 / 9.8 | 38.7 | 33 |
+| rv_big | tu10 + cq02 | 104.23 / 95.37 / 97.78 | 99.13 | -3.1 % | 23218 | 668 | 13.0 / 9.9 | 33.8 | 32 |
+| rv_big | tu10 + cq02 + cdb | 93.64 / 93.97 / 102.69 | 96.77 | -5.4 % | 21769 | 605 | 10.5 / 9.2 | 40.2 | 31 |
+| rv_mul | base (dspq) | 112.54 / 105.90 / 100.12 | 106.19 | | 26733 | 633 | 12.4 / 12.2 | 65.3 | 39 |
+| rv_mul | tu10 + cq02 (dspq) | 115.33 / 118.84 / 115.55 | **116.57** | **+9.8 %** | 21055 | 651 | 15.5 / 8.7 | 43.0 | 43 |
+
+Reading:
+- **The two ICAP designs gain, the others do not** (but see the ablations below: on rv_mul the target density, not cq02, carries the gain). rv_mul +9.8 % with every seed above the base's best seed, worst-path
+  hops 65.3 -> 43.0 and HPWL -21 %; rv_soc +7.0 % with carry-di-bypass (two of three seeds above the base's best),
+  hops 49.5 -> 37.5. That is where the criticality fix applies (the ICAPE2 path is their worst path). bram and rv_big
+  have no ICAP; there the target density alone shortens HPWL (-7 / -9 %) and slices (rv_big -11 %) but Fmax is
+  -0.3 % / -3.1 %, inside or near the seed spread (rv_big base 92-109).
+- carry-di-bypass helps rv_soc (+10 % over tu10 + cq02) and costs bram and rv_big (-5 %, -2 %), the same mixed sign as
+  Finding 15 had; area always drops (rv_soc 388 slices against Vivado's 398, bram 287 against 290).
+- The worst-path hops fall where Fmax rises, but not one for one: rv_soc tu10 + cq02 shortens them (49.5 -> 42.3) and is
+  still -2.9 %; on bram they grow a little (19.1 -> 21.5). Hops are a symptom, not the whole cause.
+- The gap to Vivado placing these designs itself stays large: Finding 16 measured Vivado on its own placement (no opt_design, Vivado timer, ICAP excluded) at rv_soc 173.2, rv_mul 157.9, rv_big 166.7, bram 172.3 MHz. Those builds used the cal netlists of Finding 13, not exactly this run's netlist, so read it as the order of the gap (rv_soc 120 vs 173, rv_mul 117 vs 158), not a ratio. In these runs the ICAPE2 is not Vivado's worst path (Fmax with and without it are equal).
+- Not separated yet: on rv_mul, how much comes from tu10 and how much from cq02 (runs pl15_tu10_dq, pl15_cq02_dq queued),
+  and cq02 alone on the stub designs (pl15_cq02_stub). Queued too: the path-based refinement `-o dpl=2,3,0.8,4,0,0.02`
+  (the detailed placer with the same quantile; it saw only 25 critical cells on rv_soc before, 53 with it).
+
+Path-based refinement (`-o dpl=2,3,0.8,4,0,0.02`, the detailed placer with the same criticality quantile, place_v16),
+Vivado timer, mean of seeds: rv_soc 108.68 (tu10 + cq02: 109.34), with cdb 118.18 (120.45); bram 154.98 (155.47),
+with cdb 148.08 (148.25); rv_big 99.80 on 2 seeds (99.13). No gain: dropped.
+
+What else differs from Vivado's own placement (flow/place_paths.py on the dumps, 100 worst paths, Vivado timer; Vivado's
+"free" dump runs opt_design, ours do not):
+
+| dump | worst slack ns | datapath ns | logic ns | net ns | levels (LUT / CARRY4) | hops | net ps per step | steps in one slice | LUT->FF in one slice |
+|---|---|---|---|---|---|---|---|---|---|
+| rv_soc, Vivado's own (fix_static_free) | -2.352 | 5.77 | 3.10 | 2.66 | 6.3 (4.2 / 0.2) | 28.2 | 498 | 23 % | 54 % |
+| rv_soc, base s1 | -3.670 | 7.26 | 2.65 | 4.61 | 7.8 (5.6 / 0.2) | 52.2 | 679 | 21 % | 41 % |
+| rv_soc, base s2 | -3.884 | 7.01 | 2.80 | 4.21 | 7.6 (4.5 / 1.1) | 38.7 | 639 | 23 % | 45 % |
+| rv_soc, tu10 + cq02 + cdb s1 | -2.878 | 6.87 | 2.89 | 3.98 | 7.2 (4.6 / 0.6) | 32.1 | 640 | 29 % | 45 % |
+| rv_soc, tu10 + cq02 + cdb s2 | -3.572 | 7.11 | 2.48 | 4.62 | 7.5 (5.3 / 0.2) | 43.1 | 710 | 23 % | 43 % |
+| bram, Vivado's own | -0.852 | 5.47 | 4.05 | 1.42 | 10.7 (1.0 / 7.7) | 13.8 | 147 | 18 % | - |
+| bram, base s1 | -1.448 | 5.97 | 3.96 | 2.00 | 9.5 (1.0 / 6.5) | 20.9 | 237 | 11 % | - |
+| bram, tu10 + cq02 s1 | -1.481 | 6.01 | 3.99 | 2.03 | 9.9 (1.3 / 6.6) | 18.4 | 227 | 15 % | - |
+
+- The gap is in the nets, not the cells: logic delay per path is equal or lower in ours (rv_soc 2.5-2.9 vs 3.10 ns),
+  net delay is 1.5-2 ns higher (4.0-4.6 vs 2.66 ns; bram 2.0 vs 1.42).
+- Per connection, Vivado's critical nets are shorter (5.3 grid hops per step against 5.6-7.7) and faster (498 ps against
+  640-710 ps per step); the delay per hop is about the same (88-124 vs 94 ps). So it is distance, not routing quality per
+  unit of distance: the worst paths' cells still sit further apart.
+- Our worst paths have more LUT levels (rv_soc 7.2-7.8 vs 6.3 cells). Vivado's reference ran opt_design, which can merge
+  LUTs, so part of this is netlist, not placement.
+- LUT->FF steps on the worst paths share a slice 41-45 % in ours against 54 % in Vivado's. **Checked: not a pairing
+  problem.** Every split step is a LUT driving a flip-flop's CE or R pin (its D comes from another LUT, which nextpnr
+  does put in the same slice). By endpoint pin (100 worst paths, Vivado timer): Vivado's own rv_soc has 57 D / 38 CE /
+  3 R endpoints, ours 39-43 D / 34-40 CE / 19-21 R. Ending at D, Vivado's paths carry 1.70 ns of net delay and ours
+  3.4-3.9 ns with the last step in the same slice, so the stretch is upstream in the logic cone; ending at CE, 4.09 vs
+  4.95-5.18 ns. rv_mul base: 38 D (4.19 ns net) / 45 CE (6.04) / 15 R (5.13).
+- Carry chains are not the problem (adjacent CARRY4 steps 100 % in ours, 80-94 % in Vivado's).
+- Next lever from this: critical-connection distance. The earlier timing-weight tests (`--placer-static-timingweight` 20,
+  Finding 13) ran with the ICAP-flattened criticality, so they say nothing; tu10 + cq02 + timing weight 15 was measured (ablation table: no gain), and the
+  DREAMPlaceFPGA-style arc term with the quantile criticality is the next run.
+
+### Ablations (2026-11-08 12:45; Vivado timer, mean of seeds 1-3, corrected extraction)
+"anc" = anchored start + ip-wait; "tu10" = anc + target utilisation 1.0; ra = `-o static-ram-assign`; tw15 =
+`--placer-static-timingweight 15`.
+
+| variant | rv_soc | bram | rv_big | rv_mul (dspq) |
+|---|---|---|---|---|
+| base | 112.56 | 155.87 | 102.32 | 106.19 |
+| cq02 alone | 108.85 (-3.3 %) | 152.85 (-1.9 %) | 95.20 (-7.0 %) | 110.03 (+3.6 %) |
+| anc | 114.85 (+2.0 %) | 152.93 (-1.9 %) | 88.28 (-13.7 %) | - |
+| tu10 | 114.53 (+1.8 %) | 154.82 (-0.7 %) | - | 116.63 (+9.8 %) |
+| anc + ra | 114.16 | 151.84 | 95.88 | - |
+| tu10 + ra | 110.98 | 157.26 (+0.9 %) | 94.36 | - |
+| tu10 + cdb | 113.34 | 150.46 | 94.05 | 106.81 |
+| tu10 + cq02 | 109.34 | 155.47 | 99.13 | 116.57 |
+| tu10 + cq02 + tw15 | 113.25 | 157.61 (+1.1 %) | 98.92 | 108.91 |
+| tu10 + cq02 + cdb | **120.45 (+7.0 %)** | 148.25 | 96.77 | 113.56 |
+| tu10 + cq02 + tw15 + cdb | 118.31 | - | 90.63 | - |
+| tu10 + cq02 + dpl quantile | 108.68 | 154.98 | 99.80 (2 seeds) | 116.13 |
+
+Correction to the reading above: **on rv_mul the gain comes from the target density, not from cq02** (tu10 alone
+116.63, tu10 + cq02 116.57, cq02 alone 110.03). cq02 alone loses on rv_soc, bram and rv_big. The rv_soc +7.0 % appears
+only in the combination tu10 + cq02 + cdb; tu10 + cdb (113.34) and tu10 + cq02 (109.34) do not show it, and rv_soc's
+seed-to-seed spread on one variant is up to 12 MHz (104.7-115.8), so with three seeds that result is not separable from
+noise. The anchored start costs rv_big 13.7 %, and nothing here beats rv_big's base.
+- No variant wins on all four designs. The one consistent result is **target density on rv_mul** (all three seeds
+  110.9-121.7 against the base's 100.1-112.5). Next: target density without the anchored start (`pl15_tuonly_*`), since
+  anchoring is what hurts rv_big; and more seeds before any default.
+- The ICAP-flattening explanation for cq02 stands as a mechanism (criticalities were compressed), but Vivado's timer does
+  not show it as a Fmax lever on its own.
+
+Target density without the anchored start (`--placer-static-target-util 1.0` only; Vivado timer, seeds 1-3):
+
+| design | base | target util 1.0 | + cq02 | HPWL base -> tu | slices base -> tu | nextpnr s base -> tu |
+|---|---|---|---|---|---|---|
+| rv_soc | 112.56 | 112.98 (113.65 / 111.46 / 113.83) | 115.15 | 17363 -> 15320 (-12 %) | 492 -> 473 | 42 -> 28 |
+| bram | 155.87 | 155.87 (158.83 / 155.71 / 153.07) | 152.86 | 22485 -> 21637 (-4 %) | 323 -> 316 | 27 -> 20 |
+| rv_big | 102.32 | 100.05 (102.52 / 99.63 / 97.99) | 99.37 | 25539 -> 24394 (-4 %) | 748 -> 666 (-11 %) | 33 -> 26 |
+| rv_mul (dspq) | 106.19 | 109.91 (121.11 / 98.55 / 110.08) | 107.53 | 26733 -> 25491 (-5 %) | 633 -> 572 (-10 %) | 39 -> 29 |
+
+- Target utilisation 1.0 alone is Fmax-neutral within the seed spread (+0.4 / 0.0 / -2.2 / +3.5 %) and gives
+  4-12 % less HPWL, 2-11 % fewer slices and 20-33 % less nextpnr time on all four designs. That makes it the candidate
+  for a default (area, wirelength and build time better, Fmax not worse), to be confirmed on the QoR suite.
+- The rv_mul +9.8 % needs the anchored start together with it (tu10), and the anchored start costs rv_big 13.7 %.
+  A design-dependent switch would need a rule that predicts it; none is in hand.
+
+### Re-timed with the exact import (2026-11-08 evening; supersedes the placed-mode Fmax above)
+flow/exact_src.py + vivado/build_rte.tcl "fixed" mode: our netlist, placement and LUT pins imposed, Vivado only
+routes (Vivado timer; build/exact and build/exact_sa). Placed mode was optimistic by 10-14 % on the bases. Both
+compare placements with nextpnr's LUT pins locked (same pin policy for all rows). Reference, Vivado placing the same
+exact netlists (vref, no opt_design): rv_soc 136.0, bram 164.1, rv_big 110.9 MHz.
+
+| variant | rv_soc | bram | rv_big | rv_mul (dspq) |
+|---|---|---|---|---|
+| base | 101.39 / 103.35 / 100.22 -> **101.65** | 139.12 / 145.90 / 144.36 -> **143.13** | 88.75 / 85.91 / 90.88 -> **88.51** | 103.09 / 94.95 / 95.02 -> **97.69** |
+| target util 1.0 | 100.20 (-1.4 %) | 143.68 (+0.4 %) | 85.43 (-3.5 %) | 99.04 (+1.4 %) |
+| tu10 (anchored + target util 1.0) | 101.78 (+0.1 %) | 143.69 (+0.4 %) | pending | **106.33 (+8.8 %; 104.29 / 104.29 / 110.40)** |
+| tu10 + cq02 + cdb | 103.01 (+1.3 %) | 138.99 (-2.9 %) | 90.72 (+2.5 %) | 104.57 (+7.0 %) |
+
+- The one result that holds on the exact yardstick is **tu10 on rv_mul: +8.8 %, every seed above the base's best seed**,
+  as in placed mode (+9.8 %). The worst-100 hops fall from 70.3 (target util alone) to 52.2.
+- Everything else is within the seed spread. rv_soc's placed-mode +7.0 % for tu10 + cq02 + cdb shrinks to +1.3 %.
+- Target util 1.0 alone stays Fmax-neutral within noise (-3.5 to +1.4 %) with less HPWL, fewer slices and less run
+  time; rv_big -3.5 % is the largest move, with that design's seed spread at 5 MHz.
+- Our best rows remain 25-35 % below Vivado on the same netlists (rv_soc 103 vs 136, bram 144 vs 164, rv_big 91 vs 111).
+
+Conclusion so far: keep all options opt-in. A design-aware choice is suggested by the data (crit-quantile where a hard
+block dominates the worst slack), but a default needs the ablation runs and the QoR suite.
 
 ## Summary: what closed, what is open, why
 Best openXC7 result per design at 5 ns against Vivado at 5 ns, each with its own timer, plus Vivado's timer on the openXC7 placement where measured:

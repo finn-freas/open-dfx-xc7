@@ -1,0 +1,209 @@
+diff --git a/common/kernel/command.cc b/common/kernel/command.cc
+index d9b7288f..4503ec53 100644
+--- a/common/kernel/command.cc
++++ b/common/kernel/command.cc
+@@ -405,6 +405,16 @@ po::options_description CommandHandler::getGeneralOptions()
+                           "the worst path (default: off)");
+     general.add_options()("placer-static-driver-crit-fanout", po::value<int>(),
+                           "placer static: a net driver takes its users' worst criticality below this fanout (default 5)");
++    general.add_options()("placer-static-legal-ring", po::value<int>(),
++                          "placer static: legalise unclustered cells to the nearest legal bel, scanning rings up to N "
++                          "tiles around the solver position (default: off, random search)");
++    general.add_options()("placer-static-legal-ring-clusters",
++                          "placer static: with --placer-static-legal-ring, clusters (LUT+FF pairs, carry chains) too");
++    general.add_options()("placer-static-legal-wy", po::value<float>(),
++                          "placer static: with --placer-static-legal-ring, cost of a vertical tile step (default 1)");
++    general.add_options()("placer-static-legal-wn", po::value<float>(),
++                          "placer static: with --placer-static-legal-ring, weight of the pull toward placed neighbours "
++                          "(default 0.2)");
+     general.add_options()("placer-static-anchor-init", po::value<int>(),
+                           "placer static: star-model relaxation iterations toward fixed cells before spreading (default: off)");
+     general.add_options()("placer-static-weighted-precond",
+@@ -665,6 +675,14 @@ void CommandHandler::setupContext(Context *ctx)
+     if (vm.count("placer-static-driver-crit-fanout"))
+         ctx->settings[ctx->id("placerStatic/driverCritFanout")] =
+                 std::to_string(vm["placer-static-driver-crit-fanout"].as<int>());
++    if (vm.count("placer-static-legal-ring"))
++        ctx->settings[ctx->id("placerStatic/legalRing")] = std::to_string(vm["placer-static-legal-ring"].as<int>());
++    if (vm.count("placer-static-legal-ring-clusters"))
++        ctx->settings[ctx->id("placerStatic/legalRingClusters")] = true;
++    if (vm.count("placer-static-legal-wy"))
++        ctx->settings[ctx->id("placerStatic/legalWy")] = std::to_string(vm["placer-static-legal-wy"].as<float>());
++    if (vm.count("placer-static-legal-wn"))
++        ctx->settings[ctx->id("placerStatic/legalWn")] = std::to_string(vm["placer-static-legal-wn"].as<float>());
+     if (vm.count("placer-static-anchor-init"))
+         ctx->settings[ctx->id("placerStatic/anchorInit")] = std::to_string(vm["placer-static-anchor-init"].as<int>());
+     if (vm.count("placer-static-weighted-precond"))
+diff --git a/common/place/placer_static.cc b/common/place/placer_static.cc
+index 29d37946..f9ac6749 100644
+--- a/common/place/placer_static.cc
++++ b/common/place/placer_static.cc
+@@ -1555,6 +1555,8 @@ class StaticPlacer
+         update_nets(true);
+         float post_hpwl = system_hpwl();
+         log_info("HPWL after legalise: %f (delta: %f)\n", post_hpwl, post_hpwl - pre_hpwl);
++        if (cfg.legal_ring > 0)
++            log_info("Ring legaliser placed %d cells.\n", legal_ring_placed);
+         if (ctx->verbose) {
+             std::vector<float> disp_by_group(cfg.cell_groups.size());
+             for (int i = 0; i < int(ccells.size()); i++) {
+@@ -1593,6 +1595,120 @@ class StaticPlacer
+         }
+     }
+     // Strict placement legalisation, performed after the initial HeAP spreading
++
++
++
++
++
++    bool legalise_ring(CellInfo *ci)
++    {
++        FastBels::FastBelsData *fb;
++        fast_bels.getBelsForCellType(ci->type, &fb);
++        auto &mc = mcells.at(ci->udata);
++        float px = std::max(0.0f, std::min(float(width - 1), mc.pos.x)), py = std::max(0.0f, std::min(float(height - 1), mc.pos.y));
++        int cx = place_x_to_bel_x.at(int(px)), cy = place_y_to_bel_y.at(int(py));
++
++        std::vector<Loc> nb;
++        for (auto &port : ci->ports) {
++            NetInfo *ni = port.second.net;
++            if (!ni || ni->driver.cell == nullptr || ni->users.entries() > 16)
++                continue;
++            auto add = [&](CellInfo *o) {
++                if (o != ci && o->bel != BelId())
++                    nb.push_back(ctx->getBelLocation(o->bel));
++            };
++            add(ni->driver.cell);
++            for (auto &u : ni->users)
++                add(u.cell);
++        }
++        const float wy = cfg.legal_wy, wn = nb.empty() ? 0.0f : cfg.legal_wn / float(nb.size());
++        float best = std::numeric_limits<float>::max();
++        BelId best_bel;
++        for (int r = 0; r <= cfg.legal_ring; r++) {
++
++            if (best_bel != BelId() && float(r) * std::min(1.0f, wy) > best)
++                break;
++            for (int y = cy - r; y <= cy + r; y++) {
++                for (int x = cx - r; x <= cx + r; x++) {
++                    if (std::max(std::abs(x - cx), std::abs(y - cy)) != r)
++                        continue;
++                    if (x < 0 || y < 0 || x >= int(fb->size()) || y >= int(fb->at(x).size()))
++                        continue;
++                    float disp = std::abs(x - cx) + wy * std::abs(y - cy);
++                    if (disp >= best)
++                        continue;
++                    float wl = 0;
++                    for (auto &l : nb)
++                        wl += std::abs(l.x - x) + wy * std::abs(l.y - y);
++                    float cost = disp + wn * wl;
++                    if (cost >= best)
++                        continue;
++                    for (auto bel : fb->at(x).at(y)) {
++                        if (ci->cluster != ClusterId()) {
++
++
++                            std::vector<std::pair<CellInfo *, BelId>> targets;
++                            if (!ctx->getClusterPlacement(ci->cluster, bel, targets))
++                                continue;
++                            bool free = true;
++                            for (auto &t : targets)
++                                if (!t.first->testRegion(t.second) || !ctx->checkBelAvail(t.second))
++                                    free = false;
++                            if (!free)
++                                continue;
++                            for (auto &t : targets)
++                                ctx->bindBel(t.second, t.first, STRENGTH_STRONG);
++                            bool ok = true;
++                            for (auto &t : targets)
++                                ok = ok && ctx->isBelLocationValid(t.second);
++                            for (auto &t : targets)
++                                ctx->unbindBel(t.second);
++                            if (ok) {
++                                best = cost;
++                                best_bel = bel;
++                                break;
++                            }
++                            continue;
++                        }
++                        if (!ci->testRegion(bel) || !ctx->checkBelAvail(bel))
++                            continue;
++                        ctx->bindBel(bel, ci, STRENGTH_WEAK);
++                        bool ok = ctx->isBelLocationValid(bel);
++                        ctx->unbindBel(bel);
++                        if (ok) {
++                            best = cost;
++                            best_bel = bel;
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++        if (best_bel == BelId())
++            return false;
++        if (ci->cluster != ClusterId()) {
++            std::vector<std::pair<CellInfo *, BelId>> targets;
++            NPNR_ASSERT(ctx->getClusterPlacement(ci->cluster, best_bel, targets));
++            for (auto &t : targets) {
++                ctx->bindBel(t.second, t.first, STRENGTH_STRONG);
++                if (t.first->udata != -1) {
++                    auto &tm = mcells.at(t.first->udata);
++                    tm.pos = tm.ref_pos = RealPair(get_place_loc(ctx->getBelLocation(t.second)), 0.5);
++                    tm.is_fixed = true;
++                }
++            }
++            legal_ring_placed++;
++            return true;
++        }
++        ctx->bindBel(best_bel, ci, STRENGTH_WEAK);
++        Loc loc = get_place_loc(ctx->getBelLocation(best_bel));
++        mc.pos = mc.ref_pos = RealPair(loc, 0.5);
++        mc.is_fixed = true;
++        legal_ring_placed++;
++        return true;
++    }
++    int legal_ring_placed = 0;
++
+     void legalise_placement_strict(bool require_validity = true)
+     {
+         // At the moment we don't follow the full HeAP algorithm using cuts for legalisation, instead using
+@@ -1608,6 +1724,10 @@ class StaticPlacer
+             // Was now placed, ignore
+             if (ci->bel != BelId())
+                 continue;
++            if (cfg.legal_ring > 0 && ci->udata != -1 &&
++                (ci->cluster == ClusterId() || (cfg.legal_ring_clusters && ctx->getClusterRootCell(ci->cluster) == ci)) &&
++                legalise_ring(ci))
++                continue;
+             // log_info("   Legalising %s (%s) %d\n", top.second.c_str(ctx), ci->type.c_str(ctx), top.first);
+             FastBels::FastBelsData *fb;
+             fast_bels.getBelsForCellType(ci->type, &fb);
+@@ -1959,6 +2079,10 @@ PlacerStaticCfg::PlacerStaticCfg(Context *ctx)
+     anchor_init = ctx->setting_or<int>("placerStatic/anchorInit", 0);
+     crit_quantile = ctx->setting_or<float>("placerStatic/critQuantile", 0.0f);
+     driver_crit_fanout = ctx->setting_or<int>("placerStatic/driverCritFanout", 5);
++    legal_ring = ctx->setting_or<int>("placerStatic/legalRing", 0);
++    legal_ring_clusters = ctx->setting_or<bool>("placerStatic/legalRingClusters", false);
++    legal_wy = ctx->setting_or<float>("placerStatic/legalWy", 1.0f);
++    legal_wn = ctx->setting_or<float>("placerStatic/legalWn", 0.2f);
+     arc_exp = ctx->setting_or<float>("placerStatic/arcExp", 8.0f);
+     arc_min_crit = ctx->setting_or<float>("placerStatic/arcMinCrit", 0.5f);
+     arc_start_overlap = ctx->setting_or<float>("placerStatic/arcStartOverlap", 0.3f);
+diff --git a/common/place/placer_static.h b/common/place/placer_static.h
+index e8c17547..8546ce12 100644
+--- a/common/place/placer_static.h
++++ b/common/place/placer_static.h
+@@ -86,6 +86,12 @@ struct PlacerStaticCfg
+     // A net's driver takes the worst criticality of its users only below this fanout (default 5, as before);
+     // higher lets a critical control net (CE / SR) pull its driver too.
+     int driver_crit_fanout = 5;
++
++
++    int legal_ring = 0;
++
++    bool legal_ring_clusters = false;
++    float legal_wy = 1.0f, legal_wn = 0.2f;
+     // Timing-arc term (DREAMPlaceFPGA timing-driven style): a 2-pin wirelength term per critical driver->sink
+     // arc, weight crit^arc_exp, scaled to arc_ratio of the net wirelength gradient; 0 = off.
+     // Preconditioner from the cell's summed net (timing) weights instead of its pin count (Mai et al. TCAD 2024).

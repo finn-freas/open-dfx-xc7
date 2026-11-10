@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 from . import debug as debugmod
+from . import hls as hlsmod
 from . import ip as ipmod
 from . import vhdl
 from .project import CONFIG as PCONFIG, ProjectError, defines_module
@@ -48,6 +49,15 @@ def vhdl_sources(proj, d, tool_dry):
     return [f for f in proj.sources if not vhdl.is_vhdl(f)] + outs
 
 
+def greybox_text(spec):
+    """Vivado's greybox (update_design -buffer_ports) as an RM core: inputs unused, every output driven by 0."""
+    ports = (([("input", "clk", 1)] if spec.get("core_clk") else [])
+             + [("input", n, w) for n, w in spec["inputs"]] + [("output", n, w) for n, w in spec["outputs"]])
+    decl = ", ".join(f"{d} wire {'' if w == 1 else f'[{w - 1}:0] '}{n}" for d, n, w in ports)
+    body = "".join(f"    assign {n} = {w}'d0;\n" for n, w in spec["outputs"])
+    return f"module rm_core ({decl});\n{body}endmodule\n"
+
+
 def vhdl_rm(proj, d, pname, rm, f, tool_dry):
     if not vhdl.is_vhdl(f):
         return f
@@ -65,6 +75,13 @@ def stage(proj, dry, tool_dry=False):
         write_if_changed(xdc, xdc_text(proj))
     sources = vhdl_sources(proj, d, tool_dry)
     inputs = [f for f in proj.sources]
+    if proj.raw.get("hls"):
+        try:
+            hf, hin = hlsmod.generate(proj, proj.build / hlsmod.CONFIG["out_dir"], dry or tool_dry)
+        except hlsmod.HlsError as e:
+            raise ProjectError(str(e))
+        sources = sources + hf
+        inputs += hin + ([] if (dry or tool_dry) else hf)
     if proj.raw.get("ip"):
         try:
             ipf, ipin = ipmod.gen_all(proj, proj.build / ipmod.CONFIG["dir"], dry or tool_dry)
@@ -97,6 +114,8 @@ def stage(proj, dry, tool_dry=False):
             if not dry and not p["spec_file"]:
                 write_if_changed(spec_file, json.dumps(p["spec"]) + "\n")
             info["specs"][p["name"]] = spec_file
+            if p.get("greybox"):
+                write_if_changed(d / f"greybox_{p['name']}.v", greybox_text(p["spec"]))
             info["rms"][p["name"]] = {rm: vhdl_rm(proj, d, p["name"], rm, f, tool_dry) for rm, f in p["rms"].items()}
             if p["stub"]:
                 sources.append(proj.path(p["stub"]))

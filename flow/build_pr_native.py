@@ -1,5 +1,7 @@
 import argparse
+import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -70,6 +72,7 @@ CONFIG = {
                    "partpin_xdc": "designs/dfx_rv/partpin_example.xdc"},
     },
     "shared_pblock": "pblock_shared_dyn",
+    "candidate_seed_step": 1000,
     "pblock": "pblock_rm",
     "variants": {
         "router": {"nextpnr": "build/nextpnr-build/router/nextpnr-himbaechel", "contain_routing": True,
@@ -87,6 +90,23 @@ CONFIG = {
                      "args": ["--router2-region-keep-out"]},
         "partpin3": {"nextpnr": "build/nextpnr-build/partpin3/nextpnr-himbaechel", "contain_routing": True,
                      "args": ["--router2-region-keep-out"]},
+        "pp3hb_t": {"nextpnr": "build/nextpnr-build/pp3hb/nextpnr-himbaechel", "contain_routing": True,
+                    "args": ["--router2-region-keep-out", "-o", "hardblock-timing"]},
+        "pp3hb28_t": {"nextpnr": "build/nextpnr-build/pp3hb28/nextpnr-himbaechel", "contain_routing": True,
+                      "args": ["--router2-region-keep-out", "-o", "hardblock-timing"]},
+        "rthb_t": {"nextpnr": "build/nextpnr-build/rthb/nextpnr-himbaechel", "contain_routing": True,
+                   "args": ["--router2-region-keep-out", "-o", "hardblock-timing"]},
+        "pp3pl": {"nextpnr": "build/nextpnr-build/pp3pl/nextpnr-himbaechel", "contain_routing": True,
+                  "args": ["--router2-region-keep-out"]},
+        "pp3pl_tu": {"nextpnr": "build/nextpnr-build/pp3pl/nextpnr-himbaechel", "contain_routing": True,
+                     "args": ["--router2-region-keep-out", "--placer", "static", "-o", "hardblock-timing",
+                              "--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5",
+                              "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02"]},
+        "pp3pl_tucdb": {"nextpnr": "build/nextpnr-build/pp3pl/nextpnr-himbaechel", "contain_routing": True,
+                        "args": ["--router2-region-keep-out", "--placer", "static", "-o", "hardblock-timing",
+                                 "--placer-static-anchor-init", "20", "--placer-static-ip-wait", "0.5",
+                                 "--placer-static-target-util", "1.0", "--placer-static-crit-quantile", "0.02",
+                                 "-o", "carry-di-bypass"]},
         "rkcrit90": {"nextpnr": "build/nextpnr-build/rkcrit/nextpnr-himbaechel", "contain_routing": True,
                      "args": ["--router2-region-keep-out", "--router2-region-keep-out-crit=0.9"]},
         "rel01": {"nextpnr": "build/nextpnr-build/rel01/nextpnr-himbaechel", "contain_routing": True,
@@ -402,15 +422,38 @@ def main_auto(a, dry, var):
     npnr = ROOT / var["nextpnr"]
     chipdb = ROOT / CONFIG["chipdb"]
 
-    def pnr(key, name, xdcf, opts, extra=()):
+    def pnr(key, name, xdcf, opts, extra=(), seed=None):
         d = out / name
         cmd = [py, str(FLOW / "build_openxc7.py"), CONFIG["src"], "--top", top, "--json", str(linked[key]),
                "--xdc", str(xdcf), "--nextpnr", str(npnr), "--chipdb", str(chipdb), "--out", str(d), "--run"]
         cmd += ["--db-root", str(ROOT / var["db_root"])] if var.get("db_root") else []
         cmd += [x for o in opts for x in ("--opt", o)] + [f"--nextpnr-arg={x}" for x in list(var["args"]) + list(extra)]
-        cmd += ["--seed", str(a.seed)] if a.seed is not None else []
+        if seed is not None:
+            cmd += ["--seed", str(seed)]
+        elif a.seed is not None:
+            cmd += ["--seed", str(a.seed)]
         run(f"pnr {name}", d / f"{top}.bit", cmd, dry)
         return d
+
+    def cand_seed(k):
+        return (a.seed if a.seed is not None else 1) + CONFIG["candidate_seed_step"] * k
+
+    def fmax_of(d):
+        r = d / "report.json"
+        return min(v["achieved"] for v in json.loads(r.read_text())["fmax"].values()) if r.exists() else -1.0
+
+    def select(label, cands, dst):
+        """Copy the candidate build with the highest Fmax (nextpnr timer) to dst; record the choice."""
+        if (dst / f"{top}.bit").exists():
+            return dst
+        print(f"[{'dry' if dry else 'run'}] select {label}: best of {[c.name for c in cands]} -> {dst.name}")
+        if dry:
+            return dst
+        scores = {c.name: fmax_of(c) for c in cands}
+        best = max(cands, key=lambda c: (scores[c.name], -cands.index(c)))
+        shutil.copytree(best, dst)
+        (dst / "selected.json").write_text(json.dumps({"from": best.name, "fmax": scores}, indent=1) + "\n")
+        return dst
 
     def replay_xdc(name, loc):
         xf = out / name
@@ -429,23 +472,37 @@ def main_auto(a, dry, var):
         + (["--module-ends", "--keep-per-net", "5000"] if CONFIG.get("pin_module_ends") else [])
         + (["--w-module", str(CONFIG["pin_w_module"])] if "pin_w_module" in CONFIG else [])
         + (["--exclude-wrap-exits"] if CONFIG.get("pin_exclude_wrap_exits") else [])
-        + (["--xdc", str(ROOT / CONFIG["partpin_xdc"])] if CONFIG.get("partpin_xdc") else []), dry)
+        + (["--xdc", str(ROOT / CONFIG["partpin_xdc"])] if CONFIG.get("partpin_xdc") else [])
+        + (["--tile-cap", str(CONFIG["pin_tile_cap"])] if CONFIG.get("pin_tile_cap") else []), dry)
     gp = out / "grey_place"
     run("dump greybox placement", Path(str(gp) + ".preplaced"),
         [py, str(FLOW / "replay_dump.py"), str(dp / f"{top}_routed.json"), str(gp), "--exclude", inst + "."], dry)
-    if fix_ep:
-        gpe = out / "grey_place_endpoints.preplaced"
-        if not dry:
-            cells = set(epc.read_text().split())
-            lines = [l.split("\t", 1) for l in Path(str(gp) + ".preplaced").read_text().splitlines() if "\t" in l]
-            slice_of = lambda bel: bel.rsplit(".", 1)[0]
-            sites = {slice_of(b) for c, b in lines if c in cells}
-            kept = [f"{c}\t{b}" for c, b in lines if slice_of(b) in sites]
-            write("endpoint placement", gpe, "".join(l + "\n" for l in kept), dry)
-        gopts, gxdc = [f"preplaced={gpe}"], pxdc
+    def grey_inputs(fix):
+        if fix:
+            gpe = out / "grey_place_endpoints.preplaced"
+            if not dry and not gpe.exists():
+                cells = set(epc.read_text().split())
+                lines = [l.split("\t", 1) for l in Path(str(gp) + ".preplaced").read_text().splitlines() if "\t" in l]
+                slice_of = lambda bel: bel.rsplit(".", 1)[0]
+                sites = {slice_of(b) for c, b in lines if c in cells}
+                kept = [f"{c}\t{b}" for c, b in lines if slice_of(b) in sites]
+                write("endpoint placement", gpe, "".join(l + "\n" for l in kept), dry)
+            return [f"preplaced={gpe}"], pxdc
+        return [f"preplaced={gp}.preplaced"], replay_xdc("grey_s.xdc", Path(str(gp) + ".loc.xdc"))
+
+    pin_opts = [f"partition-pins={asg}.partpins", "partition-pins-route"]
+    modes = [bool(fix_ep)] + ([not fix_ep] if fix_ep and CONFIG.get("static_try_unfixed") else [])
+    n_static = CONFIG.get("static_seeds", 1)
+    if len(modes) == 1 and n_static == 1:
+        gopts, gxdc = grey_inputs(modes[0])
+        ds = pnr("grey", "grey_s", gxdc, gopts + pin_opts)
     else:
-        gopts, gxdc = [f"preplaced={gp}.preplaced"], replay_xdc("grey_s.xdc", Path(str(gp) + ".loc.xdc"))
-    ds = pnr("grey", "grey_s", gxdc, gopts + [f"partition-pins={asg}.partpins", "partition-pins-route"])
+        cands = []
+        for fix in modes:
+            gopts, gxdc = grey_inputs(fix)
+            for k in range(n_static):
+                cands.append(pnr("grey", f"grey_s_c{'f' if fix else 'u'}{k}", gxdc, gopts + pin_opts, seed=cand_seed(k)))
+        ds = select("greybox static", cands, out / "grey_s")
     ref = out / "static"
     keep = [x for p in CONFIG["rm_ports"] for x in ("--keep", rf"{inst}\.{p}")]
     run("dump static", Path(str(ref) + ".prerouted"),
@@ -467,17 +524,26 @@ def main_auto(a, dry, var):
                                      f"read_verilog -lib +/xilinx/cells_sim.v +/xilinx/cells_xtra.v; hierarchy -top pp_proxy; "
                                      f"flatten; select pp_proxy; write_json -selected {lj}"), dry)
         linked[key] = lj
-        dpx = pnr(key, f"{rm}_p", Path(str(px) + ".xdc"), [])
-        mp = out / f"{rm}_place"
-        run(f"dump {rm} placement", Path(str(mp) + ".preplaced"),
-            [py, str(FLOW / "replay_dump.py"), str(dpx / f"{top}_routed.json"), str(mp), "--exclude", "",
-             "--keep", rf"{inst}\..*"], dry)
-        both = out / f"{rm}_static_place.preplaced"
-        if not dry:
-            write(f"{rm} + static placement", both, Path(str(ref) + ".preplaced").read_text()
-                  + Path(str(mp) + ".preplaced").read_text(), dry)
-        opts = [f"preplaced={both}", f"prerouted={pp}.prerouted", f"partition-pins={pp}.partpins"]
-        builds[rm] = pnr(rm, f"{rm}_n", rxdc, opts)
+        n_mod = CONFIG.get("module_seeds", 1)
+        alts = CONFIG.get("module_place_alts", [])
+        tries = [(k, ()) for k in range(n_mod)] + [(f"a{i}", tuple(x)) for i, x in enumerate(alts)]
+        cands = []
+        for k, pargs in tries:
+            single = len(tries) == 1
+            sfx = "" if single else f"_c{k}"
+            seed = None if single or isinstance(k, str) else cand_seed(k)
+            dpx = pnr(key, f"{rm}_p{sfx}", Path(str(px) + ".xdc"), [], pargs, seed=seed)
+            mp = out / f"{rm}_place{sfx}"
+            run(f"dump {rm} placement{sfx}", Path(str(mp) + ".preplaced"),
+                [py, str(FLOW / "replay_dump.py"), str(dpx / f"{top}_routed.json"), str(mp), "--exclude", "",
+                 "--keep", rf"{inst}\..*"], dry)
+            both = out / f"{rm}_static_place{sfx}.preplaced"
+            if not dry:
+                write(f"{rm} + static placement{sfx}", both, Path(str(ref) + ".preplaced").read_text()
+                      + Path(str(mp) + ".preplaced").read_text(), dry)
+            opts = [f"preplaced={both}", f"prerouted={pp}.prerouted", f"partition-pins={pp}.partpins"]
+            cands.append(pnr(rm, f"{rm}_n{sfx}", rxdc, opts, seed=seed))
+        builds[rm] = cands[0] if len(cands) == 1 else select(f"module {rm}", cands, out / f"{rm}_n")
     checks = out / "checks"
     for d in [dp, ds] + list(builds.values()):
         pj = checks / f"pips_{d.name}.json"

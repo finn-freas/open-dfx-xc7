@@ -66,7 +66,10 @@ Evidence: `retime/rv_pr.log`, `retime/rv_ppt_recheck.log`, `retime/*/*/retime.js
 
 ## 4. Vivado's DFX build of the same design (build quality, matrix row 15 / "DFX build quality")
 
-**Not run in this session.** The Vivado slot was held by the placer/router/benchmark agents for the whole session
+**Still not run (2026-11-08).** The queue (now one design per Vivado invocation, slot 3, `docs/wip/dfx-gaps/job_vq.sh`)
+finished the DSP fuzz (§6) and the xc7a50t/xc7a100t die builds (§7), then stopped at the wind-down before
+dfx_rv_p10/p5 and the xtime runs. Until those run, the per-RM Fmax/area/partial-size/build-time comparison below has
+only the open side. Earlier note: the Vivado slot was held by the placer/router/benchmark agents for the whole session
 (from 21:43, when my queue started, to the end of the session it never found `vivado.lock` free with no other `vivado.exe` running), so there are no Vivado
 numbers here; none are estimated. What is ready:
 
@@ -170,9 +173,24 @@ called it 26_277; with offset 60 that would be the same bit. `flow/dsp_use_mult.
 in DSP_1 is `USE_SIMD_FOUR12_TWO24` at 26_244.
 
 **Decoding run** (`designs/gap/dsp_um_{none,multiply,dynamic}`: four DSP48E1 at DSP48_X0Y0, X0Y1, X1Y0, X1Y1 with
-identical settings except USE_MULT; MREG=0 so NONE is legal): **not run** (no Vivado slot, §4). `flow/dsp_use_mult.py`
-decodes the three bitstreams and lists the unnamed bits per DSP tile and variant once they exist. Until then the bit
-stays undecoded; `--pass1-keep-unknown` copies it.
+identical settings except USE_MULT; MREG=0 so NONE is legal): **run 2026-11-08** (Vivado 2025.2, one invocation per
+variant, `C:/Users/finnf/open-dfx-xc7-vivado/build/dspum/<variant>/`), decoded by `flow/dsp_use_mult.py`
+(`build/dfxgaps/dspum/dsp_use_mult.json`, `dsp_um_*.fasm`). Result:
+
+| variant | named DSP features (both tiles, both sites) | bits prjxray-db does not name |
+|---|---|---|
+| USE_MULT=NONE | AREG_1, BREG_1, MASK, ZADREG, ZAREG_2_ACASCREG_1, ZBREG_2_BCASCREG_1, ZDREG, ZIS_*_INVERTED, ZMREG | **26_85 and 26_245** in DSP_L_X34Y0 and DSP_R_X9Y0 |
+| USE_MULT=MULTIPLY | the same | none |
+| USE_MULT=DYNAMIC | the same | none |
+
+- So **26_85 = DSP_0 `USE_MULT_NONE`** and **26_245 = DSP_1 `USE_MULT_NONE`**, in both DSP_L and DSP_R tiles. The
+  DSP_0/DSP_1 offset (+160) matches the neighbours prjxray-db names: SEL_MASK_C 26_83/26_243, USE_SIMD_FOUR12_TWO24
+  26_84/26_244, PATTERN[24] 26_86/26_246, ZINMODEREG[0] 26_87/26_247. The bit is set only with USE_MULT=NONE.
+- MULTIPLY and DYNAMIC give identical DSP bits: no configuration bit tells them apart (DYNAMIC only allows INMODE
+  selection at run time; on this OPMODE the bitstream is the same).
+- This decodes phase 10's 26_277 (= 26_245 in DSP_1, see "Numbering"). One device (xc7a35t), 4 DSP sites, one
+  setting combination. Next: add `DSP48.DSP_{0,1}.USE_MULT_NONE` to the open flow's DSP segbits (prjxray-db is
+  untouched; an overlay) so yosys `USE_MULT="NONE"` cells write the bit, and drop `--pass1-keep-unknown` for it.
 
 **Remaining uncertainty of the empirical pass-1 rules** (`--pass1-hold-dsp`, `--pass1-hold-carry`):
 
@@ -193,7 +211,31 @@ xc7a100t (`examples/dfx100`, `dfx100_verify_fabcache.log`) and xc7a200t (`exampl
 `dfx_nv_verify_fabcache.log`); auto partition pins on xc7a200t (`dfxpp_nv`) 10 PASS 0 FAIL 2 INFO. This phase
 added the child-run check on xc7a50t (§8: verify 25 PASS, 0 FAIL with a third RM added later).
 
-Vivado cross-check: **not run** (no Vivado slot, §4). Ready: `designs/dfx_dev/` (the same RTL as `examples/dfx_a50`,
+Vivado cross-check, **run 2026-11-08** for xc7a50t and xc7a100t (xc7a200t not run: wind-down). Vivado 2025.2,
+`vivado/build_dfx_dev.tcl` on `designs/dfx_dev` (RMs rm_xor/rm_andn + greybox, pblock SLICE_X12Y100:SLICE_X15Y149),
+then phase 10's check `flow/vivado_variant_compare.sh` (partial.py on Vivado's own full bitstreams, `--static-pip-list
+--pass1-hold-hclk`, uncompressed, no RAR) per die with `OFX_PART`/`OFX_FABRIC` set (`build/vq/die_check.sh`; outputs
+`build/dfxgaps/die/<die>/`, logs `build/dfxgaps/die/<die>.log`):
+
+| die | Vivado build (wall, one invocation) | partials rm_xor / rm_andn / grey | words | differ from Vivado's partial | CRC, base + partial == target (both commit models) |
+|---|---|---|---|---|---|
+| xc7a50t | 321 s | 3 / 3 / 3 | 14,805 | 13 / 13 / 13 | OK, 0 frames differ |
+| xc7a100t | 600 s | 3 / 3 / 3 | 14,805 | **0 / 0 / 0** | OK, 0 frames differ |
+
+- xc7a50t: the 13 words are 2 bursts x 6 words + CRC, all in the burst's **pad frame** c12 m0 (`0x00020600`, words
+  34/35, 38/39, 49 + ECC 50), outside the region. That frame holds the static design's routing in INT_L_X12Y117/Y119
+  (`CLK_L1.GCLK_L_B5`, bits 00_23/00_27) and INT_L_X12Y124 (`LVB_L12.NE2END2`, 00_45). Vivado writes the pad frame as
+  zeros; partial.py writes the full bitstream's own content. This is the known, deliberate difference of phase 10
+  §9.4 (dfx_dsp residue, 31 words), not a new gap: same behaviour, a different die. `--pass1-hold-dsp
+  --pass1-hold-carry --pass1-keep-unknown` change nothing (`xc7a50t_opt.log`, 13/13/13).
+- xc7a100t: **word-identical** to Vivado's partials (the pad frame is zero in this build). Vivado's partials are
+  59,272 B on both dies (.bin; the same size as our rv_ppt xor partial in §4). Vivado's timer on xc7a100t: WNS 5.185 ns (rm_xor) / 3.997 ns
+  (rm_andn) at 10 ns; rm_xor 42 LUT + 1 FF in the pblock.
+- Vivado's own side on xc7a50t (`C:/Users/finnf/open-dfx-xc7-vivado/build/dfx_dev_xc7a50t/`): WNS at 10 ns 4.155 ns
+  (rm_xor) / 3.582 ns (rm_andn), Vivado's timer; rm_xor in the pblock 42 LUT + 1 FF; pr_verify compatible (194 static
+  cells, 1520 static pips compared).
+- Resume: `nohup setsid bash docs/wip/dfx-gaps/job_vq.sh &` (skips finished builds), then `bash build/vq/die_check.sh
+  xc7a200t xc7a200tsbg484-1`. Ready: `designs/dfx_dev/` (the same RTL as `examples/dfx_a50`,
 module `top`, RMs as `rm_slot` with the rv_ppt shell, per-die pin XDCs) and `vivado/build_dfx_dev.tcl` (build_dfx.tcl
 with the part as an argument, plus the static pip dump), for xc7a50tcsg324-1, xc7a100tcsg324-1, xc7a200tsbg484-1.
 The planned check is phase 10's: `flow/vivado_variant_compare.sh` (partial.py on Vivado's own full bitstreams vs

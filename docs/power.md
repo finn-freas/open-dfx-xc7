@@ -52,51 +52,73 @@ Two held-out measures:
 
 <!-- power-results (generated from build/; rerun after new Vivado data) -->
 ```
-Held-out (2): total 1.7 % mean abs error (max 1.8 %), dynamic 3 % mean abs (5.1 mW mean abs)
-Held-out with Vivado dynamic >= 10 mW (2): dynamic 3 % mean abs
-Training (39): total 3.2 %, dynamic 15 %
-Leave-one-family-out over all (41): total 8.1 % (max 75.2 %), dynamic 23 % mean abs (16.5 mW); with Vivado dynamic >= 10 mW (28): dynamic 22 %
+Held-out (10): total 10.0 % mean abs error (max 30.2 %), dynamic 71 % mean abs (11.6 mW mean abs)
+Held-out with Vivado dynamic >= 10 mW (8): dynamic 37 % mean abs
+Training (45): total 5.6 %, dynamic 30 %
+Leave-one-family-out over all (55): total 7.4 % (max 86.1 %), dynamic 34 % mean abs (10.9 mW); with Vivado dynamic >= 10 mW (39): dynamic 33 %
 ```
 
 Held-out designs (shipped model, never trained on these families):
 
 | Design | Vivado total W | ofx total W | err % | Vivado dynamic W | ofx dynamic W | err % | worst class (Vivado W / ofx W) | LUTs ofx/Vivado |
 |---|---|---|---|---|---|---|---|---|
-| pw_mmcm32_150 | 0.258 | 0.254 | 1.6 | 0.186 | 0.181 | 3 | Slice Logic 0.024 / 0.018 | 1.96 |
-| pw_mmcm32_200 | 0.270 | 0.265 | 1.8 | 0.198 | 0.193 | 3 | Slice Logic 0.032 / 0.024 | 1.96 |
+| dsp48e1 | 0.087 | 0.087 | 0.2 | 0.015 | 0.015 | 0 | Signals 0.001 / 0.000 | 1.31 |
+| dsp_cascade | 0.087 | 0.092 | 5.8 | 0.015 | 0.020 | 32 | Slice Logic 0.000 / 0.004 | 1.31 |
+| fir_p5 | 0.173 | 0.225 | 30.2 | 0.101 | 0.152 | 51 | DSPs 0.045 / 0.086 | 1.28 |
+| mmcme2_adv | 0.190 | 0.193 | 1.6 | 0.118 | 0.121 | 2 | I/O 0.010 / 0.012 | 2.25 |
+| oserdes_pin | 0.079 | 0.084 | 5.4 | 0.008 | 0.012 | 54 | Slice Logic 0.000 / 0.008 | 3.00 |
+| pw_mmcm32_150 | 0.258 | 0.254 | 1.4 | 0.186 | 0.182 | 2 | Slice Logic 0.024 / 0.019 | 1.96 |
+| pw_mmcm32_200 | 0.270 | 0.266 | 1.7 | 0.198 | 0.193 | 3 | Slice Logic 0.032 / 0.025 | 1.96 |
+| ramb36e1 | 0.088 | 0.089 | 0.9 | 0.017 | 0.017 | 4 | Signals 0.001 / 0.000 | 1.29 |
+| rv_mul_p10 | 0.084 | 0.109 | 29.8 | 0.012 | 0.037 | 202 | Signals 0.003 / 0.010 | 1.69 |
+| srl | 0.077 | 0.094 | 23.2 | 0.005 | 0.023 | 355 | Slice Logic 0.000 / 0.019 | 1.00 |
 
 Leave-one-family-out, all designs except the tiny drc_* tests (those are in build/power/fit.md):
 
 | Design | Vivado total W | ofx total W | err % | Vivado dynamic W | ofx dynamic W | err % | worst class (Vivado W / ofx W) | LUTs ofx/Vivado |
 |---|---|---|---|---|---|---|---|---|
-| blinky_p10 | 0.075 | 0.076 | 1.3 | 0.004 | 0.004 | 21 | Clocks 0.001 / 0.001 | 56.00 |
-| blinky_p5 | 0.079 | 0.081 | 1.9 | 0.007 | 0.009 | 17 | Clocks 0.001 / 0.002 | 56.00 |
-| blinky_p7 | 0.077 | 0.078 | 1.6 | 0.005 | 0.006 | 19 | Clocks 0.001 / 0.001 | 56.00 |
-| bram_p10 | 0.213 | 0.190 | 10.7 | 0.140 | 0.118 | 16 | Signals 0.017 / 0.008 | 2.49 |
-| bram_p5 | 0.365 | 0.308 | 15.6 | 0.292 | 0.236 | 19 | Signals 0.048 / 0.017 | 1.71 |
-| pw_bram16 | 0.165 | 0.164 | 1.1 | 0.093 | 0.091 | 1 | Block RAM 0.056 / 0.060 | 1.61 |
-| pw_bram16_p5 | 0.271 | 0.255 | 5.8 | 0.198 | 0.183 | 8 | Signals 0.035 / 0.020 | 1.61 |
-| pw_bram4 | 0.105 | 0.105 | 0.5 | 0.033 | 0.033 | 1 | Block RAM 0.014 / 0.015 | 1.59 |
-| pw_bram40 | 0.290 | 0.281 | 3.2 | 0.216 | 0.208 | 3 | Block RAM 0.140 / 0.149 | 1.61 |
-| pw_dsp32 | 0.133 | 0.180 | 35.4 | 0.061 | 0.108 | 76 | Slice Logic 0.009 / 0.059 | 7.61 |
-| pw_dsp32_p5 | 0.199 | 0.288 | 45.0 | 0.127 | 0.215 | 70 | Slice Logic 0.017 / 0.119 | 7.61 |
-| pw_dsp64 | 0.182 | 0.276 | 51.5 | 0.110 | 0.203 | 84 | Slice Logic 0.017 / 0.118 | 7.78 |
-| pw_dsp8 | 0.096 | 0.110 | 14.1 | 0.025 | 0.038 | 54 | Slice Logic 0.002 / 0.015 | 6.83 |
-| pw_io24 | 0.156 | 0.151 | 3.4 | 0.084 | 0.079 | 7 | I/O 0.082 / 0.077 | 1.30 |
-| pw_io24_p5 | 0.241 | 0.230 | 4.7 | 0.169 | 0.157 | 7 | I/O 0.163 / 0.153 | 1.30 |
-| pw_io8 | 0.109 | 0.107 | 1.7 | 0.037 | 0.035 | 6 | I/O 0.035 / 0.033 | 1.41 |
-| pw_mmcm32_150 | 0.258 | 0.254 | 1.6 | 0.186 | 0.181 | 3 | Slice Logic 0.024 / 0.018 | 1.96 |
-| pw_mmcm32_200 | 0.270 | 0.265 | 1.8 | 0.198 | 0.193 | 3 | Slice Logic 0.032 / 0.024 | 1.96 |
-| pw_xor128 | 0.219 | 0.200 | 8.6 | 0.147 | 0.128 | 13 | Slice Logic 0.065 / 0.038 | 1.97 |
-| pw_xor128_p20 | 0.145 | 0.136 | 6.3 | 0.074 | 0.064 | 13 | Slice Logic 0.032 / 0.019 | 1.97 |
-| pw_xor32 | 0.118 | 0.114 | 3.3 | 0.046 | 0.042 | 9 | Slice Logic 0.016 / 0.009 | 1.96 |
-| pw_xor32_p5 | 0.164 | 0.156 | 5.0 | 0.093 | 0.084 | 9 | Slice Logic 0.032 / 0.019 | 1.96 |
-| pw_xor8 | 0.092 | 0.092 | 0.4 | 0.020 | 0.020 | 0 | Slice Logic 0.004 / 0.002 | 1.93 |
+| blinky_p10 | 0.075 | 0.076 | 0.7 | 0.004 | 0.004 | 10 | I/O 0.003 / 0.003 | 56.00 |
+| blinky_p5 | 0.079 | 0.080 | 0.9 | 0.007 | 0.008 | 8 | I/O 0.006 / 0.006 | 56.00 |
+| blinky_p7 | 0.077 | 0.078 | 0.8 | 0.005 | 0.006 | 8 | I/O 0.004 / 0.005 | 56.00 |
+| bram_p10 | 0.213 | 0.183 | 14.3 | 0.140 | 0.111 | 21 | Block RAM 0.090 / 0.077 | 2.49 |
+| bram_p5 | 0.365 | 0.293 | 19.7 | 0.292 | 0.221 | 24 | Signals 0.048 / 0.016 | 1.71 |
+| dsp48e1 | 0.087 | 0.086 | 0.4 | 0.015 | 0.015 | 3 | Signals 0.001 / 0.000 | 1.31 |
+| dsp_cascade | 0.087 | 0.088 | 1.3 | 0.015 | 0.016 | 6 | Signals 0.001 / 0.000 | 1.31 |
+| fir_p5 | 0.173 | 0.213 | 23.2 | 0.101 | 0.140 | 39 | DSPs 0.045 / 0.086 | 1.28 |
+| lutram_infer | 0.085 | 0.081 | 5.0 | 0.013 | 0.009 | 33 | I/O 0.012 / 0.006 | 1.00 |
+| mmcme2_adv | 0.190 | 0.193 | 1.6 | 0.118 | 0.121 | 2 | I/O 0.010 / 0.012 | 2.25 |
+| oserdes_pin | 0.079 | 0.077 | 2.4 | 0.008 | 0.006 | 27 | I/O 0.007 / 0.003 | 3.00 |
+| plle2_adv | 0.202 | 0.249 | 23.4 | 0.130 | 0.177 | 36 | PLL 0.118 / 0.162 | 2.25 |
+| pw_bram16 | 0.165 | 0.158 | 4.5 | 0.093 | 0.086 | 7 | Signals 0.013 / 0.010 | 1.61 |
+| pw_bram16_p5 | 0.271 | 0.244 | 9.8 | 0.198 | 0.172 | 13 | Signals 0.035 / 0.020 | 1.61 |
+| pw_bram4 | 0.105 | 0.104 | 1.1 | 0.033 | 0.032 | 3 | Slice Logic 0.002 / 0.002 | 1.59 |
+| pw_bram40 | 0.290 | 0.267 | 7.7 | 0.216 | 0.195 | 10 | Signals 0.035 / 0.025 | 1.61 |
+| pw_dsp32 | 0.133 | 0.153 | 14.8 | 0.061 | 0.081 | 32 | Slice Logic 0.009 / 0.030 | 7.61 |
+| pw_dsp32_p5 | 0.199 | 0.233 | 17.5 | 0.127 | 0.161 | 27 | Slice Logic 0.017 / 0.060 | 7.61 |
+| pw_dsp64 | 0.182 | 0.221 | 21.5 | 0.110 | 0.149 | 35 | Slice Logic 0.017 / 0.060 | 7.78 |
+| pw_dsp8 | 0.096 | 0.103 | 6.6 | 0.025 | 0.031 | 25 | Slice Logic 0.002 / 0.008 | 6.83 |
+| pw_io24 | 0.156 | 0.150 | 3.9 | 0.084 | 0.078 | 7 | I/O 0.082 / 0.076 | 1.30 |
+| pw_io24_p5 | 0.241 | 0.228 | 5.2 | 0.169 | 0.156 | 8 | I/O 0.163 / 0.152 | 1.30 |
+| pw_io8 | 0.109 | 0.106 | 2.2 | 0.037 | 0.034 | 7 | I/O 0.035 / 0.033 | 1.41 |
+| pw_mmcm32_150 | 0.258 | 0.254 | 1.4 | 0.186 | 0.182 | 2 | Slice Logic 0.024 / 0.019 | 1.96 |
+| pw_mmcm32_200 | 0.270 | 0.266 | 1.8 | 0.198 | 0.193 | 3 | Slice Logic 0.032 / 0.025 | 1.96 |
+| pw_xor128 | 0.219 | 0.201 | 8.3 | 0.147 | 0.129 | 13 | Slice Logic 0.065 / 0.040 | 1.97 |
+| pw_xor128_p20 | 0.145 | 0.136 | 6.2 | 0.074 | 0.064 | 12 | Slice Logic 0.032 / 0.020 | 1.97 |
+| pw_xor32 | 0.118 | 0.114 | 3.5 | 0.046 | 0.042 | 9 | Slice Logic 0.016 / 0.010 | 1.96 |
+| pw_xor32_p5 | 0.164 | 0.156 | 5.1 | 0.093 | 0.084 | 9 | Slice Logic 0.032 / 0.020 | 1.96 |
+| pw_xor8 | 0.092 | 0.092 | 0.2 | 0.020 | 0.020 | 2 | Slice Logic 0.004 / 0.002 | 1.93 |
+| ramb36e1 | 0.088 | 0.089 | 0.8 | 0.017 | 0.017 | 4 | Signals 0.001 / 0.000 | 1.29 |
+| rv_big_p10 | 0.086 | 0.161 | 86.1 | 0.014 | 0.088 | 541 | Block RAM 0.000 / 0.058 | 1.63 |
+| rv_mul_p10 | 0.084 | 0.108 | 28.4 | 0.012 | 0.036 | 193 | Block RAM 0.000 / 0.007 | 1.69 |
+| rv_soc_p10 | 0.080 | 0.100 | 25.3 | 0.008 | 0.028 | 250 | Block RAM 0.000 / 0.007 | 1.75 |
+| srl | 0.077 | 0.082 | 7.0 | 0.005 | 0.010 | 105 | Slice Logic 0.000 / 0.007 | 1.00 |
 <!-- /power-results -->
 
 ### What the errors say
-- **pw_dsp (LOFO dynamic +54 … +84 %).** This is an implementation difference, not a model error. The open flow uses 6.8–7.8× Vivado's LUTs. yosys keeps the 48-bit accumulator `p <= p + m` in LUTs and CARRY4. Vivado folds it into the DSP48E1 P register. Vivado's Slice Logic for pw_dsp32 is 9 mW; on the open netlist the estimate is 59 mW. For the open flow, this is a synthesis QoR finding (DSP accumulator absorption), not a power model issue.
+- **pw_dsp (LOFO dynamic +25 … +35 %).** This is an implementation difference, not a model error. The open flow uses 6.8–7.8× Vivado's LUTs. yosys keeps the 48-bit accumulator `p <= p + m` in LUTs and CARRY4. Vivado folds it into the DSP48E1 P register. Vivado's Slice Logic for pw_dsp32 is 9 mW; on the open netlist the estimate is 30 mW. For the open flow, this is a synthesis QoR finding (DSP accumulator absorption), not a power model issue.
 - **Logic in general.** The xorshift designs use about 1.96× Vivado's LUTs, and Slice Logic still comes out lower than Vivado's, because the fitted per-toggle LUT coefficient is shared with designs that are packed differently. Signals is the class with the largest misses on bram_p5/bram_p10.
+- **Block RAM on the CPU designs (rv_soc/rv_mul/rv_big, LOFO dynamic +190 … +540 %).** Vivado reports 0 W of Block RAM for them, the model 7-58 mW. The model charges every RAMB18 unit at its clock frequency; it does not yet look at the enable and write-enable activity, which vectorless Vivado evidently does. Largest open model error (the 2026-11-08 refit added these designs).
+- **DSPs on fir_p5 (held out, total +30 %).** DSPs 86 mW vs Vivado 45 mW: the DSP coefficient is per DSP48E1 and MHz only, without the data activity of the cascaded P path.
 - **Small designs.** Under about 10 mW dynamic, Vivado's 1 mW report steps and the ~4 mW of LED I/O dominate, so relative dynamic errors look large. Absolute errors there are a few mW.
 
 ## Limits
