@@ -7,8 +7,6 @@ You know how Vivado lets you swap out one piece of your FPGA design while the re
 DFX) I wanted to do that without Vivado. So this is that, made out of the open-source tools: Yosys, nextpnr and
 Project X-Ray.
 
-Yeah - Vivado is still on my computer. But I only use it to check my bitstreams against its own, it never builds
-anything here.
 
 - made for the Digilent Arty A7-35T (XC7A35T-CSG324-1)
 - the demo is a little RISC-V computer (PicoRV32) that swaps out its own custom-instruction hardware while it's
