@@ -1,28 +1,31 @@
 # open-dfx-xc7
 
-An open-source partial-reconfiguration flow, the equivalent of Vivado's DFX, for Xilinx 7-series FPGAs, built from Yosys, nextpnr (openXC7) and Project X-Ray. Vivado is used only as a reference to compare outputs against, never in the flow.
+Partial reconfiguration for Xilinx 7-series FPGAs, without Vivado. Vivado calls this DFX: you swap out one part of
+the design while the rest of it keeps running. I wanted that with only the open-source tools (Yosys, nextpnr and
+Project X-Ray), so I built the flow for it.
 
-- Board: Digilent Arty A7-35T (XC7A35T-CSG324-1).
-- Demo: a PicoRV32 RISC-V SoC that swaps its own custom-instruction hardware at runtime through ICAPE2, from UART or from SPI flash.
+Vivado is still on my machine, but only to check my bitstreams against its own. It's never used to build anything.
 
-**Status:** everything is verified offline. **Nothing has run on hardware yet.** See `PROGRESS.md` for the current-status summary.
+Nothing here has run on a real board yet - everything is checked offline for now. Still being worked on!
 
-## Where to look
-- `PROGRESS.md`: current status and verified results.
-- `docs/dfx-vs-vivado.md`: feature-by-feature comparison with Vivado DFX, with evidence.
-- `docs/hardware-test-plan.md`: the ordered board bring-up plan, with expected values and stop conditions.
-- `docs/phase*.md`: details per phase.
-- `docs/drafts/`: patches for nextpnr, openFPGALoader, prjxray-db and yosys. All are local drafts; nothing has been sent upstream. `docs/drafts/README.md` is the index.
-- `flow/`: the tools.
-  - `build_pr_native.py` is the default flow (patched nextpnr); `build_pr.py` is the stock-nextpnr fallback.
-  - `partial.py` writes partials.
-  - `full_check.sh` and `full_check_native.sh` run the regressions.
-- `designs/`: test designs and Vivado reference designs.
-- `vivado/`: Tcl and PowerShell for building the Vivado reference bitstreams.
+- made for the Digilent Arty A7-35T (XC7A35T-CSG324-1)
+- the demo is a little RISC-V computer (PicoRV32) that swaps its own custom-instruction hardware while it's
+  running, from UART or from SPI flash
+- the partial bitstreams are compared against Vivado's
+- no vendor IDE anywhere in the flow
 
-## Project flow: `bin/ofx`
-A Vivado-like project flow over the scripts in `flow/`: one project file (`ofx.toml`: top, sources, XDC, part or
-board, clocks, DFX partitions with their RMs) and one command.
+`PROGRESS.md` has where things are at right now.
+
+## Running it
+
+First build the tools. This takes a while, but it doesn't need root and it puts everything in `~/.local/ofx`:
+
+```bash
+bash install/install.sh --run
+```
+
+Then it works a lot like a Vivado project. There's one project file (`ofx.toml`) with your top module, sources,
+XDC, board, clocks and the parts you want to swap, and one command:
 
 ```
 bin/ofx new arty-a7-35t myproj [--dfx]   # skeleton project (board presets in boards/)
@@ -34,10 +37,24 @@ bin/ofx dfx verify --run                  # DRC, pr_check, records, byteman, reg
 bin/ofx dfx load <partial> [--via jtag]   # ICAP UART loader or openFPGALoader --partial (dry run unless --run)
 ```
 
-The device is a parameter (`flow/device.py`: part to family, fabric and chipdb). Defaults stay the Arty A7-35T.
-Second device built offline with it: xc7a100t (Arty A7-100T). Reference and results: `docs/ofx.md`.
+Most commands only print what they would do until you add `--run`. If you don't pick a device you get the Arty
+A7-35T. The xc7a100t (Arty A7-100T) builds too, also only offline so far. Everything `ofx` can do is in
+`docs/ofx.md`.
 
-## Building
-- **Install the toolchain:** `bash install/install.sh --run` builds the whole toolchain (openXC7 nextpnr with this project's patch series, Project X-Ray tools and database, chipdbs, byteman, openFPGALoader with `--partial`, yosys from the pinned oss-cad-suite) from pinned upstream sources into `~/.local/ofx`, without root. `docs/install.md` has the quickstart, the supported devices, every upstream project with its licence, and troubleshooting.
-- The toolchain and build environment are not in the repo. `docs/buildenv.md` and `PROGRESS.md` list the exact pinned versions and how to reproduce them.
-- `toolchain/`, `build/` and `upstream/` are git-ignored.
+The install builds nextpnr (openXC7, with my patches), the Project X-Ray tools and database, the chipdbs, byteman,
+openFPGALoader with `--partial`, and yosys, all from pinned versions. If it breaks, look at `docs/install.md`. The
+tools themselves aren't in the repo (`toolchain/`, `build/` and `upstream/` are git-ignored), and
+`docs/buildenv.md` lists the exact versions.
+
+## What's in here
+
+| Where | What it has |
+|-|-|
+| `PROGRESS.md` | where things are at and what's been verified |
+| `docs/dfx-vs-vivado.md` | Vivado DFX feature by feature: what this can do, what it can't, and the proof |
+| `docs/hardware-test-plan.md` | the plan for the first time it goes on the board, step by step, with what to expect and when to stop |
+| `docs/phase*.md` | the details, one file per phase |
+| `docs/drafts/` | my patches for nextpnr, openFPGALoader, prjxray-db and yosys. None of them have been sent upstream yet. `docs/drafts/README.md` lists them |
+| `flow/` | the actual tools. `build_pr_native.py` is the normal flow (needs the patched nextpnr), `build_pr.py` works with stock nextpnr, `partial.py` writes the partials, and `full_check.sh` / `full_check_native.sh` run all the checks |
+| `designs/` | test designs, plus the ones I build in Vivado to compare against |
+| `vivado/` | the Tcl and PowerShell that build those Vivado bitstreams |
