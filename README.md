@@ -16,9 +16,7 @@ Nothing here has run on a real board yet - everything is checked offline for now
 
 `PROGRESS.md` has where things are at right now.
 
-## Running it
-
-First build the tools. This takes a while, but it doesn't need root and it puts everything in `~/.local/ofx`:
+To run it, first build the tools. This takes a while, but it doesn't need root and it puts everything in `~/.local/ofx`:
 
 ```bash
 bash install/install.sh --run
@@ -46,7 +44,7 @@ openFPGALoader with `--partial`, and yosys, all from pinned versions. If it brea
 tools themselves aren't in the repo (`toolchain/`, `build/` and `upstream/` are git-ignored), and
 `docs/buildenv.md` lists the exact versions.
 
-## What's in here
+Here's what's in the repo:
 
 | Where | What it has |
 |-|-|
